@@ -120,3 +120,6 @@ packages/server/.env
 skills-lock.json
 test-results/
 .archon/ralph/
+
+# Per-project knowledge digest (regenerated every 2h by librarian)
+.knowledge/
