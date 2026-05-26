@@ -1,0 +1,142 @@
+name: dev-maintenance
+description: |
+  Periodic dev-system maintenance — runs every 2 hours via Windows Task Scheduler.
+  Promotes intake to the knowledge base, refreshes session continuity, audits
+  open incidents, sweeps stale CHECKPOINT.md files, and appends a summary to
+  the system manifest.
+  Idempotent and read-only against project repos. Runs directly on the
+  dev-system checkout (no worktree).
+  NOT for: per-task work (use dev-feature), discovery (use dev-idea).
+
+provider: claude
+interactive: false
+
+worktree:
+  enabled: false
+
+nodes:
+  # ─── 1. Librarian (intake → knowledge base) ─────────────────────────
+  - id: librarian
+    bash: |
+      set -e
+      cd D:/projects/dev-system
+      cmd //c D:/projects/dev-system/_system/scripts/run-librarian.bat 2>&1 | tail -120
+    timeout: 600000
+
+  # ─── 2. Memento (session continuity refresh) ────────────────────────
+  - id: memento
+    depends_on: [librarian]
+    model: haiku
+    prompt: |
+      You are the dev-maintenance workflow's memento node.
+
+      Run the `/memento` slash command on the dev-system checkout
+      (`D:/projects/dev-system`). This refreshes the session continuity chain:
+      it scans `D:/projects/dev-system/memory/` for any unindexed packets and
+      updates `D:/projects/dev-system/memory/INDEX.md` to reflect the on-disk
+      state.
+
+      Append a one-line summary to `$ARTIFACTS_DIR/memento.md`:
+
+      ```
+      packets_indexed: <N>
+      missing_rows_marked: <N>
+      drift_resolved: YES | NO
+      ```
+
+      Do NOT compress this maintenance run itself into a packet — there is no
+      conversation worth preserving. Memento here is an audit pass on the
+      existing chain.
+    allowed_tools: [Read, Write, Edit, Bash, Glob, Grep]
+
+  # ─── 3a. Incident review (long-open SEV:1 / SEV:2 items) ────────────
+  - id: incident-review
+    depends_on: [memento]
+    model: haiku
+    prompt: |
+      You are the dev-maintenance workflow's incident-review node.
+
+      Read `D:/projects/dev-system/_system/incidents/INCIDENT-LOG.md`.
+      For every entry with state `OPEN` and `SEV:1` or `SEV:2`:
+      - Compute days open from `Detected:` to today.
+      - If days_open > 7, list it as overdue.
+
+      Write `$ARTIFACTS_DIR/incident-review.md`:
+
+      ```markdown
+      ---
+      stage: incident-review
+      status: complete
+      total_open_sev1_sev2: <N>
+      overdue_count: <N>
+      completed_at: <ISO timestamp>
+      ---
+
+      ## Overdue OPEN Incidents (>7 days)
+      | INC | Days Open | Severity | Title | Project |
+      |---|---|---|---|---|
+
+      ## All OPEN SEV:1 / SEV:2 (audit trail)
+      | INC | Days Open | Severity | Title | Project |
+      |---|---|---|---|---|
+      ```
+
+      Do NOT write to INCIDENT-LOG.md — this stage is read-only.
+      Do NOT close incidents autonomously — surfacing is the job.
+    allowed_tools: [Read, Write, Glob, Grep]
+
+  # ─── 3b. Checkpoint cleanup (delete CHECKPOINT.md older than 7 days) ────
+  - id: checkpoint-cleanup
+    depends_on: [memento]
+    bash: |
+      set -e
+      # Find every CHECKPOINT.md under D:/projects/ and check age.
+      # Delete files modified more than 7 days ago.
+      THRESHOLD_DAYS=7
+      DELETED=0
+      KEPT=0
+      while IFS= read -r -d '' file; do
+        AGE_DAYS=$(( ( $(date +%s) - $(stat -c %Y "$file") ) / 86400 ))
+        if [ "$AGE_DAYS" -gt "$THRESHOLD_DAYS" ]; then
+          rm -f "$file"
+          DELETED=$((DELETED + 1))
+          echo "deleted: $file (age ${AGE_DAYS}d)"
+        else
+          KEPT=$((KEPT + 1))
+        fi
+      done < <(find /d/projects -mindepth 2 -maxdepth 3 -name CHECKPOINT.md -type f -print0 2>/dev/null)
+      echo "summary: deleted=$DELETED kept=$KEPT threshold_days=$THRESHOLD_DAYS"
+    timeout: 60000
+
+  # ─── 4. Report (append summary to MANIFEST.md) ──────────────────────
+  - id: report
+    depends_on: [incident-review, checkpoint-cleanup]
+    trigger_rule: all_done
+    model: haiku
+    prompt: |
+      You are the dev-maintenance workflow's report node.
+
+      Read prior node outputs:
+      - $librarian.output
+      - $memento.output
+      - $incident-review.output
+      - $checkpoint-cleanup.output
+
+      Write a single-paragraph maintenance summary, then APPEND it to
+      `D:/projects/dev-system/_system/MANIFEST.md` under a heading:
+
+      ```
+      ## Maintenance run — <ISO timestamp>
+      ```
+
+      Body should include:
+      - Librarian: intake files processed, knowledge entries promoted
+      - Memento: packets indexed, drift resolved
+      - Incident review: total OPEN SEV:1/2, overdue count
+      - Checkpoint cleanup: deleted vs kept
+
+      Then write `$ARTIFACTS_DIR/report.md` with the same content for archival.
+
+      Do NOT replace MANIFEST.md content — append only. Use the Edit tool
+      with the canonical end-of-file marker, or read + write.
+    allowed_tools: [Read, Write, Edit, Glob, Grep]

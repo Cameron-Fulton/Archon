@@ -1,0 +1,65 @@
+name: dev-feature-quick
+description: |
+  Use when: A small, well-scoped fix where research/design/plan would just be ceremony.
+  Triggers: tasks with `<!-- one_off -->` in the title, "fix typo", "rename X to Y", small CSS tweaks.
+  Does: build → review-backend & review-frontend → simplify → harden → security → commit → update-kb.
+        Skips research, design, plan, plan-review, and all 3 approval gates.
+  NOT for: anything with non-trivial architecture, anything that touches data flow,
+           anything that needs a PRD reference. Use dev-feature for those.
+
+provider: claude
+interactive: false
+
+worktree:
+  enabled: true
+
+nodes:
+  - id: build
+    command: dev-build
+    model: opus
+    context: fresh
+    skills:
+      - superpowers:test-driven-development
+
+  - id: review-backend
+    command: dev-review-backend
+    depends_on: [build]
+    model: opus
+    context: fresh
+
+  - id: review-frontend
+    command: dev-review-frontend
+    depends_on: [build]
+    model: opus
+    context: fresh
+
+  - id: simplify
+    command: dev-simplify
+    depends_on: [review-backend, review-frontend]
+    trigger_rule: all_done
+    model: sonnet
+    context: fresh
+
+  - id: harden
+    command: dev-harden
+    depends_on: [simplify]
+    model: opus
+    context: fresh
+
+  - id: security
+    command: dev-security
+    depends_on: [harden]
+    model: opus
+    context: fresh
+
+  - id: commit
+    command: dev-commit
+    depends_on: [security]
+    model: haiku
+    context: fresh
+
+  - id: update-kb
+    command: dev-update-kb
+    depends_on: [commit]
+    model: haiku
+    context: fresh
