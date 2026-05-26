@@ -1,4 +1,7 @@
 import { describe, test, expect, mock, beforeEach } from 'bun:test';
+import { mkdtemp, rm, writeFile } from 'fs/promises';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import { createMockLogger } from '../test/mocks/logger';
 
 const mockLogger = createMockLogger();
@@ -72,7 +75,7 @@ describe('CodexProvider', () => {
       const caps = client.getCapabilities();
       expect(caps).toEqual({
         sessionResume: true,
-        mcp: false,
+        mcp: true,
         hooks: false,
         skills: false,
         agents: false,
@@ -783,6 +786,155 @@ describe('CodexProvider', () => {
       }
     });
 
+    test('passes workflow MCP config as Codex mcp_servers overrides', async () => {
+      const testDir = await mkdtemp(join(tmpdir(), 'codex-provider-mcp-'));
+      const originalToken = process.env.ARCHON_CODEX_MCP_TOKEN;
+      process.env.ARCHON_CODEX_MCP_TOKEN = 'token-from-process';
+
+      try {
+        await writeFile(
+          join(testDir, 'mcp.json'),
+          JSON.stringify({
+            figma: {
+              type: 'http',
+              url: 'http://127.0.0.1:3845/mcp',
+              headers: { Authorization: 'Bearer $ARCHON_CODEX_MCP_TOKEN' },
+              startup_timeout_sec: 20,
+            },
+            local: {
+              type: 'stdio',
+              command: 'npx',
+              args: ['-y', 'figma-mcp'],
+              env: { TOKEN: '$ARCHON_CODEX_MCP_TOKEN' },
+            },
+          })
+        );
+
+        mockRunStreamed.mockResolvedValue({
+          events: (async function* () {
+            yield { type: 'turn.completed', usage: defaultUsage };
+          })(),
+        });
+
+        for await (const _ of client.sendQuery('test prompt', testDir, undefined, {
+          nodeConfig: { mcp: 'mcp.json' },
+        })) {
+          // consume
+        }
+
+        expect(MockCodex).toHaveBeenCalledWith(
+          expect.objectContaining({
+            config: expect.objectContaining({
+              mcp_servers: expect.objectContaining({
+                figma: expect.objectContaining({
+                  url: 'http://127.0.0.1:3845/mcp',
+                  http_headers: { Authorization: 'Bearer token-from-process' },
+                  startup_timeout_sec: 20,
+                }),
+                local: expect.objectContaining({
+                  command: 'npx',
+                  args: ['-y', 'figma-mcp'],
+                  env: { TOKEN: 'token-from-process' },
+                }),
+              }),
+            }),
+          })
+        );
+        expect(mockLogger.info).toHaveBeenCalledWith(
+          { serverNames: ['figma', 'local'], mcpPath: 'mcp.json' },
+          'codex.mcp_config_loaded'
+        );
+      } finally {
+        if (originalToken === undefined) {
+          delete process.env.ARCHON_CODEX_MCP_TOKEN;
+        } else {
+          process.env.ARCHON_CODEX_MCP_TOKEN = originalToken;
+        }
+        await rm(testDir, { recursive: true, force: true });
+      }
+    });
+
+    test('uses request env when expanding workflow MCP config variables', async () => {
+      const testDir = await mkdtemp(join(tmpdir(), 'codex-provider-mcp-env-'));
+
+      try {
+        await writeFile(
+          join(testDir, 'mcp.json'),
+          JSON.stringify({
+            figma: {
+              command: 'figma-mcp',
+              env: { TOKEN: '$FIGMA_TOKEN' },
+            },
+          })
+        );
+
+        mockRunStreamed.mockResolvedValue({
+          events: (async function* () {
+            yield { type: 'turn.completed', usage: defaultUsage };
+          })(),
+        });
+
+        for await (const _ of client.sendQuery('test prompt', testDir, undefined, {
+          env: { FIGMA_TOKEN: 'from-codebase-env' },
+          nodeConfig: { mcp: 'mcp.json' },
+        })) {
+          // consume
+        }
+
+        expect(MockCodex).toHaveBeenCalledWith(
+          expect.objectContaining({
+            config: expect.objectContaining({
+              mcp_servers: expect.objectContaining({
+                figma: expect.objectContaining({
+                  command: 'figma-mcp',
+                  env: { TOKEN: 'from-codebase-env' },
+                }),
+              }),
+            }),
+          })
+        );
+      } finally {
+        await rm(testDir, { recursive: true, force: true });
+      }
+    });
+
+    test('prefixes workflow MCP warnings for workflow forwarding', async () => {
+      const testDir = await mkdtemp(join(tmpdir(), 'codex-provider-mcp-warning-'));
+      delete process.env.ARCHON_CODEX_MISSING_TOKEN;
+
+      try {
+        await writeFile(
+          join(testDir, 'mcp.json'),
+          JSON.stringify({
+            figma: {
+              command: 'figma-mcp',
+              env: { TOKEN: '$ARCHON_CODEX_MISSING_TOKEN' },
+            },
+          })
+        );
+        mockRunStreamed.mockResolvedValue({
+          events: (async function* () {
+            yield { type: 'turn.completed', usage: defaultUsage };
+          })(),
+        });
+
+        const chunks = [];
+        for await (const chunk of client.sendQuery('test prompt', testDir, undefined, {
+          nodeConfig: { mcp: 'mcp.json' },
+        })) {
+          chunks.push(chunk);
+        }
+
+        expect(chunks[0]).toEqual({
+          type: 'system',
+          content:
+            '⚠️ MCP config references undefined env vars: ARCHON_CODEX_MISSING_TOKEN. These will be empty strings - MCP servers may fail to authenticate.',
+        });
+      } finally {
+        await rm(testDir, { recursive: true, force: true });
+      }
+    });
+
     test('reuses the singleton Codex instance across sequential calls without env', async () => {
       mockRunStreamed.mockResolvedValue({
         events: (async function* () {
@@ -870,10 +1022,13 @@ describe('CodexProvider', () => {
       );
     });
 
-    test('handles error events', async () => {
+    test('error events followed by turn.completed yield a clean result (recoverable)', async () => {
+      // SDK error events that are followed by turn.completed indicate the SDK
+      // recovered internally. The dropped error message is logged but not
+      // surfaced \u2014 only one terminal result chunk is yielded.
       mockRunStreamed.mockResolvedValue({
         events: (async function* () {
-          yield { type: 'error', message: 'Something went wrong' };
+          yield { type: 'error', message: 'Transient blip' };
           yield { type: 'turn.completed', usage: defaultUsage };
         })(),
       });
@@ -883,42 +1038,132 @@ describe('CodexProvider', () => {
         chunks.push(chunk);
       }
 
-      expect(chunks[0]).toEqual({ type: 'system', content: '\u26A0\uFE0F Something went wrong' });
-      expect(mockLogger.error).toHaveBeenCalledWith(
-        { message: 'Something went wrong' },
-        'stream_error'
-      );
-    });
-
-    test('suppresses MCP timeout errors', async () => {
-      mockRunStreamed.mockResolvedValue({
-        events: (async function* () {
-          yield { type: 'error', message: 'MCP client connection timeout' };
-          yield { type: 'turn.completed', usage: defaultUsage };
-        })(),
-      });
-
-      const chunks = [];
-      for await (const chunk of client.sendQuery('test', '/workspace')) {
-        chunks.push(chunk);
-      }
-
-      // Should only have the result, not the MCP error
       expect(chunks).toHaveLength(1);
       expect(chunks[0]).toEqual({
         type: 'result',
         sessionId: 'new-thread-id',
         tokens: { input: 10, output: 5 },
       });
+      expect(mockLogger.error).toHaveBeenCalledWith({ message: 'Transient blip' }, 'stream_error');
+    });
 
-      // Error is still logged even though not sent to user
+    test('error event followed by stream close yields fail-stop result.isError', async () => {
+      // The SDK sends an error event (e.g. "model not supported") and the
+      // iterator closes without turn.completed or turn.failed. The provider
+      // synthesizes a fail-stop result so the dag-executor's msg.isError
+      // branch catches the failure \u2014 same chunk shape as Claude.
+      mockRunStreamed.mockResolvedValue({
+        events: (async function* () {
+          yield { type: 'error', message: "'opus[1m]' model is not supported" };
+        })(),
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('test', '/workspace')) {
+        chunks.push(chunk);
+      }
+
+      expect(chunks).toHaveLength(1);
+      expect(chunks[0]).toEqual({
+        type: 'result',
+        sessionId: 'new-thread-id',
+        isError: true,
+        errorSubtype: 'codex_stream_incomplete',
+        errors: ["'opus[1m]' model is not supported"],
+      });
+    });
+
+    test('MCP client errors followed by turn.completed yield clean result', async () => {
+      // MCP client errors are non-fatal \u2014 Codex retries internally.
+      // Only after turn.completed do we know the SDK recovered.
+      mockRunStreamed.mockResolvedValue({
+        events: (async function* () {
+          yield { type: 'error', message: 'mcp client connection timeout' };
+          yield { type: 'turn.completed', usage: defaultUsage };
+        })(),
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('test', '/workspace')) {
+        chunks.push(chunk);
+      }
+
+      expect(chunks).toHaveLength(1);
+      expect(chunks[0]).toEqual({
+        type: 'result',
+        sessionId: 'new-thread-id',
+        tokens: { input: 10, output: 5 },
+      });
+      // Logged but not surfaced as failure
       expect(mockLogger.error).toHaveBeenCalledWith(
-        { message: 'MCP client connection timeout' },
+        { message: 'mcp client connection timeout' },
         'stream_error'
       );
     });
 
-    test('handles turn.failed events', async () => {
+    test('MCP-only error followed by stream close still fails (no terminal = failure)', async () => {
+      // The stream-incomplete fail-stop fires whenever the iterator closes
+      // without a terminal event \u2014 that's an SDK contract violation
+      // regardless of cause. But the captured error message does NOT carry
+      // the MCP-client text, since MCP errors are filtered from capture.
+      mockRunStreamed.mockResolvedValue({
+        events: (async function* () {
+          yield { type: 'error', message: 'MCP client transport closed' };
+        })(),
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('test', '/workspace')) {
+        chunks.push(chunk);
+      }
+
+      expect(chunks).toHaveLength(1);
+      expect(chunks[0]).toMatchObject({
+        type: 'result',
+        isError: true,
+        errorSubtype: 'codex_stream_incomplete',
+      });
+      const errors = (chunks[0] as { errors?: string[] }).errors;
+      expect(errors?.[0]).not.toContain('MCP client');
+    });
+
+    test('surfaces MCP client errors when workflow MCP is configured', async () => {
+      const testDir = await mkdtemp(join(tmpdir(), 'codex-provider-mcp-error-'));
+
+      try {
+        await writeFile(
+          join(testDir, 'mcp.json'),
+          JSON.stringify({ figma: { command: 'figma-mcp' } })
+        );
+        mockRunStreamed.mockResolvedValue({
+          events: (async function* () {
+            yield { type: 'error', message: 'MCP client connection timeout' };
+            yield { type: 'turn.completed', usage: defaultUsage };
+          })(),
+        });
+
+        const chunks = [];
+        for await (const chunk of client.sendQuery('test', testDir, undefined, {
+          nodeConfig: { mcp: 'mcp.json' },
+        })) {
+          chunks.push(chunk);
+        }
+
+        expect(chunks[0]).toEqual({
+          type: 'system',
+          content: '\u26A0\uFE0F MCP client connection timeout',
+        });
+        expect(chunks[1]).toEqual({
+          type: 'result',
+          sessionId: 'new-thread-id',
+          tokens: { input: 10, output: 5 },
+        });
+      } finally {
+        await rm(testDir, { recursive: true, force: true });
+      }
+    });
+
+    test('turn.failed yields result.isError with codex_turn_failed subtype', async () => {
       mockRunStreamed.mockResolvedValue({
         events: (async function* () {
           yield { type: 'turn.failed', error: { message: 'Rate limit exceeded' } };
@@ -930,9 +1175,13 @@ describe('CodexProvider', () => {
         chunks.push(chunk);
       }
 
+      expect(chunks).toHaveLength(1);
       expect(chunks[0]).toEqual({
-        type: 'system',
-        content: '\u274C Turn failed: Rate limit exceeded',
+        type: 'result',
+        sessionId: 'new-thread-id',
+        isError: true,
+        errorSubtype: 'codex_turn_failed',
+        errors: ['Rate limit exceeded'],
       });
       expect(mockLogger.error).toHaveBeenCalledWith(
         { errorMessage: 'Rate limit exceeded' },
@@ -940,7 +1189,7 @@ describe('CodexProvider', () => {
       );
     });
 
-    test('handles turn.failed without error message', async () => {
+    test('turn.failed without error message yields fail-stop with Unknown error', async () => {
       mockRunStreamed.mockResolvedValue({
         events: (async function* () {
           yield { type: 'turn.failed', error: null };
@@ -952,14 +1201,43 @@ describe('CodexProvider', () => {
         chunks.push(chunk);
       }
 
+      expect(chunks).toHaveLength(1);
       expect(chunks[0]).toEqual({
-        type: 'system',
-        content: '\u274C Turn failed: Unknown error',
+        type: 'result',
+        sessionId: 'new-thread-id',
+        isError: true,
+        errorSubtype: 'codex_turn_failed',
+        errors: ['Unknown error'],
       });
       expect(mockLogger.error).toHaveBeenCalledWith(
         { errorMessage: 'Unknown error' },
         'turn_failed'
       );
+    });
+
+    test('iterator that closes with zero events yields codex_stream_incomplete with default message', async () => {
+      // Bare-stream-close fallback: no error event, no terminal event,
+      // iterator just ends. Locks in the default message used when there is
+      // no captured non-MCP error to attribute the failure to.
+      mockRunStreamed.mockResolvedValue({
+        events: (async function* () {
+          // no events
+        })(),
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('test', '/workspace')) {
+        chunks.push(chunk);
+      }
+
+      expect(chunks).toHaveLength(1);
+      expect(chunks[0]).toEqual({
+        type: 'result',
+        sessionId: 'new-thread-id',
+        isError: true,
+        errorSubtype: 'codex_stream_incomplete',
+        errors: ['Codex stream closed without turn.completed or turn.failed'],
+      });
     });
 
     test('throws on runStreamed error', async () => {
