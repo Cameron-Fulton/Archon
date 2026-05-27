@@ -8,16 +8,21 @@
 > should not re-litigate.
 
 ## Project intent
+
 (one or two sentences — what the product is, who uses it, what problem it solves)
 
 ## Core entities
+
 - **{Entity}** — (definition; specific to this codebase, not Wikipedia-generic)
 
 ## Modules
+
 - **{Module}** — (what it owns; what sits behind its seam)
 
 ## Roles / actors
+
 - **{Role}** — (what they can do; what they can't; where the boundary is enforced)
 
 ## Out-of-scope concepts
+
 - **{Concept}** — (what this project deliberately does NOT do, and why)
