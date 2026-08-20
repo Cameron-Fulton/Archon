@@ -8,7 +8,6 @@
 
 ## Machine-generated findings (triage; not queued)
 
-- Kanban tables are missing from the Postgres schema. `migrations/024_kanban_tasks.sql` (renumbered from 022 during the v0.9.0 merge) is never applied on Postgres: `getSchemaSQL()` reads only `migrations/000_combined.sql`, which has no `remote_agent_kanban_tasks` table. SQLite is fine — `packages/core/src/db/adapters/sqlite.ts` creates it inline. Predates the v0.9.0 merge; the board silently 500s on a Postgres-backed install. Fix = add the table + indexes to `000_combined.sql` and re-run `bun run generate:bundled-schema`.
 - Server test `GET /api/commands > includes bundled commands with source:bundled` (`packages/server/src/routes/api.workflows.test.ts:1441`) fails on this machine: a user-global `archon-assist` command in ARCHON_HOME shadows the bundled one, so `source` is `global` not `bundled`. Verified to fail identically on a pristine `v0.9.0` checkout, so it is upstream/environmental, not fork drift. Fix = isolate ARCHON_HOME in the test.
 - `bun run validate` cannot complete on Windows: `scripts/test-install.sh` exits with "Windows is not supported. Please use WSL2". Every other gate step (capability matrix, type-check, eslint, prettier) passes. Fix = skip `test:install` off-Linux, or run validate under WSL2.
 - Archon is absent from the dev-system orchestrator's project registry and has no `project-kb/` directory, unlike sibling projects. Not paused and not disabled — simply never registered. Fix = run the reconciler for this project.
