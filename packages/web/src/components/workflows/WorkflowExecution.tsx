@@ -48,6 +48,7 @@ interface WorkflowRunQueryData {
   workerPlatformId: string | null;
   parentPlatformId: string | null;
   conversationPlatformId: string | null;
+  workingPath: string | null;
   codebaseId: string | null;
   events: WorkflowEventResponse[];
 }
@@ -199,6 +200,7 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
         workerPlatformId: data.run.worker_platform_id ?? null,
         parentPlatformId: data.run.parent_platform_id ?? null,
         conversationPlatformId: data.run.conversation_platform_id ?? null,
+        workingPath: data.run.working_path ?? null,
         codebaseId: data.run.codebase_id ?? null,
         events: data.events,
       };
@@ -215,6 +217,7 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
   const workerPlatformId = queryData?.workerPlatformId ?? null;
   const parentPlatformId = queryData?.parentPlatformId ?? null;
   const conversationPlatformId = queryData?.conversationPlatformId ?? null;
+  const workingPath = queryData?.workingPath ?? null;
   const error = queryError
     ? queryError instanceof Error
       ? queryError.message
@@ -282,13 +285,22 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
   // Only gated on workflowName — codebaseCwd is optional; when absent the server tries the
   // first registered codebase before falling back to bundled defaults (handles CLI runs and
   // "No project" web runs).
-  const { data: workflowDef } = useQuery({
+  const {
+    data: workflowDef,
+    error: workflowDefError,
+    isPending: workflowDefPending,
+  } = useQuery({
     queryKey: ['workflowDefinition', initialData?.workflowName, codebaseCwd],
     queryFn: () => getWorkflow(initialData?.workflowName ?? '', codebaseCwd ?? undefined),
     enabled: !!initialData?.workflowName,
     staleTime: Infinity,
   });
   const dagDefinitionNodes = workflowDef?.workflow?.nodes ?? null;
+  const dagDefinitionErrorMessage = workflowDefError
+    ? workflowDefError instanceof Error
+      ? workflowDefError.message
+      : String(workflowDefError)
+    : null;
   // Use workflow definition when available, fall back to dagNodes from run state.
   const isDag = dagDefinitionNodes !== null || (initialData?.dagNodes.length ?? 0) > 0;
 
@@ -552,10 +564,39 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
                 selectedNodeId={selectedDagNode}
                 onNodeClick={handleNodeClick}
               />
-            ) : (
+            ) : dagDefinitionErrorMessage ? (
+              <div className="flex flex-col items-center justify-center h-full text-text-secondary px-4 text-center">
+                <p className="text-error mb-1">Failed to load workflow graph</p>
+                <p className="text-xs mb-3">{dagDefinitionErrorMessage}</p>
+                <button
+                  type="button"
+                  onClick={(): void => {
+                    queryClient
+                      .resetQueries({
+                        queryKey: ['workflowDefinition', initialData?.workflowName, codebaseCwd],
+                      })
+                      .catch((err: unknown) => {
+                        console.error('[WorkflowExecution] Retry resetQueries failed', {
+                          workflowName: initialData?.workflowName,
+                          error: err instanceof Error ? err.message : err,
+                        });
+                      });
+                  }}
+                  className="text-xs text-primary hover:text-accent-bright transition-colors"
+                >
+                  Retry
+                </button>
+              </div>
+            ) : workflowDefPending ? (
               <div className="flex items-center justify-center h-full text-text-secondary">
                 <span className="inline-block h-5 w-5 animate-spin rounded-full border-2 border-accent border-t-transparent mr-2" />
                 Loading graph...
+              </div>
+            ) : (
+              // Final fallback: query resolved with no nodes and no error.
+              // Covers older runs whose stored workflow has no DAG.
+              <div className="flex items-center justify-center h-full text-text-secondary px-4 text-center">
+                <p>Workflow graph unavailable for this run.</p>
               </div>
             )}
           </ResizablePanel>
@@ -569,7 +610,7 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
     if (isDag && activeView === 'chat' && parentPlatformId) {
       return (
         <div className="flex flex-col flex-1 overflow-hidden min-h-0">
-          <ChatInterface conversationId={parentPlatformId} />
+          <ChatInterface conversationId={parentPlatformId} cwdOverride={workingPath} />
         </div>
       );
     }
@@ -597,7 +638,7 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
             if (window.history.length > 1) {
               navigate(-1);
             } else {
-              navigate('/workflows');
+              navigate('/legacy/workflows');
             }
           }}
           className="text-text-secondary hover:text-text-primary transition-colors text-sm"
@@ -614,7 +655,7 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
           {workerRunId && (
             <button
               onClick={(): void => {
-                navigate(`/workflows/runs/${workerRunId}`);
+                navigate(`/legacy/workflows/runs/${workerRunId}`);
               }}
               className="flex items-center gap-1 text-xs text-primary hover:text-accent-bright transition-colors"
               title="View workflow run details"
