@@ -14,7 +14,7 @@ Set these in your shell or `.env` file:
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `CLAUDE_BIN_PATH` | Yes (binary builds) | Absolute path to the Claude Code SDK's `cli.js`. Required in compiled Archon binaries unless `assistants.claude.claudeBinaryPath` is set. Dev mode (`bun run`) auto-resolves via `node_modules`. |
+| `CLAUDE_BIN_PATH` | No (binary builds autodetect `~/.local/bin/claude`) | Absolute path to the Claude Code binary, SDK `cli.js`, or the npm platform-package directory (e.g. `@anthropic-ai/claude-code-win32-x64`, auto-expanded to `claude`/`claude.exe`). Overrides autodetection in compiled Archon binaries. Falls back to `assistants.claude.claudeBinaryPath`, then to the native-installer path. Dev mode (`bun run`) auto-resolves via `node_modules`. |
 | `CLAUDE_USE_GLOBAL_AUTH` | No | Set to `true` to use credentials from `claude /login` (default when no other Claude token is set) |
 | `CLAUDE_CODE_OAUTH_TOKEN` | No | OAuth token from `claude setup-token` (alternative to global auth) |
 | `CLAUDE_API_KEY` | No | Anthropic API key for pay-per-use (alternative to global auth) |
@@ -26,6 +26,7 @@ Set these in your shell or `.env` file:
 | `GITEA_TOKEN` | No | Gitea/Forgejo access token — used to authenticate when cloning private Gitea/Forgejo repos (also used by the Gitea adapter) |
 | `LOG_LEVEL` | No | `debug`, `info` (default), `warn`, `error` |
 | `PORT` | No | Server port (default: 3090, Docker: 3000) |
+| `WSL_DISTRO_NAME` | No (WSL sets it automatically) | WSL distro name; Archon reads it to emit Windows-host-friendly `vscode://vscode-remote/wsl+<distro>/...` "Open in IDE" links. Override only to force a specific distro name into the URI. |
 
 ## Project Configuration
 
@@ -38,7 +39,7 @@ assistants:
     settingSources:
       - project
   codex:
-    model: gpt-5.3-codex
+    model: gpt-5.6-sol
     modelReasoningEffort: medium
 
 # docs:

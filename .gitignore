@@ -123,3 +123,5 @@ test-results/
 
 # Per-project knowledge digest (regenerated every 2h by librarian)
 .knowledge/
+# Stray run logs from a mis-threaded logDir argument (see #2299) — never committed.
+main/

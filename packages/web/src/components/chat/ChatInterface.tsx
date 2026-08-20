@@ -29,6 +29,7 @@ import type {
   WorkflowDispatchEvent,
 } from '@/lib/types';
 import { applyOnText } from '@/lib/chat-message-reducer';
+import { applySystemStatus } from '@/lib/system-status-reducer';
 import {
   getCachedMessages,
   setCachedMessages,
@@ -37,6 +38,7 @@ import {
 } from '@/lib/message-cache';
 import { useProject } from '@/contexts/ProjectContext';
 import { ensureUtc } from '@/lib/format';
+import { resolveChatHeaderPath } from '@/lib/chat-header';
 
 function mapMessageRow(row: MessageResponse): ChatMessage {
   let meta: {
@@ -98,9 +100,13 @@ function mapMessageRow(row: MessageResponse): ChatMessage {
 
 interface ChatInterfaceProps {
   conversationId: string;
+  cwdOverride?: string | null;
 }
 
-export function ChatInterface({ conversationId }: ChatInterfaceProps): React.ReactElement {
+export function ChatInterface({
+  conversationId,
+  cwdOverride,
+}: ChatInterfaceProps): React.ReactElement {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const { selectedProjectId } = useProject();
@@ -135,6 +141,8 @@ export function ChatInterface({ conversationId }: ChatInterfaceProps): React.Rea
   });
   // Default to true (hide button) until server confirms non-Docker — prevents broken vscode:// links
   const isDocker = health?.is_docker ?? true;
+  const isWsl = health?.is_wsl ?? false;
+  const wslDistro = health?.wsl_distro;
 
   // Sync messages to cache for persistence across navigation
   useEffect(() => {
@@ -277,7 +285,7 @@ export function ChatInterface({ conversationId }: ChatInterfaceProps): React.Rea
       ? codebases?.find(cb => cb.id === selectedProjectId)
       : undefined;
   const headerTitle = currentConv?.title ?? 'Chat';
-  const headerSubtitle = currentConv?.cwd ?? undefined;
+  const headerSubtitle = resolveChatHeaderPath(currentConv?.cwd, cwdOverride);
 
   const nextId = (): string => {
     messageIdCounter.current += 1;
@@ -563,15 +571,7 @@ export function ChatInterface({ conversationId }: ChatInterfaceProps): React.Rea
   );
 
   const onSystemStatus = useCallback((content: string): void => {
-    setMessages(prev => [
-      ...prev,
-      {
-        id: nextId(),
-        role: 'system' as const,
-        content,
-        timestamp: Date.now(),
-      },
-    ]);
+    setMessages(prev => applySystemStatus(prev, content, nextId));
   }, []);
 
   const { connected } = useSSE(isNewChat ? null : conversationId, {
@@ -635,7 +635,7 @@ export function ChatInterface({ conversationId }: ChatInterfaceProps): React.Rea
           // Cache messages under the new ID so the remounted ChatInterface picks them up
           // (navigate changes the key prop, causing unmount/remount — state is lost otherwise)
           setCachedMessages(newId, [userMsg, thinkingMsg]);
-          navigate(`/chat/${newId}`, { replace: true });
+          navigate(`/legacy/chat/${newId}`, { replace: true });
           // Trigger title + workflow refreshes after AI generates a proper title
           if (!hasTriggeredTitleRefresh.current && !message.startsWith('/')) {
             hasTriggeredTitleRefresh.current = true;
@@ -710,6 +710,8 @@ export function ChatInterface({ conversationId }: ChatInterfaceProps): React.Rea
         projectName={currentCodebase?.name ?? contextCodebase?.name}
         connected={isNewChat ? undefined : connected}
         isDocker={isDocker}
+        isWsl={isWsl}
+        wslDistro={wslDistro}
       />
       {(conversationsError || codebasesError) && (
         <div className="flex gap-2 px-4 py-1">

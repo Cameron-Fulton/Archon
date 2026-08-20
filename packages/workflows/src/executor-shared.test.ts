@@ -18,6 +18,7 @@ mock.module('@archon/paths', () => ({
   createLogger: mock(() => mockLogger),
 }));
 
+import type { IWorkflowPlatform } from './deps';
 import {
   substituteWorkflowVariables,
   buildPromptWithContext,
@@ -27,6 +28,9 @@ import {
   isInlineScript,
   formatSubprocessFailure,
   classifyError,
+  toTelemetryErrorClass,
+  safeSendMessage,
+  type UnknownErrorTracker,
 } from './executor-shared';
 
 describe('substituteWorkflowVariables', () => {
@@ -52,6 +56,117 @@ describe('substituteWorkflowVariables', () => {
       'docs/'
     );
     expect(prompt).toBe('Save to /tmp/artifacts/runs/run-1/output.txt');
+  });
+
+  it('replaces $STATE_DIR with the resolved state directory', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'Read $STATE_DIR/triage-state.json',
+      'run-1',
+      'msg',
+      '/tmp/artifacts',
+      'main',
+      'docs/',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { stateDir: '/home/u/.archon/workspaces/acme/widget/state' }
+    );
+    expect(prompt).toBe('Read /home/u/.archon/workspaces/acme/widget/state/triage-state.json');
+  });
+
+  it('replaces $STATE_DIR even under shellSafe (engine-controlled, like $ARTIFACTS_DIR)', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'cat "$STATE_DIR/pr-state.json"',
+      'run-1',
+      'msg',
+      '/tmp/artifacts',
+      'main',
+      'docs/',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { shellSafe: true, stateDir: '/state/root' }
+    );
+    expect(prompt).toBe('cat "/state/root/pr-state.json"');
+  });
+
+  it('throws when $STATE_DIR is referenced but no state dir was resolved', () => {
+    expect(() =>
+      substituteWorkflowVariables(
+        'Write $STATE_DIR/x.json',
+        'run-1',
+        'msg',
+        '/tmp/artifacts',
+        'main',
+        'docs/'
+      )
+    ).toThrow('$STATE_DIR is referenced but no state directory was resolved');
+  });
+
+  it('does not throw when $STATE_DIR is not referenced and no state dir is supplied', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'No state reference here',
+      'run-1',
+      'msg',
+      '/tmp/artifacts',
+      'main',
+      'docs/'
+    );
+    expect(prompt).toBe('No state reference here');
+  });
+
+  it('substitutes a known $INPUTS.<name> from options.inputs (#2470)', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'Plan: $INPUTS.plan and mode $INPUTS.mode',
+      'run-1',
+      'msg',
+      '/tmp/artifacts',
+      'main',
+      'docs/',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { inputs: { plan: 'do the thing', mode: 'fast' } }
+    );
+    expect(prompt).toBe('Plan: do the thing and mode fast');
+  });
+
+  it('throws with a did-you-mean hint on an unknown $INPUTS name (#2470)', () => {
+    expect(() =>
+      substituteWorkflowVariables(
+        'Use $INPUTS.pln',
+        'run-1',
+        'msg',
+        '/tmp/artifacts',
+        'main',
+        'docs/',
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { inputs: { plan: 'x' } }
+      )
+    ).toThrow('$INPUTS.plan');
+  });
+
+  it('does NOT substitute $INPUTS under shellSafe — env delivery is the shell path (#2470/#2115)', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'echo "$INPUTS.plan"',
+      'run-1',
+      'msg',
+      '/tmp/artifacts',
+      'main',
+      'docs/',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { shellSafe: true, inputs: { plan: 'x' } }
+    );
+    expect(prompt).toBe('echo "$INPUTS.plan"');
   });
 
   it('replaces $BASE_BRANCH with config value', () => {
@@ -352,6 +467,36 @@ describe('buildPromptWithContext', () => {
     expect(result).toContain('## Issue #42');
   });
 
+  it('forwards the stateDir option through to $STATE_DIR substitution', () => {
+    const result = buildPromptWithContext(
+      'Read $STATE_DIR/notes.md',
+      'run-1',
+      'msg',
+      '/tmp',
+      'main',
+      'docs/',
+      undefined,
+      'test prompt',
+      { stateDir: '/state/root' }
+    );
+    expect(result).toBe('Read /state/root/notes.md');
+  });
+
+  it('throws when $STATE_DIR is referenced and no stateDir option is forwarded', () => {
+    expect(() =>
+      buildPromptWithContext(
+        'Read $STATE_DIR/notes.md',
+        'run-1',
+        'msg',
+        '/tmp',
+        'main',
+        'docs/',
+        undefined,
+        'test prompt'
+      )
+    ).toThrow('$STATE_DIR is referenced but no state directory was resolved');
+  });
+
   it('does not append issueContext when $CONTEXT was substituted', () => {
     const result = buildPromptWithContext(
       'Fix this: $CONTEXT',
@@ -407,6 +552,37 @@ describe('detectCreditExhaustion', () => {
 
   it('is case-insensitive', () => {
     expect(detectCreditExhaustion("YOU'RE OUT OF EXTRA USAGE")).not.toBeNull();
+  });
+
+  it('detects "You\'ve hit your session limit" and includes reset time', () => {
+    const result = detectCreditExhaustion(
+      "You've hit your session limit · resets 3am (America/Mexico_City)"
+    );
+    expect(result).not.toBeNull();
+    expect(result).toContain('session limit');
+    expect(result).toContain('3am (America/Mexico_City)');
+  });
+
+  it('returns generic session limit message when no reset time found', () => {
+    const result = detectCreditExhaustion("You've hit your session limit.");
+    expect(result).not.toBeNull();
+    expect(result).toContain('session limit');
+  });
+
+  it('detects "hit your session limit" variant (case-insensitive)', () => {
+    expect(detectCreditExhaustion("YOU'VE HIT YOUR SESSION LIMIT · resets noon")).not.toBeNull();
+  });
+
+  it('detects "session limit reached" variant', () => {
+    const result = detectCreditExhaustion('session limit reached');
+    expect(result).not.toBeNull();
+    expect(result).toContain('session limit');
+  });
+
+  it('detects "session limit has been reached" variant', () => {
+    const result = detectCreditExhaustion('Session limit has been reached.');
+    expect(result).not.toBeNull();
+    expect(result).toContain('session limit');
   });
 });
 
@@ -616,6 +792,22 @@ describe('classifyError', () => {
     expect(classifyError(new Error('Minimax: overloaded, try again later'))).toBe('TRANSIENT');
   });
 
+  it('classifies Codex 503 responses decorated with auth error as TRANSIENT — #2386', () => {
+    expect(
+      classifyError(
+        new Error(
+          "Node 'prime' failed: SDK returned codex_turn_failed — unexpected status 503 Service Unavailable: Service Unavailable, url: https://chatgpt.com/backend-api/codex/responses, cf-ray: ..., auth error: 503, auth error code: biscuit_baker_service_me_circuit_open"
+        )
+      )
+    ).toBe('TRANSIENT');
+  });
+
+  it('classifies Codex model-capacity errors as TRANSIENT — #2425', () => {
+    expect(
+      classifyError(new Error('Selected model is at capacity. Please try a different model.'))
+    ).toBe('TRANSIENT');
+  });
+
   it('classifies 401 as FATAL', () => {
     expect(classifyError(new Error('401 unauthorized'))).toBe('FATAL');
   });
@@ -624,7 +816,196 @@ describe('classifyError', () => {
     expect(classifyError(new Error('unauthorized: exited with code 1'))).toBe('FATAL');
   });
 
+  it('keeps concrete authentication and quota failures FATAL', () => {
+    expect(classifyError(new Error('auth error: 401'))).toBe('FATAL');
+    expect(classifyError(new Error('rate limit: session limit reached'))).toBe('FATAL');
+  });
+
+  it('keeps a generic auth error FATAL when no transient signal is present', () => {
+    expect(classifyError(new Error('auth error: credentials rejected'))).toBe('FATAL');
+  });
+
+  it('classifies session-limit and usage-limit errors as FATAL (never retried) — #2177', () => {
+    // Verbatim node_failed payload from the issue report — regression pin.
+    expect(
+      classifyError(
+        new Error(
+          'Claude session limit reached — resets 3:20pm (UTC). Abandon this run and retry after reset.'
+        )
+      )
+    ).toBe('FATAL');
+    // CLI-only quota string: not producible by detectCreditExhaustion, so the
+    // drift guard below cannot cover it.
+    expect(classifyError(new Error('Claude AI usage limit reached|1751234567'))).toBe('FATAL');
+  });
+
+  it('session-limit stays FATAL even when the message also matches a TRANSIENT pattern', () => {
+    expect(classifyError(new Error('rate limit: session limit reached'))).toBe('FATAL');
+  });
+
+  it('every detectCreditExhaustion output string classifies FATAL (drift guard)', () => {
+    const outputs = [
+      detectCreditExhaustion("You've hit your session limit · resets 3am"),
+      detectCreditExhaustion('session limit reached'),
+      detectCreditExhaustion('out of credits'),
+    ];
+    for (const msg of outputs) {
+      expect(msg).not.toBeNull();
+      expect(classifyError(new Error(msg as string))).toBe('FATAL');
+    }
+  });
+
   it('classifies unknown errors as UNKNOWN', () => {
     expect(classifyError(new Error('something completely unexpected happened'))).toBe('UNKNOWN');
+  });
+});
+
+describe('toTelemetryErrorClass', () => {
+  it('maps FATAL to fatal', () => {
+    expect(toTelemetryErrorClass('FATAL')).toBe('fatal');
+  });
+
+  it('maps TRANSIENT to transient', () => {
+    expect(toTelemetryErrorClass('TRANSIENT')).toBe('transient');
+  });
+
+  it('maps UNKNOWN to unknown', () => {
+    expect(toTelemetryErrorClass('UNKNOWN')).toBe('unknown');
+  });
+
+  it('round-trips classifyError output for every ErrorType', () => {
+    expect(toTelemetryErrorClass(classifyError(new Error('401 unauthorized')))).toBe('fatal');
+    expect(toTelemetryErrorClass(classifyError(new Error('rate limit: 429')))).toBe('transient');
+    expect(toTelemetryErrorClass(classifyError(new Error('mystery')))).toBe('unknown');
+  });
+});
+
+describe('safeSendMessage', () => {
+  const makePlatform = (impl: () => Promise<void>) => ({
+    sendMessage: mock(impl),
+    getPlatformType: mock(() => 'test'),
+  });
+
+  it('returns true and resets tracker to 0 on success', async () => {
+    const platform = makePlatform(() => Promise.resolve());
+    const tracker: UnknownErrorTracker = { count: 5 };
+    const result = await safeSendMessage(
+      platform as unknown as IWorkflowPlatform,
+      'conv-1',
+      'hello',
+      undefined,
+      undefined,
+      tracker
+    );
+    expect(result).toBe(true);
+    expect(tracker.count).toBe(0);
+  });
+
+  it('returns false on TRANSIENT error without throwing', async () => {
+    const platform = makePlatform(() => Promise.reject(new Error('timeout connecting')));
+    const result = await safeSendMessage(
+      platform as unknown as IWorkflowPlatform,
+      'conv-1',
+      'hello'
+    );
+    expect(result).toBe(false);
+  });
+
+  it('rethrows FATAL errors', async () => {
+    const platform = makePlatform(() => Promise.reject(new Error('unauthorized')));
+    await expect(
+      safeSendMessage(platform as unknown as IWorkflowPlatform, 'conv-1', 'hello')
+    ).rejects.toThrow('Platform authentication/permission error: unauthorized');
+  });
+
+  it('increments UNKNOWN tracker and returns false below threshold', async () => {
+    const platform = makePlatform(() => Promise.reject(new Error('some unclassified glitch')));
+    const tracker: UnknownErrorTracker = { count: 0 };
+    const result = await safeSendMessage(
+      platform as unknown as IWorkflowPlatform,
+      'conv-1',
+      'hello',
+      undefined,
+      undefined,
+      tracker
+    );
+    expect(result).toBe(false);
+    expect(tracker.count).toBe(1);
+  });
+
+  it('throws after three consecutive UNKNOWN errors', async () => {
+    const platform = makePlatform(() => Promise.reject(new Error('some unclassified glitch')));
+    const tracker: UnknownErrorTracker = { count: 2 };
+    await expect(
+      safeSendMessage(
+        platform as unknown as IWorkflowPlatform,
+        'conv-1',
+        'hello',
+        undefined,
+        undefined,
+        tracker
+      )
+    ).rejects.toThrow('3 consecutive unrecognized errors');
+  });
+
+  it('TRANSIENT resets tracker so subsequent UNKNOWN does not trip threshold', async () => {
+    // Sequence: UNKNOWN (count→1), TRANSIENT (count→0), UNKNOWN (count→1) — no throw
+    const errors = [
+      new Error('some unclassified glitch'), // UNKNOWN
+      new Error('timeout'), // TRANSIENT
+      new Error('some unclassified glitch'), // UNKNOWN
+    ];
+    let callCount = 0;
+    const platform = {
+      sendMessage: mock(async () => {
+        throw errors[callCount++];
+      }),
+      getPlatformType: mock(() => 'test'),
+    };
+    const tracker: UnknownErrorTracker = { count: 0 };
+
+    await safeSendMessage(
+      platform as unknown as IWorkflowPlatform,
+      'conv-1',
+      'msg',
+      undefined,
+      undefined,
+      tracker
+    );
+    expect(tracker.count).toBe(1);
+
+    await safeSendMessage(
+      platform as unknown as IWorkflowPlatform,
+      'conv-1',
+      'msg',
+      undefined,
+      undefined,
+      tracker
+    );
+    expect(tracker.count).toBe(0);
+
+    const result = await safeSendMessage(
+      platform as unknown as IWorkflowPlatform,
+      'conv-1',
+      'msg',
+      undefined,
+      undefined,
+      tracker
+    );
+    expect(result).toBe(false);
+    expect(tracker.count).toBe(1);
+  });
+
+  it('works correctly without unknownErrorTracker (DAG executor path)', async () => {
+    const platform = makePlatform(() => Promise.reject(new Error('some unclassified glitch')));
+    // No tracker passed — UNKNOWN errors never throw regardless of call count
+    for (let i = 0; i < 5; i++) {
+      const result = await safeSendMessage(
+        platform as unknown as IWorkflowPlatform,
+        'conv-1',
+        'hello'
+      );
+      expect(result).toBe(false);
+    }
   });
 });
