@@ -260,7 +260,6 @@ import * as isolationEnvDb from '@archon/core/db/isolation-environments';
 import * as workflowDb from '@archon/core/db/workflows';
 import * as workflowEventDb from '@archon/core/db/workflow-events';
 import * as messageDb from '@archon/core/db/messages';
-import * as kanbanDb from '@archon/core/db/kanban';
 import * as userDb from '@archon/core/db/users';
 import {
   abandonWorkflow,
@@ -318,15 +317,6 @@ import {
   codebaseEnvVarParamsSchema,
   envVarMutationResponseSchema,
 } from './schemas/codebase.schemas';
-import {
-  kanbanTaskSchema,
-  kanbanTaskListResponseSchema,
-  listKanbanTasksQuerySchema,
-  createKanbanTaskBodySchema,
-  updateKanbanTaskBodySchema,
-  kanbanTaskIdParamsSchema,
-  deleteKanbanTaskResponseSchema,
-} from './schemas/kanban-task.schemas';
 import {
   updateAssistantConfigBodySchema,
   updateAssistantConfigResponseSchema,
@@ -836,85 +826,6 @@ const deleteEnvVarRoute = createRoute({
       description: 'Env var deleted',
     },
     404: jsonError('Codebase not found'),
-  },
-});
-
-// =========================================================================
-// Kanban task route configs (dev-system pipeline board)
-// =========================================================================
-
-const listKanbanTasksRoute = createRoute({
-  method: 'get',
-  path: '/api/tasks',
-  tags: ['Kanban'],
-  summary: 'List kanban tasks (dev-system pipeline board)',
-  request: { query: listKanbanTasksQuerySchema },
-  responses: {
-    200: {
-      content: { 'application/json': { schema: kanbanTaskListResponseSchema } },
-      description: 'OK',
-    },
-    500: jsonError('Server error'),
-  },
-});
-
-const createKanbanTaskRoute = createRoute({
-  method: 'post',
-  path: '/api/tasks',
-  tags: ['Kanban'],
-  summary: 'Create a kanban task',
-  request: {
-    body: {
-      content: { 'application/json': { schema: createKanbanTaskBodySchema } },
-      required: true,
-    },
-  },
-  responses: {
-    201: {
-      content: { 'application/json': { schema: kanbanTaskSchema } },
-      description: 'Created',
-    },
-    400: jsonError('Bad request'),
-    500: jsonError('Server error'),
-  },
-});
-
-const patchKanbanTaskRoute = createRoute({
-  method: 'patch',
-  path: '/api/tasks/{id}',
-  tags: ['Kanban'],
-  summary: 'Update a kanban task',
-  request: {
-    params: kanbanTaskIdParamsSchema,
-    body: {
-      content: { 'application/json': { schema: updateKanbanTaskBodySchema } },
-      required: true,
-    },
-  },
-  responses: {
-    200: {
-      content: { 'application/json': { schema: kanbanTaskSchema } },
-      description: 'Updated',
-    },
-    400: jsonError('Bad request'),
-    404: jsonError('Not found'),
-    500: jsonError('Server error'),
-  },
-});
-
-const deleteKanbanTaskRoute = createRoute({
-  method: 'delete',
-  path: '/api/tasks/{id}',
-  tags: ['Kanban'],
-  summary: 'Delete a kanban task',
-  request: { params: kanbanTaskIdParamsSchema },
-  responses: {
-    200: {
-      content: { 'application/json': { schema: deleteKanbanTaskResponseSchema } },
-      description: 'Deleted',
-    },
-    404: jsonError('Not found'),
-    500: jsonError('Server error'),
   },
 });
 
@@ -4690,69 +4601,5 @@ export function registerApiRoutes(
     if (!BUNDLED_IS_BINARY) return c.json(noUpdate);
     const result = await checkForUpdate(appVersion);
     return c.json(result ?? noUpdate);
-  });
-
-  // =========================================================================
-  // Kanban task endpoints (dev-system pipeline board)
-  // =========================================================================
-
-  // GET /api/tasks
-  registerOpenApiRoute(listKanbanTasksRoute, async c => {
-    try {
-      const project = c.req.query('project');
-      const status = c.req.query('status') as kanbanDb.KanbanTaskStatus | undefined;
-      const limitRaw = c.req.query('limit');
-      const offsetRaw = c.req.query('offset');
-      const tasks = await kanbanDb.listKanbanTasks({
-        project: project || undefined,
-        status: status || undefined,
-        limit: limitRaw ? Number(limitRaw) : undefined,
-        offset: offsetRaw ? Number(offsetRaw) : undefined,
-      });
-      return c.json({ tasks });
-    } catch (error) {
-      getLog().error({ err: error }, 'list_kanban_tasks_failed');
-      return apiError(c, 500, 'Failed to list kanban tasks');
-    }
-  });
-
-  // POST /api/tasks
-  registerOpenApiRoute(createKanbanTaskRoute, async c => {
-    try {
-      const body = getValidatedBody(c, createKanbanTaskBodySchema);
-      const task = await kanbanDb.createKanbanTask(body);
-      return c.json(task, 201);
-    } catch (error) {
-      getLog().error({ err: error }, 'create_kanban_task_failed');
-      return apiError(c, 500, 'Failed to create kanban task');
-    }
-  });
-
-  // PATCH /api/tasks/:id
-  registerOpenApiRoute(patchKanbanTaskRoute, async c => {
-    const id = c.req.param('id') ?? '';
-    try {
-      const body = getValidatedBody(c, updateKanbanTaskBodySchema);
-      const existing = await kanbanDb.getKanbanTask(id);
-      if (!existing) return apiError(c, 404, 'Kanban task not found');
-      const updated = await kanbanDb.updateKanbanTask(id, body);
-      return c.json(updated);
-    } catch (error) {
-      getLog().error({ err: error, id }, 'update_kanban_task_failed');
-      return apiError(c, 500, 'Failed to update kanban task');
-    }
-  });
-
-  // DELETE /api/tasks/:id
-  registerOpenApiRoute(deleteKanbanTaskRoute, async c => {
-    const id = c.req.param('id') ?? '';
-    try {
-      const removed = await kanbanDb.deleteKanbanTask(id);
-      if (!removed) return apiError(c, 404, 'Kanban task not found');
-      return c.json({ success: true });
-    } catch (error) {
-      getLog().error({ err: error, id }, 'delete_kanban_task_failed');
-      return apiError(c, 500, 'Failed to delete kanban task');
-    }
   });
 }

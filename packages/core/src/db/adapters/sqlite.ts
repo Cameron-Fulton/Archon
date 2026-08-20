@@ -748,22 +748,6 @@ export class SqliteAdapter implements IDatabase {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
 
-      -- From PG migration 022: kanban tasks (dev-system pipeline board)
-      CREATE TABLE IF NOT EXISTS remote_agent_kanban_tasks (
-        id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
-        project TEXT NOT NULL,
-        title TEXT NOT NULL,
-        description TEXT,
-        status TEXT NOT NULL DEFAULT 'backlog',
-        priority TEXT NOT NULL DEFAULT 'normal',
-        prd_id TEXT,
-        flags TEXT NOT NULL DEFAULT '{}',
-        workflow_run_id TEXT REFERENCES remote_agent_workflow_runs(id) ON DELETE SET NULL,
-        branch TEXT,
-        created_at TEXT DEFAULT (datetime('now')),
-        updated_at TEXT DEFAULT (datetime('now'))
-      );
-
       -- Per-node provider session IDs persisted across workflow re-runs
       CREATE TABLE IF NOT EXISTS remote_agent_workflow_node_sessions (
         workflow_name TEXT NOT NULL,
@@ -818,14 +802,6 @@ export class SqliteAdapter implements IDatabase {
         ON remote_agent_sessions(parent_session_id);
       CREATE INDEX IF NOT EXISTS idx_sessions_conversation_started
         ON remote_agent_sessions(conversation_id, started_at DESC);
-
-      -- From PG migration 022: kanban task indexes
-      CREATE INDEX IF NOT EXISTS idx_kanban_tasks_status
-        ON remote_agent_kanban_tasks(status);
-      CREATE INDEX IF NOT EXISTS idx_kanban_tasks_project
-        ON remote_agent_kanban_tasks(project);
-      CREATE INDEX IF NOT EXISTS idx_kanban_tasks_workflow_run_id
-        ON remote_agent_kanban_tasks(workflow_run_id);
 
       -- User identity index. user_identities is a new table created above
       -- so its user_id column always exists. Indexes for the user_id columns
