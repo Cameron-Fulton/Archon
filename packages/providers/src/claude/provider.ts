@@ -50,6 +50,16 @@ import { CLAUDE_CAPABILITIES } from './capabilities';
 import { buildContainerSpawn } from './container-spawn';
 import { resolveClaudeBinaryPath, pathKind } from './binary-resolver';
 import { buildArchonMcpServer, ARCHON_TOOL_SERVER } from './native-tools';
+import {
+  AccountPool,
+  accountFailureKind,
+  envForAccount,
+  parseResetText,
+  requestHasOwnCredential,
+  tapRateLimits,
+  withoutPoolSecrets,
+  type RateLimitSink,
+} from './account-pool';
 import { createLogger } from '@archon/paths';
 import { loadMcpConfig } from '../mcp/config';
 import { withResumedOutcome, resumedOutcome } from '../shared/resumed';
@@ -176,7 +186,7 @@ function buildSubprocessEnv(): NodeJS.ProcessEnv {
     { authMode },
     authMode === 'global' ? 'using_global_auth' : 'using_explicit_tokens'
   );
-  return { ...process.env };
+  return withoutPoolSecrets({ ...process.env });
 }
 
 /**
@@ -1447,6 +1457,18 @@ export class ClaudeProvider implements IAgentProvider {
     // process.env never crosses the boundary (the isolation invariant); the host
     // path inherits the (already-cleaned) process env exactly as before.
     const env = buildRequestSubprocessEnv(requestOptions);
+
+    // Optional subscription account rotation (account-pool.ts). Host runs only:
+    // a container run's credentials are the Archon-managed bag by design, and a
+    // request that brings its own credential keeps it.
+    const pool =
+      isContainerRun || requestHasOwnCredential(requestOptions?.env)
+        ? undefined
+        : AccountPool.fromEnv(process.env);
+    const triedAccounts = new Set<string>();
+    let account = pool?.pick();
+    if (pool && !account) throw pool.exhausted();
+
     const settingSources =
       requestOptions?.nodeConfig?.settingSources ??
       assistantDefaults.settingSources ??
@@ -1488,10 +1510,17 @@ export class ClaudeProvider implements IAgentProvider {
       requestOptions.abortSignal.addEventListener('abort', onAbort, { once: true });
     }
 
-    for (let attempt = 0; attempt <= MAX_SUBPROCESS_RETRIES; attempt++) {
+    // Rotating to another account is not a retry of the same thing, so it has
+    // its own bound (each account at most once per request) beside the backoff
+    // retry budget.
+    let backoffRetries = 0;
+    const maxAttempts = MAX_SUBPROCESS_RETRIES + (pool?.size ?? 0);
+    for (let attempt = 0; attempt <= maxAttempts; attempt++) {
       if (requestOptions?.abortSignal?.aborted) {
         throw new Error('Query aborted');
       }
+      const attemptEnv = account ? envForAccount(env, account) : env;
+      const rateLimits: RateLimitSink = {};
 
       const stderrLines: string[] = [];
       const toolResultQueue: ToolResultEntry[] = [];
@@ -1506,7 +1535,7 @@ export class ClaudeProvider implements IAgentProvider {
         controller,
         stderrLines,
         toolResultQueue,
-        env,
+        attemptEnv,
         resolvedCliPath,
         [...settingSources]
       );
@@ -1548,7 +1577,12 @@ export class ClaudeProvider implements IAgentProvider {
           options.env as Record<string, string>,
           options.model
         );
-        const events = withFirstMessageTimeout(rawEvents, controller, timeoutMs, diagnostics);
+        const events = withFirstMessageTimeout(
+          pool ? tapRateLimits(rawEvents, rateLimits) : rawEvents,
+          controller,
+          timeoutMs,
+          diagnostics
+        );
 
         // 5. Stream normalized events
         // Claude resumes-or-errors: an invalid resume id throws (and is
@@ -1558,6 +1592,7 @@ export class ClaudeProvider implements IAgentProvider {
           streamClaudeMessages(events, toolResultQueue),
           resumedOutcome(resumeSessionId, true)
         );
+        if (pool && account) pool.recordSuccess(account.name);
         return;
       } catch (error) {
         const err = error as Error;
@@ -1579,11 +1614,46 @@ export class ClaudeProvider implements IAgentProvider {
           'query_error'
         );
 
-        if (!shouldRetry || attempt >= MAX_SUBPROCESS_RETRIES) {
+        if (pool && account) {
+          const failureText = `${enrichedError.message} ${stderrLines.join('\n')}`;
+          const kind = accountFailureKind(errorClass, failureText, rateLimits);
+          if (kind !== 'none') {
+            const until =
+              kind === 'quota'
+                ? pool.blockForQuota(
+                    account.name,
+                    rateLimits.rejectedResetAt ?? parseResetText(failureText)
+                  )
+                : pool.blockForAuth(account.name);
+            triedAccounts.add(account.name);
+            const blocked = account.name;
+            const next = pool.pick(triedAccounts);
+            getLog().warn(
+              {
+                account: blocked,
+                reason: kind,
+                blockedUntil: new Date(until).toISOString(),
+                next: next?.name,
+              },
+              'claude.account_blocked'
+            );
+            if (!next) throw pool.exhausted(enrichedError);
+            account = next;
+            yield {
+              type: 'system' as const,
+              content: `Claude account ${blocked} is blocked (${kind === 'quota' ? 'usage limit' : 'auth failure'}) until ${new Date(until).toISOString()}; continuing on ${next.name}.`,
+            };
+            lastError = enrichedError;
+            continue;
+          }
+        }
+
+        if (!shouldRetry || backoffRetries >= MAX_SUBPROCESS_RETRIES) {
           throw enrichedError;
         }
 
-        const delayMs = this.retryBaseDelayMs * Math.pow(2, attempt);
+        const delayMs = this.retryBaseDelayMs * Math.pow(2, backoffRetries);
+        backoffRetries++;
         getLog().info({ attempt, delayMs, errorClass }, 'retrying_subprocess');
         await new Promise(resolve => setTimeout(resolve, delayMs));
         lastError = enrichedError;
