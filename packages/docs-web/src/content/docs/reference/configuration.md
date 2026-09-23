@@ -445,6 +445,21 @@ Environment variables override all other configuration. They are organized by ca
 
 When `CLAUDE_USE_GLOBAL_AUTH` is unset, Archon auto-detects: it uses explicit tokens if present, otherwise falls back to global auth.
 
+#### Rotating across several Claude subscriptions
+
+Set `ARCHON_CLAUDE_ACCOUNTS` to a comma-separated list of names, and give each one an OAuth token from `claude setup-token`:
+
+```ini
+ARCHON_CLAUDE_ACCOUNTS=max1,max2,team1
+ARCHON_CLAUDE_ACCOUNT_MAX1_TOKEN=sk-ant-oat01-...
+ARCHON_CLAUDE_ACCOUNT_MAX2_TOKEN=sk-ant-oat01-...
+ARCHON_CLAUDE_ACCOUNT_TEAM1_TOKEN=sk-ant-oat01-...
+```
+
+Each Claude step then runs on the least-recently-used account that is not blocked. An account that hits its usage limit is blocked until its reset time, and the step continues on the next account. An account whose token fails is blocked for one minute, rising to ten on repeated failures. Server overload is retried on the same account as usual. When every account is blocked, the step fails with an error naming the earliest reset. If any of them hit a usage limit, that error is one `workflows.autoResumeOnQuotaReset` recognizes, so the run can resume when the first account frees up.
+
+The pool replaces `ANTHROPIC_API_KEY` and `CLAUDE_API_KEY` for those steps, so an API key in the environment never bills in its place. It is off when `ARCHON_CLAUDE_ACCOUNTS` is unset, for container runs, and for requests that carry their own credential. Block state lives in `~/.archon/claude-account-pool.json`; set `ARCHON_CLAUDE_ACCOUNT_STATE` to move it.
+
 ### AI Providers -- Codex
 
 | Variable | Description | Default |
