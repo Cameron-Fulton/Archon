@@ -21,6 +21,7 @@ import {
   parseResetText,
   requestHasOwnCredential,
   tapRateLimits,
+  withoutPoolSecrets,
   type RateLimitSink,
 } from './account-pool';
 
@@ -58,6 +59,17 @@ describe('envForAccount', () => {
     expect(env.ANTHROPIC_API_KEY).toBeUndefined();
     expect(env.CLAUDE_API_KEY).toBeUndefined();
     expect(env.PATH).toBe('/bin');
+  });
+
+  test('pool variables never reach a subprocess env', () => {
+    const env = withoutPoolSecrets({
+      PATH: '/bin',
+      ARCHON_CLAUDE_ACCOUNTS: 'a',
+      ARCHON_CLAUDE_ACCOUNT_A_TOKEN: 'secret',
+      ARCHON_CLAUDE_ACCOUNT_STATE: '/x',
+      ARCHON_HOME: '/h',
+    });
+    expect(env).toEqual({ PATH: '/bin', ARCHON_HOME: '/h' });
   });
 
   test('a request that brings its own credential is recognised', () => {
@@ -303,15 +315,19 @@ describe('AccountPool', () => {
     p.blockForQuota('a', clock + 90_000);
     p.blockForAuth('b');
     p.blockForQuota('c', clock + 120_000);
-    // earliest is b's one-minute auth block; any quota block marks it resumable
-    const at = clock + AUTH_BLOCK_STEPS_MS[0];
-    expect(p.exhausted().message).toContain(`usage limit reached|${Math.ceil(at / 1000)}`);
+    // b's one-minute auth block is earliest, but the resume instant is a's quota reset
+    const message = p.exhausted().message;
+    expect(message).toContain('(b)');
+    expect(message).toContain(`usage limit reached|${Math.ceil((clock + 90_000) / 1000)}`);
   });
 
   test('exhausted by auth failures alone is not called a usage limit', () => {
     const p = pool();
     for (const n of ['a', 'b', 'c']) p.blockForAuth(n);
-    expect(p.exhausted().message).not.toContain('usage limit');
+    const message = p.exhausted(new Error('Claude API error (authentication_failed): 401')).message;
+    expect(message).not.toContain('usage limit');
+    // the cause's text keeps the workflow executor's fatal classification
+    expect(message).toContain('authentication_failed');
   });
 
   test('a corrupt state file costs history, not the pick', () => {

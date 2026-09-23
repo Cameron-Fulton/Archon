@@ -71,6 +71,7 @@ describe('ClaudeProvider account pool', () => {
   const saved: Record<string, string | undefined> = {};
   let tokensSeen: Array<string | undefined>;
   let apiKeysSeen: Array<string | undefined>;
+  let poolVarsSeen: string[][];
 
   async function run(gen: AsyncIterable<Record<string, unknown>>) {
     const chunks: Array<Record<string, unknown>> = [];
@@ -88,6 +89,7 @@ describe('ClaudeProvider account pool', () => {
     mockQuery.mockImplementation(async function* (params) {
       const env = (params.options as Options).env ?? {};
       tokensSeen.push(env.CLAUDE_CODE_OAUTH_TOKEN);
+      poolVarsSeen.push(Object.keys(env).filter(k => k.startsWith('ARCHON_CLAUDE_ACCOUNT')));
       apiKeysSeen.push(env.ANTHROPIC_API_KEY);
       const events = attempts[Math.min(i++, attempts.length - 1)];
       for (const e of events) yield e;
@@ -112,6 +114,7 @@ describe('ClaudeProvider account pool', () => {
     mockQuery.mockClear();
     tokensSeen = [];
     apiKeysSeen = [];
+    poolVarsSeen = [];
   });
 
   afterEach(() => {
@@ -130,6 +133,8 @@ describe('ClaudeProvider account pool', () => {
     expect(tokensSeen).toEqual(['tok-a', 'tok-b']);
     // the host API key would outrank the pool token, so it never reaches the CLI
     expect(apiKeysSeen).toEqual([undefined, undefined]);
+    // no attempt can read the other accounts' tokens
+    expect(poolVarsSeen).toEqual([[], []]);
     const note = chunks.find(
       c => c.type === 'system' && String(c.content).includes('continuing on b')
     );
@@ -214,6 +219,7 @@ describe('ClaudeProvider account pool', () => {
     );
 
     expect(tokensSeen).toEqual(['per-user']);
+    expect(poolVarsSeen).toEqual([[]]);
   });
 
   test('pool off: credentials are exactly what they were', async () => {

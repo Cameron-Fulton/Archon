@@ -57,6 +57,7 @@ import {
   parseResetText,
   requestHasOwnCredential,
   tapRateLimits,
+  withoutPoolSecrets,
   type RateLimitSink,
 } from './account-pool';
 import { createLogger } from '@archon/paths';
@@ -185,7 +186,7 @@ function buildSubprocessEnv(): NodeJS.ProcessEnv {
     { authMode },
     authMode === 'global' ? 'using_global_auth' : 'using_explicit_tokens'
   );
-  return { ...process.env };
+  return withoutPoolSecrets({ ...process.env });
 }
 
 /**

@@ -79,6 +79,18 @@ export function envForAccount(env: NodeJS.ProcessEnv, account: PoolAccount): Nod
   return { ...Object.fromEntries(kept), CLAUDE_CODE_OAUTH_TOKEN: account.token };
 }
 
+/**
+ * Drop the pool's own variables. Every host-run subprocess inherits the host
+ * env, so without this every agent shell could read every pool token.
+ */
+export function withoutPoolSecrets(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return Object.fromEntries(
+    Object.entries(env).filter(
+      ([k]) => k !== 'ARCHON_CLAUDE_ACCOUNTS' && !k.startsWith('ARCHON_CLAUDE_ACCOUNT_')
+    )
+  );
+}
+
 /** A request that brings its own credential (per-user delivery) bypasses the pool. */
 export function requestHasOwnCredential(requestEnv: Record<string, string> | undefined): boolean {
   if (!requestEnv) return false;
@@ -286,7 +298,7 @@ export class ClaudeAccountsExhaustedError extends Error {
   constructor(
     total: number,
     earliest: { name: string; at: number } | undefined,
-    anyQuota: boolean,
+    earliestQuotaAt: number | undefined,
     cause?: Error
   ) {
     const when = earliest
@@ -294,12 +306,18 @@ export class ClaudeAccountsExhaustedError extends Error {
       : '';
     // The legacy CLI form is what the workflow executor already reads as quota
     // exhaustion with a reset instant, so `workflows.autoResumeOnQuotaReset`
-    // can resume the run when the first account frees up.
+    // can resume the run. It names the first QUOTA reset: a short auth block on
+    // one account must not spend the resume budget before the limits lift.
     const marker =
-      earliest && anyQuota
-        ? ` (Claude AI usage limit reached|${Math.ceil(earliest.at / 1000)})`
+      earliestQuotaAt !== undefined
+        ? ` (Claude AI usage limit reached|${Math.ceil(earliestQuotaAt / 1000)})`
         : '';
-    super(`All ${total} Claude accounts in ARCHON_CLAUDE_ACCOUNTS are blocked${when}${marker}`);
+    // the last failure's own text keeps the executor's classification (an auth
+    // failure stays fatal)
+    const last = cause ? `. Last failure: ${cause.message}` : '';
+    super(
+      `All ${total} Claude accounts in ARCHON_CLAUDE_ACCOUNTS are blocked${when}${marker}${last}`
+    );
     this.name = 'ClaudeAccountsExhaustedError';
     this.earliestResetAt = earliest?.at;
     if (cause) this.cause = cause;
@@ -390,15 +408,17 @@ export class AccountPool {
     const state = this.read();
     const now = this.now();
     let earliest: { name: string; at: number } | undefined;
-    let anyQuota = false;
+    let earliestQuotaAt: number | undefined;
     for (const a of this.accounts) {
       const s = state[a.name];
       const at = s?.blockedUntil;
       if (at === undefined || at <= now) continue;
-      if (s?.blockReason === 'quota') anyQuota = true;
+      if (s?.blockReason === 'quota' && (earliestQuotaAt === undefined || at < earliestQuotaAt)) {
+        earliestQuotaAt = at;
+      }
       if (earliest === undefined || at < earliest.at) earliest = { name: a.name, at };
     }
-    return new ClaudeAccountsExhaustedError(this.size, earliest, anyQuota, cause);
+    return new ClaudeAccountsExhaustedError(this.size, earliest, earliestQuotaAt, cause);
   }
 
   private read(): PoolState {
