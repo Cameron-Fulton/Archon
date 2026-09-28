@@ -23,6 +23,12 @@ deliver tail's convergence pass decides what it means — introduced red is
 correction work, while inherited or environment red pauses for explicit
 operator action. Nothing here retries: a concluded check does not re-run itself.
 
+Only the base branch's REQUIRED checks count (`gh pr checks --required`). A
+non-required check is advisory by the repository's own policy, and one that can
+never pass (a preview-deployment QA bot on a project with no previews) would
+otherwise stall every run at this wait. A repository with no required checks
+concludes here, named; the merge queue still reads the full check state.
+
 The one in-process wait left: when CI is configured but nothing has started
 yet, registration gets a single 60 s grace before the maintainer-gated skip is
 declared — the same grace the polling predecessor gave it.
@@ -34,13 +40,19 @@ import sys
 import time
 
 
-def checks() -> list[dict]:
+NO_REQUIRED = "no required checks"
+
+
+def checks() -> list[dict] | str:
     proc = subprocess.run(
-        ["gh", "pr", "checks", "--json", "name,bucket"],
+        ["gh", "pr", "checks", "--required", "--json", "name,bucket"],
         capture_output=True,
         text=True,
     )
-    if proc.returncode != 0 and "no checks reported" in (proc.stdout + proc.stderr).lower():
+    said = (proc.stdout + proc.stderr).lower()
+    if proc.returncode != 0 and "no required checks reported" in said:
+        return NO_REQUIRED
+    if proc.returncode != 0 and "no checks reported" in said:
         return []
     # Non-zero with data still parses: gh exits 1 when checks failed.
     try:
@@ -79,6 +91,8 @@ def conclude(detail: str) -> int:
 
 def main() -> int:
     rounds = checks()
+    if rounds == NO_REQUIRED:
+        return conclude("the base branch requires no checks, so there is nothing to await")
     if not rounds:
         active = repo_has_active_workflows()
         if active is False:
@@ -88,6 +102,8 @@ def main() -> int:
         # gated CI is a maintainer's power, not this run's.
         time.sleep(60)
         rounds = checks()
+        if rounds == NO_REQUIRED:
+            return conclude("the base branch requires no checks, so there is nothing to await")
         if not rounds:
             return conclude(
                 "CI is configured but no checks started on this PR — most likely awaiting "

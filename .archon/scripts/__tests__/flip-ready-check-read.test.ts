@@ -61,6 +61,7 @@ if [ "$1" = "api" ] && [ "$2" = "graphql" ]; then
   exit 0
 fi
 if [ "$1" = "pr" ] && [ "$2" = "checks" ]; then
+  case "$*" in *--required*) ;; *) echo "fake gh: flip-ready must read required checks only" >&2; exit 1 ;; esac
   if [ -n '${gh.checksFail ?? ''}' ]; then echo '${gh.checksFail ?? ''}' >&2; exit 1; fi
   printf '%s' '${gh.checksOut ?? ''}'
   exit 0
@@ -142,6 +143,16 @@ describe('flip-ready check-state read', () => {
 
   it('proceeds when every observed check is green or skipped', () => {
     const result = runFlipReady({ graphqlOut: '2', checksOut: '' });
+
+    expect(result.code).toBe(0);
+    expect(result.readyCalled).toBe(true);
+  });
+
+  it('proceeds when checks exist but the base branch requires none', () => {
+    const result = runFlipReady({
+      graphqlOut: '1',
+      checksFail: "no required checks reported on the 'feature' branch",
+    });
 
     expect(result.code).toBe(0);
     expect(result.readyCalled).toBe(true);
