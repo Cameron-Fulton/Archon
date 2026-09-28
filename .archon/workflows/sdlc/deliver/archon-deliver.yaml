@@ -387,7 +387,7 @@ nodes:
       # with CI still running). Red counts as done here; ci-verdict below is
       # the node that classifies a concluded red — never flip-ready first —
       # and flip-ready's preflight refuses any non-green state regardless.
-      until_bash: '! gh pr checks --json bucket --jq ".[].bucket" 2>/dev/null | grep -q "^pending$"'
+      until_bash: '! gh pr checks --required --json bucket --jq ".[].bucket" 2>/dev/null | grep -q "^pending$"'
       nodes:
         - id: ci-probe
           script: check-ci
@@ -501,7 +501,7 @@ nodes:
   - id: await-fix-checks
     loop_group:
       max_iterations: 13
-      until_bash: '! gh pr checks --json bucket --jq ".[].bucket" 2>/dev/null | grep -q "^pending$"'
+      until_bash: '! gh pr checks --required --json bucket --jq ".[].bucket" 2>/dev/null | grep -q "^pending$"'
       nodes:
         - id: fix-ci-probe
           script: check-ci
@@ -595,13 +595,21 @@ nodes:
         exit 1
       fi
       if [ "$CHECK_COUNT" -gt 0 ]; then
-        # Checks exist: classify them with gh's structured bucket mapping. This
-        # read cannot legitimately be empty (the count above saw checks), so a
-        # failure here is a failed read too, never a no-checks case.
-        if ! NOT_GREEN=$(gh pr checks "$PR_NUMBER" --repo "$ORIGIN_REPO" --json name,bucket --jq '.[] | select(.bucket != "pass" and .bucket != "skipping") | "\(.name) (\(.bucket))"' 2>/dev/null); then
-          printf '%s\n' "flip-ready: checks exist but their state could not be read." >&2
-          exit 1
+        # Checks exist: classify the base branch's REQUIRED ones with gh's
+        # structured bucket mapping, matching the probe. gh exits non-zero with
+        # "no required checks reported" when the branch requires none; that is
+        # an answer, not a failed read. Any other failure refuses.
+        CHECKS_ERR=$(mktemp)
+        if ! NOT_GREEN=$(gh pr checks "$PR_NUMBER" --repo "$ORIGIN_REPO" --required --json name,bucket --jq '.[] | select(.bucket != "pass" and .bucket != "skipping") | "\(.name) (\(.bucket))"' 2>"$CHECKS_ERR"); then
+          if grep -qi "no required checks reported" "$CHECKS_ERR"; then
+            NOT_GREEN=""
+          else
+            rm -f "$CHECKS_ERR"
+            printf '%s\n' "flip-ready: checks exist but their state could not be read." >&2
+            exit 1
+          fi
         fi
+        rm -f "$CHECKS_ERR"
         if [ -n "$NOT_GREEN" ]; then
           printf '%s\n' "flip-ready: refusing to flip with non-green checks: $NOT_GREEN" >&2
           exit 1
