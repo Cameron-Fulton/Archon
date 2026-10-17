@@ -1,6 +1,12 @@
 import { requestJson } from '../lib/http';
-import { toWorkflow, type Workflow, type WorkflowSource } from '../primitives/workflow';
+import {
+  toWorkflow,
+  type Workflow,
+  type WorkflowSource,
+  type RawWorkflowShape,
+} from '../primitives/workflow';
 import type { WorkflowGraphNode } from '../primitives/workflow-graph';
+import type { BuilderWorkflowDefinition } from '../builder/types';
 import type { WireWorkflowDefinition } from '../builder/types/wire';
 
 interface RawNode {
@@ -11,15 +17,21 @@ interface RawNode {
   command?: string;
   cancel?: string;
   approval?: unknown;
+  wait?: unknown;
   loop?: unknown;
   script?: unknown;
 }
 
-interface RawWorkflow {
-  name: string;
-  description?: string;
+/**
+ * Shares `RawWorkflowShape` with `toWorkflow`'s own wire type rather than re-declaring
+ * the common fields: `listWorkflows` feeds these entries straight into `toWorkflow`, so
+ * a field this copy omitted (as it once omitted `inputs`) would still compile and still
+ * arrive at runtime, leaving the type quietly wrong. `nodes` is the one field only this
+ * side needs — `getWorkflowGraph` reads it.
+ */
+type RawWorkflow = RawWorkflowShape & {
   nodes?: RawNode[];
-}
+};
 
 interface WorkflowListEntry {
   workflow: RawWorkflow;
@@ -49,6 +61,7 @@ export async function listWorkflows(cwd?: string): Promise<WorkflowListResult> {
 function nodeKind(n: RawNode): WorkflowGraphNode['kind'] {
   if (n.loop !== undefined) return 'loop';
   if (n.approval !== undefined) return 'approval';
+  if (n.wait !== undefined) return 'wait';
   if (n.cancel !== undefined) return 'cancel';
   if (n.bash !== undefined) return 'bash';
   if (n.command !== undefined) return 'command';
@@ -89,7 +102,7 @@ export async function getWorkflowGraph(name: string, cwd?: string): Promise<Work
 // ---------------------------------------------------------------------------
 
 /**
- * Where a loaded workflow lives. Read-only iff `source === 'bundled'`.
+ * Where a loaded workflow lives. Read-only for `bundled` and `installed` (see `isReadOnlySource`).
  * Re-exported from `primitives/workflow` (single source of truth) so the union
  * cannot silently diverge between the list primitive and the CRUD verbs.
  */
@@ -100,16 +113,53 @@ export type WorkflowSaveSource = 'project' | 'global';
 
 /** `GET /api/workflows/:name` response. */
 export interface GetWorkflowResponse {
-  workflow: WireWorkflowDefinition;
+  /** The engine-normalized form (`kind`/`source`/…) — what runs, not what was written. */
+  workflow: unknown;
+  /**
+   * The file's YAML mapping before normalization. This is the builder's wire
+   * shape (`WireWorkflowDefinition` is the authored `DagNode`) and the only form
+   * PUT/validate accept back.
+   */
+  authored?: Record<string, unknown>;
   filename: string;
-  source: WorkflowSource;
+  /**
+   * Where the workflow came from. `Workflow['source']` widens to
+   * `WorkflowSource | (string & {})` so an unrecognised value (#2578) is
+   * surfaced verbatim rather than silently collapsed — the single-endpoint
+   * wire shape and `LoadedWorkflow` must match `Workflow.source` for the
+   * load-state chain to type-check end-to-end without a cast.
+   */
+  source: Workflow['source'];
 }
 
 /** Normalized result of `loadWorkflow`. */
 export interface LoadedWorkflow {
   definition: WireWorkflowDefinition;
   filename: string;
-  source: WorkflowSource;
+  /**
+   * Where the workflow came from. Same widening rationale as
+   * `GetWorkflowResponse.source`: an unrecognised value reaches the editor
+   * verbatim and the downstream helpers (`isReadOnlySource`, `saveTargetFor`)
+   * — both accepting `string` — decide what to do with it.
+   */
+  source: Workflow['source'];
+}
+
+/**
+ * An installed-pack workflow (`owner/plugin:entrypoint`). The server resolves it through
+ * the catalog and returns no authored form, so the builder shows it as read-only instead
+ * of opening an editor on it.
+ */
+export interface InstalledPackWorkflow {
+  installedPack: true;
+  name: string;
+}
+
+/** What `loadWorkflow` resolves to: a definition to edit, or a pack workflow that has none. */
+export type WorkflowLoad = LoadedWorkflow | InstalledPackWorkflow;
+
+export function isInstalledPackWorkflow(load: WorkflowLoad): load is InstalledPackWorkflow {
+  return 'installedPack' in load;
 }
 
 /**
@@ -136,9 +186,17 @@ export function buildSavePath(name: string, cwd: string, source: WorkflowSaveSou
  * `.archon/workflows/<subdir>/` (matches `getWorkflowGraph`'s note). Workflows
  * in subfolders won't load here — callers surface a "not found" empty state.
  */
-export async function loadWorkflow(name: string, cwd: string): Promise<LoadedWorkflow> {
+export async function loadWorkflow(name: string, cwd: string): Promise<WorkflowLoad> {
   const res = await requestJson<GetWorkflowResponse>(buildWorkflowPath(name, cwd));
-  return { definition: res.workflow, filename: res.filename, source: res.source };
+  if (res.authored === undefined) {
+    if (res.source === 'installed') return { installedPack: true, name };
+    // Editing the normalized form would open every node as unrecognised and
+    // write them back as empty prompts — refuse rather than corrupt on save.
+    throw new Error(`GET /api/workflows/${name} returned no authored form; cannot edit it`);
+  }
+  // The server parsed this same mapping with parseWorkflow before answering.
+  const definition = res.authored as unknown as WireWorkflowDefinition;
+  return { definition, filename: res.filename, source: res.source };
 }
 
 /** Persist (create or update) a workflow YAML via PUT `?cwd=&source=`. */
@@ -151,7 +209,9 @@ export async function saveWorkflow(
     method: 'PUT',
     body: JSON.stringify({ definition }),
   });
-  return { definition: res.workflow, filename: res.filename, source: res.source };
+  // The file now holds exactly `definition` (the PUT response carries only the
+  // normalized form), so that is the authored definition to report back.
+  return { definition, filename: res.filename, source: res.source };
 }
 
 /** Delete a user-defined workflow via DELETE `?cwd=&source=`. Bundled deletes 400 server-side. */
@@ -168,7 +228,7 @@ export async function deleteWorkflow(
  * NO `?cwd=` (validation is stateless).
  */
 export function validateWorkflow(
-  definition: WireWorkflowDefinition
+  definition: BuilderWorkflowDefinition
 ): Promise<ValidateWorkflowResponse> {
   return requestJson<ValidateWorkflowResponse>('/api/workflows/validate', {
     method: 'POST',

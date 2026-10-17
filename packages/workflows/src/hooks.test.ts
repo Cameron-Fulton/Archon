@@ -1,7 +1,8 @@
+import { providerRegistry } from '@archon/providers';
 import { describe, test, expect } from 'bun:test';
 import { parseNodeHooks } from './loader';
 import { buildSDKHooksFromYAML } from '@archon/providers/claude/provider';
-import type { WorkflowNodeHooks } from './schemas';
+import type { WorkflowNodeHooks, DagNode } from './schemas';
 import { parseWorkflow } from './loader';
 
 describe('parseNodeHooks', () => {
@@ -213,11 +214,11 @@ nodes:
         - response:
             systemMessage: "Verify output"
 `;
-    const result = parseWorkflow(yaml, 'test.yaml');
+    const result = parseWorkflow(yaml, 'test.yaml', providerRegistry);
     expect(result.error).toBeNull();
     const workflow = result.workflow!;
     expect(workflow.nodes).toBeDefined();
-    const node = workflow.nodes![0];
+    const node = workflow.nodes![0] as DagNode;
     expect(node.hooks).toBeDefined();
     expect(node.hooks!.PreToolUse).toHaveLength(1);
     expect(node.hooks!.PreToolUse![0].matcher).toBe('Bash');
@@ -236,11 +237,11 @@ nodes:
         - response:
             decision: block
 `;
-    const result = parseWorkflow(yaml, 'test.yaml');
+    const result = parseWorkflow(yaml, 'test.yaml', providerRegistry);
     // Bash nodes ignore AI fields including hooks — the node should parse successfully
     // but hooks should not be on the parsed node
     expect(result.error).toBeNull();
-    const node = result.workflow!.nodes![0];
+    const node = result.workflow!.nodes![0] as DagNode;
     expect(node.hooks).toBeUndefined();
   });
 });

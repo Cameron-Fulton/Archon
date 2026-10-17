@@ -15,7 +15,7 @@ import {
   hasUncommittedChanges,
   toRepoPath,
 } from '@archon/git';
-import { createLogger, getArchonWorkspacesPath } from '@archon/paths';
+import { createLogger, isInsideArchonWorkspaces } from '@archon/paths';
 import type { Codebase, IPlatformAdapter } from '../types';
 
 const log = createLogger('orchestrator.post_message_reminder');
@@ -23,15 +23,13 @@ const log = createLogger('orchestrator.post_message_reminder');
 export async function reportUnpushedWorkInSource(
   conversationId: string,
   codebase: Codebase,
-  platform: IPlatformAdapter
+  platform: Pick<IPlatformAdapter, 'sendStructuredEvent'>
 ): Promise<void> {
   if (!platform.sendStructuredEvent) return;
 
   // Only meaningful for Archon-managed clones under ~/.archon/workspaces/.
   // Locally-registered repos are the user's working dir — they already see git status.
-  const archonWorkspacesPath = getArchonWorkspacesPath().replace(/\\/g, '/');
-  const cwdNormalized = codebase.default_cwd.replace(/\\/g, '/');
-  if (!cwdNormalized.startsWith(archonWorkspacesPath)) return;
+  if (!isInsideArchonWorkspaces(codebase.default_cwd)) return;
 
   const repoPath = toRepoPath(codebase.default_cwd);
   try {
@@ -49,7 +47,7 @@ export async function reportUnpushedWorkInSource(
     if (dirty) parts.push('uncommitted changes');
 
     await platform.sendStructuredEvent(conversationId, {
-      type: 'system',
+      type: 'system_status',
       content:
         `source/ has ${parts.join(' and ')} on ${branch}. ` +
         'Push or commit + push to preserve — local-only state may be lost on the next worktree creation, manual checkout, or re-clone.',

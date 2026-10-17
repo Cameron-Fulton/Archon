@@ -8,8 +8,10 @@ import {
   createReadTool,
   createWriteTool,
   type BashSpawnContext,
+  type AgentSession,
   type BashSpawnHook,
 } from '@earendil-works/pi-coding-agent';
+import { delimiter } from 'node:path';
 import type { ThinkingLevel } from '@earendil-works/pi-ai';
 
 /**
@@ -22,36 +24,38 @@ import type { ThinkingLevel } from '@earendil-works/pi-ai';
 type PiTool = ReturnType<typeof createCodingTools>[number];
 
 import type { NodeConfig } from '../../types';
+import { clampEffort, type AssertNever } from '@archon/provider-contract';
 
 // ─── Thinking level ────────────────────────────────────────────────────────
 
 /**
- * Pi's ThinkingLevel = 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'.
- * Archon's common surface includes 'off' (from Codex's modelReasoningEffort)
- * and 'max' (from Claude's EffortLevel enum). Map into Pi's vocabulary:
- *  - 'off'    → undefined (no explicit thinkingLevel; Pi's implicit off)
- *  - 'max'    → 'xhigh'  (Archon's EffortLevel doesn't have xhigh)
- *  - others pass through if they're already Pi-native
+ * Pi's `ThinkingLevel` spans the shared ladder through `max`; stronger rungs
+ * clamp to `max`.
  *
- * See packages/workflows/src/schemas/dag-node.ts#effortLevelSchema for
- * the Archon schema enum (`low | medium | high | max`). Workflow YAML can
- * only carry Archon-enum values; Pi-native `minimal` / `xhigh` are accepted
- * here for programmatic callers (orchestrator, tests) that bypass the
- * schema validator.
+ * `satisfies` alone would not have caught the omission this list previously
+ * carried: it proves every element IS a `ThinkingLevel` (containment), not that
+ * every `ThinkingLevel` appears (coverage). Missing `max` type-checked cleanly
+ * while silently downgrading `effort: max` on every Pi model that supports it.
+ * The coverage assertion below is the half `satisfies` cannot express.
  */
-const PI_NATIVE_LEVELS: ReadonlySet<ThinkingLevel> = new Set<ThinkingLevel>([
+const PI_NATIVE_LEVELS = [
   'minimal',
   'low',
   'medium',
   'high',
   'xhigh',
-]);
+  'max',
+] as const satisfies readonly ThinkingLevel[];
+
+/** Compile-time proof that PI_NATIVE_LEVELS covers Pi's whole vocabulary — a
+ *  rung the SDK gains (or one dropped here) becomes a type error, not a silent
+ *  downgrade. */
+export type PiLevelsAreComplete = AssertNever<
+  Exclude<ThinkingLevel, (typeof PI_NATIVE_LEVELS)[number]>
+>;
 
 function normalizeToThinkingLevel(v: unknown): ThinkingLevel | undefined {
-  if (typeof v !== 'string') return undefined;
-  if (v === 'max') return 'xhigh';
-  if (PI_NATIVE_LEVELS.has(v as ThinkingLevel)) return v as ThinkingLevel;
-  return undefined;
+  return clampEffort(v, PI_NATIVE_LEVELS);
 }
 
 export interface ResolvedThinkingLevel {
@@ -62,44 +66,18 @@ export interface ResolvedThinkingLevel {
 }
 
 /**
- * Resolve Archon's `effort` / `thinking` node fields to Pi's `ThinkingLevel`.
- *
- * Precedence: `thinking` > `effort` (when both are set and valid).
- * 'off' on either → `level: undefined` (Pi runs without explicit thinking).
- * Claude-shape `thinking: { type: 'enabled', budget_tokens: N }` object form →
- * warning, not applied.
+ * Resolve Archon's `effort` field to Pi's SDK-native `ThinkingLevel`.
  */
 export function resolvePiThinkingLevel(nodeConfig?: NodeConfig): ResolvedThinkingLevel {
   if (!nodeConfig) return { level: undefined };
 
-  const { thinking, effort } = nodeConfig;
-
-  // Explicit off on either field disables thinking entirely.
-  if (thinking === 'off' || effort === 'off') return { level: undefined };
-
-  // thinking takes precedence over effort when both are valid strings.
-  const thinkingLevel = normalizeToThinkingLevel(thinking);
-  if (thinkingLevel) return { level: thinkingLevel };
-
-  const effortLevel = normalizeToThinkingLevel(effort);
+  const effortLevel = normalizeToThinkingLevel(nodeConfig.effort);
   if (effortLevel) return { level: effortLevel };
 
-  // Claude uses a structured `{ type: 'enabled', budget_tokens: N }` shape —
-  // Pi doesn't understand it. Surface the mismatch so users can fix their YAML.
-  if (thinking !== undefined && thinking !== null && typeof thinking === 'object') {
+  if (nodeConfig.effort !== undefined) {
     return {
       level: undefined,
-      warning:
-        'Pi ignored `thinking` (object form is Claude-specific). Use `effort: low|medium|high|max` in YAML (max → xhigh on Pi).',
-    };
-  }
-
-  // String that isn't a known level (e.g. 'ultra') — warn so users fix it.
-  if (typeof thinking === 'string' || typeof effort === 'string') {
-    const offender = typeof thinking === 'string' ? thinking : effort;
-    return {
-      level: undefined,
-      warning: `Pi ignored unknown thinking level '${String(offender)}'. Valid: minimal, low, medium, high, xhigh, max, off.`,
+      warning: `Pi ignored invalid effort '${nodeConfig.effort}'.`,
     };
   }
 
@@ -115,15 +93,26 @@ export type PiToolName = (typeof PI_TOOL_NAMES)[number];
 /**
  * Build a Pi `spawnHook` that merges managed env vars into every bash
  * subprocess. Matches Claude/Codex precedence: caller-provided env keys
- * override Pi's inherited baseline. Returns undefined when `env` is empty
- * so bash spawns without an unnecessary hook allocation.
+ * override Pi's inherited baseline. A caller PATH (the run's `gh` shim) goes
+ * first, but Pi's baseline entries stay after it: Pi prepends its own bin dir,
+ * and replacing PATH outright would hide the tools Pi installed there.
+ * Returns undefined when `env` is empty so bash spawns without an unnecessary
+ * hook allocation.
  */
 function buildBashSpawnHook(env: Record<string, string> | undefined): BashSpawnHook | undefined {
   if (!env || Object.keys(env).length === 0) return undefined;
-  return (context: BashSpawnContext): BashSpawnContext => ({
-    ...context,
-    env: { ...context.env, ...env },
-  });
+  return (context: BashSpawnContext): BashSpawnContext => {
+    const merged = { ...context.env, ...env };
+    const basePath = context.env.PATH;
+    if (env.PATH !== undefined && basePath) {
+      const callerEntries = env.PATH.split(delimiter);
+      merged.PATH = [
+        ...callerEntries,
+        ...basePath.split(delimiter).filter(entry => !callerEntries.includes(entry)),
+      ].join(delimiter);
+    }
+    return { ...context, env: merged };
+  };
 }
 
 /** Map a normalized (lowercase) Pi tool name to its Pi-internal factory. */
@@ -174,6 +163,30 @@ const PI_DEFAULT_TOOL_NAMES = [
 export function buildDefaultPiTools(cwd: string, env?: Record<string, string>): PiTool[] {
   const spawnHook = buildBashSpawnHook(env);
   return PI_DEFAULT_TOOL_NAMES.map(name => buildPiTool(name, cwd, spawnHook));
+}
+
+/**
+ * The tools a fresh Pi session with no tool options starts with: the
+ * `defaultTools` setting (or Pi's default four) plus every extension tool that
+ * activates on registration. Mirrors `AgentSession`'s initial loadout so a
+ * reopened session can be reset to it; Pi 1.3+ otherwise restores the loadout
+ * its transcript records. Pi's own built-in tools carry the `builtin:<name>`
+ * source path; Archon loads no built-in extensions, so nothing else does.
+ */
+export function freshPiToolNames(
+  session: Pick<AgentSession, 'getAllTools' | 'getToolDefinition'>,
+  defaultToolNames: readonly string[] | undefined
+): string[] {
+  const extensionTools = session
+    .getAllTools()
+    .filter(
+      tool =>
+        tool.sourceInfo.path !== `builtin:${tool.name}` &&
+        (tool.exposure === 'direct' || tool.exposure === 'model-only') &&
+        session.getToolDefinition(tool.name)?.defaultActive !== false
+    )
+    .map(tool => tool.name);
+  return [...(defaultToolNames ?? PI_DEFAULT_TOOL_NAMES), ...extensionTools];
 }
 
 /**
@@ -260,5 +273,5 @@ export function resolvePiTools(
 // Skill resolution is shared across providers. Re-export `resolvePiSkills` as
 // an alias of the shared `resolveSkillDirectories` so existing Pi callers and
 // tests keep their import path stable.
-export { resolveSkillDirectories as resolvePiSkills } from '../../shared/skills';
-export type { ResolvedSkills } from '../../shared/skills';
+export { resolveSkillDirectories as resolvePiSkills } from '@archon/paths/skills';
+export type { ResolvedSkills } from '@archon/paths/skills';

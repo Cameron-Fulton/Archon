@@ -1,0 +1,311 @@
+import { providerRegistry } from '@archon/providers';
+import { afterAll, beforeEach, expect, mock, spyOn, test } from 'bun:test';
+import { mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { removeTempTree } from '@archon/paths/test-utils';
+import { registerBuiltinProviders } from '@archon/providers/in-process';
+import type { WorkflowDeps } from './deps';
+
+const root = await mkdtemp(join(tmpdir(), 'archon-live-bundle-'));
+let app = join(root, 'app');
+const project = join(root, 'project');
+const home = join(root, 'home');
+const originalHome = process.env.ARCHON_HOME;
+process.env.ARCHON_HOME = home;
+registerBuiltinProviders();
+const realPaths = await import('@archon/paths');
+mock.module('@archon/paths', () => ({
+  ...realPaths,
+  getBundledWorkflowsPath: () => join(app, 'workflows'),
+}));
+
+await mkdir(join(app, 'workflows'), { recursive: true });
+await pack(join(app, 'workflows'), 'shipped', 'shipped-flow');
+await pack(join(app, 'workflows'), 'excluded', 'excluded-flow');
+await pack(join(project, '.archon', 'workflows'), 'project-only', 'project-flow');
+await pack(join(home, 'workflows'), 'home-only', 'home-flow');
+
+const inventory = await import('./defaults/bundle-inventory');
+// A binary embeds the records the build reads from the indexed tree; these stand in for it.
+const actualDefaults = await import('./defaults/bundled-defaults');
+const embedded = await inventory.readBundleRecords(
+  await inventory.collectBundleSources(join(app, 'workflows'), ['shipped'])
+);
+let binary = false;
+mock.module('./defaults/bundled-defaults', () => ({
+  ...actualDefaults,
+  BUNDLED_COMMANDS: embedded.commands,
+  BUNDLED_WORKFLOWS: embedded.workflows,
+  BUNDLED_WORKFLOW_PATHS: embedded.workflowPaths,
+  BUNDLED_WORKFLOW_OWNERS: embedded.workflowOwners,
+  BUNDLED_SCRIPT_PACKS: embedded.scriptPacks,
+  isBinaryBuild: () => binary,
+}));
+const defaults = await import('./defaults/bundled-defaults');
+let selectedPacks = ['shipped'];
+const index = spyOn(inventory, 'readBundleIndex').mockImplementation(async () => selectedPacks);
+const { discoverWorkflows } = await import('./workflow-discovery');
+const { discoverScriptsForCwd } = await import('./script-discovery');
+const { loadCommandPrompt } = await import('./executor-shared');
+const { validateWorkflowResources } = await import('./validator');
+const { captureWorkflowSource, capturedSourceRoots } = await import('./workflow-source');
+const { formatPackagedResourceReference } = await import('./packaged-workflow');
+const { parseWorkflow } = await import('./loader');
+
+const deps: Pick<WorkflowDeps, 'loadConfig'> = {
+  loadConfig: async () => ({
+    assistant: 'claude',
+    assistants: { claude: {}, codex: {} },
+    commands: {},
+  }),
+};
+
+async function write(path: string, content: string): Promise<void> {
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, content);
+}
+
+function packagedCommand(pack: string): string {
+  return formatPackagedResourceReference({ source: 'bundled', pack, workflow: 'flow' }, 'review');
+}
+
+async function pack(directory: string, packName: string, name: string): Promise<void> {
+  const path = join(directory, packName, 'flow');
+  await write(
+    join(path, `${name}.yml`),
+    `name: ${name}\ndescription: fixture\nnodes:\n  - id: work\n    command: review\n`
+  );
+  await write(join(path, 'commands', 'review.md'), `${name} command`);
+  await write(join(path, 'scripts', 'helper.ts'), `console.log('${name}')`);
+}
+
+beforeEach(() => {
+  app = join(root, 'app');
+  selectedPacks = ['shipped'];
+  index.mockImplementation(async () => selectedPacks);
+  binary = false;
+});
+
+afterAll(async () => {
+  index.mockRestore();
+  if (originalHome === undefined) delete process.env.ARCHON_HOME;
+  else process.env.ARCHON_HOME = originalHome;
+  await removeTempTree(root);
+});
+
+test('live source catalogs exclude unindexed bundled packs while retaining project and home packs', async () => {
+  const result = await discoverWorkflows(project, { providers: providerRegistry });
+  expect(result.errors).toEqual([]);
+  expect(result.workflows.map(entry => entry.workflow.name).sort()).toEqual([
+    'home-flow',
+    'project-flow',
+    'shipped-flow',
+  ]);
+});
+
+test('live script discovery uses the indexed bundle while retaining project and home scripts', async () => {
+  const scripts = await discoverScriptsForCwd(project);
+  expect([...scripts.keys()].sort()).toEqual([
+    '__archon_pack__bundled:shipped:flow::helper',
+    '__archon_pack__global:home-only:flow::helper',
+    '__archon_pack__project:project-only:flow::helper',
+  ]);
+});
+
+test('live bundled command execution rejects an unindexed owner', async () => {
+  expect(await loadCommandPrompt(deps, project, packagedCommand('shipped'))).toEqual({
+    success: true,
+    content: 'shipped-flow command',
+  });
+  expect(await loadCommandPrompt(deps, project, packagedCommand('excluded'))).toMatchObject({
+    success: false,
+    reason: 'not_found',
+  });
+});
+
+test('live validation rejects an unindexed bundled command owner', async () => {
+  const parsed = parseWorkflow(
+    `name: check\ndescription: fixture\nnodes:\n  - id: work\n    command: ${packagedCommand('excluded')}\n`,
+    'check.yaml',
+    providerRegistry
+  );
+  if (!parsed.workflow) throw new Error('Invalid test workflow');
+  const issues = await validateWorkflowResources(parsed.workflow, project, providerRegistry);
+  expect(issues.some(issue => issue.level === 'error' && issue.field === 'command')).toBe(true);
+});
+
+test('a captured bundle retains formerly indexed resources without reading the live index', async () => {
+  selectedPacks = ['shipped', 'excluded'];
+  const capture = await captureWorkflowSource({
+    sourceRoot: project,
+    captureRoot: join(root, 'capture'),
+  });
+  const roots = capturedSourceRoots(capture.anchor);
+  index.mockImplementation(async () => {
+    throw new Error('Captured consumers must not read the live index');
+  });
+  const result = await discoverWorkflows(project, {
+    providers: providerRegistry,
+    sourceRoots: roots,
+  });
+  expect(result.errors).toEqual([]);
+  expect(result.workflows.map(entry => entry.workflow.name)).toContain('excluded-flow');
+  expect(
+    (await discoverScriptsForCwd(project, roots)).has(
+      '__archon_pack__bundled:excluded:flow::helper'
+    )
+  ).toBe(true);
+  expect(
+    await loadCommandPrompt(deps, project, packagedCommand('excluded'), undefined, roots)
+  ).toEqual({
+    success: true,
+    content: 'excluded-flow command',
+  });
+});
+
+test('a capture an older binary took keeps resolving the flat commands it froze', async () => {
+  // Current builds bundle only packaged commands. An older binary embedded flat ones and
+  // wrote them into its captures, so a run paused before an upgrade must still find them.
+  binary = true;
+  Object.assign(defaults.BUNDLED_COMMANDS, { 'flat-command': 'flat command' });
+  let roots: ReturnType<typeof capturedSourceRoots>;
+  try {
+    const capture = await captureWorkflowSource({
+      sourceRoot: project,
+      captureRoot: join(root, 'older-binary-capture'),
+    });
+    roots = capturedSourceRoots(capture.anchor);
+  } finally {
+    Reflect.deleteProperty(defaults.BUNDLED_COMMANDS, 'flat-command');
+  }
+  expect(await loadCommandPrompt(deps, project, 'flat-command', undefined, roots)).toEqual({
+    success: true,
+    content: 'flat command',
+  });
+  expect(await loadCommandPrompt(deps, project, 'flat-command')).toMatchObject({
+    success: false,
+    reason: 'not_found',
+  });
+});
+
+test('live indexed workflow and script additions are visible without regenerating the binary bundle', async () => {
+  const yamlPath = join(app, 'workflows', 'shipped', 'flow', 'shipped-flow.yml');
+  const addedWorkflow = join(app, 'workflows', 'shipped', 'late-workflow');
+  const original = await readFile(yamlPath, 'utf8');
+  try {
+    await write(yamlPath, original.replace('description: fixture', 'description: edited live'));
+    await write(
+      join(addedWorkflow, 'late-workflow.yaml'),
+      'name: late-workflow\ndescription: added live\nnodes:\n  - id: work\n    prompt: work\n'
+    );
+    await write(
+      join(app, 'workflows', 'shipped', 'flow', 'scripts', 'late.ts'),
+      'console.log("late")'
+    );
+    const result = await discoverWorkflows(project, { providers: providerRegistry });
+    expect(
+      result.workflows.find(entry => entry.workflow.name === 'shipped-flow')?.workflow.description
+    ).toBe('edited live');
+    expect(result.workflows.some(entry => entry.workflow.name === 'late-workflow')).toBe(true);
+    expect(
+      (await discoverScriptsForCwd(project)).has('__archon_pack__bundled:shipped:flow::late')
+    ).toBe(true);
+  } finally {
+    await write(yamlPath, original);
+    await removeTempTree(addedWorkflow);
+  }
+});
+
+test('binary discovery preserves an authored yml filename when a project overrides it', async () => {
+  const name = 'selection-yml-override';
+  const yaml = `name: ${name}\ndescription: bundled version\nnodes:\n  - id: work\n    prompt: work\n`;
+  const paths = defaults.BUNDLED_WORKFLOW_PATHS;
+  expect(Object.hasOwn(defaults.BUNDLED_WORKFLOWS, name)).toBe(false);
+  Object.assign(defaults.BUNDLED_WORKFLOWS, { [name]: yaml });
+  Object.assign(paths, { [name]: `workflows/shipped/${name}/${name}.yml` });
+  await write(
+    join(project, '.archon', 'workflows', `${name}.yml`),
+    yaml.replace('bundled version', 'project version')
+  );
+  binary = true;
+  index.mockImplementation(async () => {
+    throw new Error('A binary must not read the source index');
+  });
+  try {
+    const result = await discoverWorkflows(project, { providers: providerRegistry });
+    expect(result.errors).toEqual([]);
+    const matches = result.workflows.filter(entry => entry.workflow.name === name);
+    expect(matches).toHaveLength(1);
+    expect(matches[0]?.workflow.description).toBe('project version');
+  } finally {
+    Reflect.deleteProperty(defaults.BUNDLED_WORKFLOWS, name);
+    Reflect.deleteProperty(paths, name);
+  }
+});
+
+test('SDK discovery without an installed source tree retains project and home resources', async () => {
+  app = join(root, 'absent-app');
+  const result = await discoverWorkflows(project, { providers: providerRegistry });
+  expect(result.errors).toEqual([]);
+  expect(result.workflows.some(entry => entry.source === 'bundled')).toBe(false);
+  const scripts = await discoverScriptsForCwd(project);
+  expect([...scripts.keys()].some(name => name.startsWith('__archon_pack__bundled:'))).toBe(false);
+  expect(scripts.has('__archon_pack__project:project-only:flow::helper')).toBe(true);
+});
+
+test('a partial source installation fails instead of appearing to have no bundled resources', async () => {
+  app = join(root, 'partial-app');
+  await mkdir(join(app, 'workflows'), { recursive: true });
+  const result = await discoverWorkflows(project, { providers: providerRegistry });
+  expect(result.errors.some(error => error.error.includes('Indexed bundle pack'))).toBe(true);
+  await expect(discoverScriptsForCwd(project)).rejects.toThrow('Indexed bundle pack');
+});
+
+test('a missing index in an installed source tree remains a visible discovery error', async () => {
+  index.mockImplementation(async () => {
+    throw Object.assign(new Error('Missing installed bundle index'), { code: 'ENOENT' });
+  });
+  const result = await discoverWorkflows(project, { providers: providerRegistry });
+  expect(result.errors.some(error => error.error === 'Missing installed bundle index')).toBe(true);
+});
+
+test('an existing non-directory bundle root is an invalid installation', async () => {
+  app = join(root, 'invalid-app');
+  await write(join(app, 'workflows'), 'not a directory');
+  const result = await discoverWorkflows(project, { providers: providerRegistry });
+  expect(result.errors).toHaveLength(1);
+  await expect(discoverScriptsForCwd(project)).rejects.toThrow();
+});
+
+// The live bundled route reads the index through `collectBundleSources`; the captured
+// route reads the same tree through `loadPackagedWorkflowsFromDir`. A pack-root
+// `fixtures/` directory must be invisible to both, or one tree catalogues a fixture as a
+// workflow while the other does not (#3183).
+test('a pack-root fixtures directory is not a bundled workflow in live or captured mode', async () => {
+  const fixtures = join(app, 'workflows', 'shipped', 'fixtures');
+  await write(
+    join(fixtures, 'clean.stubs.yaml'),
+    'fixture:\n  expect: completed\n  reached: [work]\n'
+  );
+  try {
+    const live = await discoverWorkflows(project, { providers: providerRegistry });
+    expect(live.errors).toEqual([]);
+    expect(live.workflows.some(entry => entry.workflow.name === 'clean.stubs')).toBe(false);
+
+    const capture = await captureWorkflowSource({
+      sourceRoot: project,
+      captureRoot: join(root, 'fixture-capture'),
+    });
+    const captured = await discoverWorkflows(project, {
+      providers: providerRegistry,
+      sourceRoots: capturedSourceRoots(capture.anchor),
+    });
+    expect(captured.errors).toEqual([]);
+    expect(captured.workflows.map(entry => entry.workflow.name).sort()).toEqual(
+      live.workflows.map(entry => entry.workflow.name).sort()
+    );
+  } finally {
+    await removeTempTree(fixtures);
+  }
+});

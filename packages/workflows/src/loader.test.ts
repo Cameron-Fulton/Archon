@@ -1,18 +1,31 @@
-import { describe, it, expect, beforeEach, afterEach, spyOn, mock, type Mock } from 'bun:test';
-import { mkdir, writeFile, rm, readdir, readFile } from 'fs/promises';
-import { join, basename } from 'path';
+import { providerRegistry } from '@archon/providers';
+import {
+  describe,
+  it,
+  expect,
+  afterAll,
+  beforeEach,
+  afterEach,
+  spyOn,
+  mock,
+  type Mock,
+} from 'bun:test';
+import { mkdir, mkdtemp, writeFile, rm } from 'fs/promises';
+import { join } from 'path';
 import { tmpdir } from 'os';
+import { removeTempTree } from '@archon/paths/test-utils';
 
 const isWindows = process.platform === 'win32';
 
 // Inline mock logger to suppress noisy output during tests
+type MockLog = (data: unknown, message?: string, ...args: unknown[]) => undefined;
 const mockLogger = {
-  fatal: mock(() => undefined),
-  error: mock(() => undefined),
-  warn: mock(() => undefined),
-  info: mock(() => undefined),
-  debug: mock(() => undefined),
-  trace: mock(() => undefined),
+  fatal: mock<MockLog>(() => undefined),
+  error: mock<MockLog>(() => undefined),
+  warn: mock<MockLog>(() => undefined),
+  info: mock<MockLog>(() => undefined),
+  debug: mock<MockLog>(() => undefined),
+  trace: mock<MockLog>(() => undefined),
   child: mock(function () {
     return mockLogger;
   }),
@@ -21,26 +34,155 @@ const mockLogger = {
   level: 'info',
 };
 
+// A fake bundled pack stands in for the shipped one: source mode reads its tree through
+// `getBundledWorkflowsPath`, binary mode the records built from it.
+const bundleRoot = await mkdtemp(join(tmpdir(), 'loader-bundle-'));
+afterAll(() => removeTempTree(bundleRoot));
+const fakeBundle = await writeFakeBundle(
+  bundleRoot,
+  {
+    'fake/review/fake-review.yaml':
+      'name: fake-review\ndescription: Bundled review\nnodes:\n  - id: check\n    command: check\n',
+    'fake/review/commands/check.md': 'Check the change against its contract.\n',
+  },
+  ['fake']
+);
+const realBundledDefaults = await import('./defaults/bundled-defaults');
+mock.module('./defaults/bundled-defaults', () => ({ ...realBundledDefaults, ...fakeBundle }));
+spyOn(bundleInventory, 'readBundleIndex').mockResolvedValue(['fake']);
+
 // Mock @archon/paths: suppress logger + pass through real path utilities
 const realArchonPaths = await import('@archon/paths');
 mock.module('@archon/paths', () => ({
   ...realArchonPaths,
   createLogger: mock(() => mockLogger),
+  getBundledWorkflowsPath: () => bundleRoot,
 }));
 
 // Bootstrap provider registry (needed by isRegisteredProvider checks at load time)
-import { registerBuiltinProviders, clearRegistry } from '@archon/providers';
+import { clearRegistry } from '@archon/providers';
+import { registerBuiltinProviders, registerCommunityProviders } from '@archon/providers/in-process';
+import { type ProviderDefaults } from '@archon/provider-contract';
 clearRegistry();
 registerBuiltinProviders();
 
-import { discoverWorkflows, discoverWorkflowsWithConfig } from './workflow-discovery';
-import { isBashNode, isCancelNode, isLoopNode } from './schemas';
-import { parseWorkflow } from './loader';
-import { COMPILED_LOOP_COMMAND, type LoopWithCompiledCommand } from './compiled-command';
-import { workflowDefinitionSchema } from './schemas/workflow';
+import {
+  discoverWorkflows as discoverWorkflowsWithProviders,
+  discoverWorkflowsWithConfig,
+} from './workflow-discovery';
+import {
+  isExecNode,
+  isHaltNode,
+  isLoopGroupNode,
+  isLoopNode,
+  isAgentNode,
+  isWorkflowNode,
+  isIncludeDirective,
+} from './schemas';
+import { parseWorkflow as parseWorkflowWithProviders, type ParseResult } from './loader';
+import { evaluateCondition } from './condition-evaluator';
+import {
+  readHomeMcpDirectory,
+  COMPILED_LOOP_COMMAND,
+  type LoopWithCompiledCommand,
+} from './compiled-command';
+import { KNOWN_WORKFLOW_KEYS } from './schemas/workflow';
 import type { WorkflowDefinition } from './schemas/workflow';
+import type { DagNode, IncludeDirective, BindingDirective } from './schemas';
+import type { JsonValue } from './output-ref';
 import * as bundledDefaults from './defaults/bundled-defaults';
+import * as bundleInventory from './defaults/bundle-inventory';
+import { writeFakeBundle } from './test-fake-bundle';
 import { parsePackagedResourceReference } from './packaged-workflow';
+import { discoverScriptsForCwd } from './script-discovery';
+import { validateWorkflowResources } from './validator';
+import { mapNodeTemplateSlots, mapNodeTemplateValueSlots } from './template-walker';
+
+function discoverWorkflows(
+  cwd: string | null,
+  options: Omit<Parameters<typeof discoverWorkflowsWithProviders>[1], 'providers'> = {}
+) {
+  return discoverWorkflowsWithProviders(cwd, { ...options, providers: providerRegistry });
+}
+
+function parseWorkflow(
+  content: string,
+  filename: string,
+  configuredEnvNames?: ReadonlySet<string>
+): ParseResult {
+  return parseWorkflowWithProviders(content, filename, providerRegistry, configuredEnvNames);
+}
+
+/** The inline prompt text of an agent node, or undefined for any other kind
+ * (formerly the bare `'prompt' in node ? node.prompt : ...` idiom, #2486). */
+function inlinePrompt(node: DagNode | IncludeDirective | undefined): string | undefined {
+  return node && !isIncludeDirective(node) && isAgentNode(node) && node.source.kind === 'inline'
+    ? node.source.prompt
+    : undefined;
+}
+
+/** The `with:` bindings of an agent (command-sourced) or exec node, or undefined
+ * for any other kind (formerly the bare `'with' in node ? node.with : ...` idiom). */
+function nodeWith(
+  node: DagNode | IncludeDirective | undefined
+): Record<string, JsonValue | BindingDirective> | undefined {
+  if (!node || isIncludeDirective(node)) return undefined;
+  if (isExecNode(node)) return node.with;
+  if (isAgentNode(node) && node.source.kind === 'command') return node.source.with;
+  if (isWorkflowNode(node)) return node.with;
+  return undefined;
+}
+
+/**
+ * Write one workflow YAML into `<root>/.archon/workflows/`, creating the folder.
+ *
+ * This is the file's dominant setup — nearly every test needs one workflow on
+ * disk — and open-coding the mkdir/join/writeFile made the setup longer than the
+ * assertion it served (#3169). Tests that need a tree this cannot express (an
+ * empty workflows folder, a nested pack, a broken symlink, a non-YAML sibling)
+ * still write it by hand; do not grow this an option at a time.
+ */
+async function writeWorkflowFile(root: string, filename: string, yaml: string): Promise<void> {
+  const dir = join(root, '.archon', 'workflows');
+  await mkdir(dir, { recursive: true });
+  await writeFile(join(dir, filename), yaml);
+}
+
+/**
+ * Parse one workflow YAML directly.
+ *
+ * These assertions are about what `parseWorkflow` PRODUCES. Routing them through
+ * `discoverWorkflows` also ran include expansion, which since #1764 collapses a
+ * workflow's node-affecting config onto its own nodes and removes the workflow-level
+ * layer — so a `provider:`/`model:`/`effort:` assertion made on a discovered workflow
+ * was testing the expander, not the parser it named.
+ */
+function parseWorkflowYaml(
+  yaml: string,
+  filename = 'test.yaml'
+): { workflow: WorkflowDefinition; warnings: string[] } {
+  const result = parseWorkflow(yaml, filename);
+  expect(result.error).toBeNull();
+  if (result.workflow === null) throw new Error('expected a parsed workflow');
+  return { workflow: result.workflow, warnings: result.warnings };
+}
+
+describe('workflow YAML line endings', () => {
+  it.each(['"', "'"])('folds multiline %s-quoted prompts identically for LF and CRLF', quote => {
+    const lf = `name: line-endings
+description: Quoted multiline scalar
+nodes:
+  - id: read
+    prompt: ${quote}first line
+      second line${quote}
+`;
+    const { workflow: lfWorkflow } = parseWorkflowYaml(lf);
+    const { workflow: crlfWorkflow } = parseWorkflowYaml(lf.replaceAll('\n', '\r\n'));
+
+    expect(inlinePrompt(lfWorkflow.nodes[0])).toBe('first line second line');
+    expect(crlfWorkflow).toEqual(lfWorkflow);
+  });
+});
 
 describe('Workflow Loader', () => {
   let testDir: string;
@@ -76,10 +218,119 @@ describe('Workflow Loader', () => {
     }
   });
 
+  describe('MCP declaration provenance', () => {
+    it.each(['', 'nested', 'pack/flow'])(
+      'keeps the actual home YAML directory: %s',
+      async subdir => {
+        const yamlDir = join(testDir, 'home', 'workflows', subdir);
+        await mkdir(yamlDir, { recursive: true });
+        await writeFile(
+          join(yamlDir, 'home.yaml'),
+          `name: portable
+description: Home MCP
+nodes:
+  - id: check
+    prompt: Check
+    mcp: servers.json
+`
+        );
+        await writeFile(join(yamlDir, 'servers.json'), '{"home":{"command":"example"}}');
+        const catalog = await discoverWorkflows(testDir, { loadDefaults: false });
+        expect(catalog.errors).toEqual([]);
+        const entry = catalog.workflows.find(e => e.source === 'global');
+        if (!entry) throw new Error('Missing home workflow');
+        expect(readHomeMcpDirectory(entry.workflow.nodes[0])).toBe(yamlDir);
+        expect(
+          (await validateWorkflowResources(entry.workflow, testDir, providerRegistry)).filter(
+            i => i.field === 'mcp'
+          )
+        ).toEqual([]);
+      }
+    );
+
+    it('preserves declaration ownership across mixed scopes, nested includes and loop bodies', async () => {
+      const homeDir = join(testDir, 'home', 'workflows', 'nested');
+      const projectDir = join(testDir, '.archon', 'workflows');
+      await mkdir(homeDir, { recursive: true });
+      await mkdir(projectDir, { recursive: true });
+      await writeFile(
+        join(homeDir, 'home.yaml'),
+        `name: home-block
+description: Home declaration
+nodes:
+  - id: group
+    loop_group:
+      until: done
+      max_iterations: 1
+      nodes:
+        - id: check
+          prompt: Check
+          mcp: servers.json
+`
+      );
+      await writeFile(
+        join(projectDir, 'project.yaml'),
+        `name: project-block
+description: Project declaration
+nodes:
+  - id: check
+    prompt: Check
+    mcp: servers.json
+`
+      );
+      await writeFile(
+        join(testDir, 'home', 'workflows', 'middle.yaml'),
+        `name: middle
+description: Mixed includes
+nodes:
+  - id: home
+    include: home-block
+  - id: project
+    include: project-block
+`
+      );
+      await writeFile(
+        join(projectDir, 'parent.yaml'),
+        `name: parent
+description: Second level
+nodes:
+  - id: outer
+    include: middle
+`
+      );
+      await writeFile(join(homeDir, 'servers.json'), '{"home":{}}');
+      const catalog = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(catalog.errors).toEqual([]);
+      const parent = catalog.workflows.find(e => e.workflow.name === 'parent')?.workflow;
+      if (!parent) throw new Error('Missing parent');
+      const group = parent.nodes.find(n => n.id === 'outer__home__group');
+      const project = parent.nodes.find(n => n.id === 'outer__project__check');
+      if (!group || isIncludeDirective(group) || !isLoopGroupNode(group) || !project)
+        throw new Error('Missing composed nodes');
+      expect(readHomeMcpDirectory(project)).toBeUndefined();
+      expect(readHomeMcpDirectory(group.loop_group.nodes[0])).toBe(homeDir);
+      for (const clone of [
+        mapNodeTemplateSlots(group, slot => slot.value),
+        mapNodeTemplateValueSlots(group, slot => slot.value),
+      ]) {
+        if (!isLoopGroupNode(clone)) throw new Error('Lost group');
+        expect(readHomeMcpDirectory(clone.loop_group.nodes[0])).toBe(homeDir);
+      }
+      const issues = (await validateWorkflowResources(parent, testDir, providerRegistry)).filter(
+        i => i.field === 'mcp'
+      );
+      expect(issues).toHaveLength(1);
+      expect(issues[0].nodeId).toBe('outer__project__check');
+      expect(issues[0].message).toContain(join(testDir, 'servers.json'));
+      expect(issues[0].message).not.toContain(homeDir);
+    });
+  });
+
   describe('packaged workflow folders (#2527)', () => {
     it('discovers arbitrary repo pack/workflow folders and qualifies local resources', async () => {
       const workflowDir = join(testDir, '.archon', 'workflows', 'team-kit', 'ship-it');
-      await mkdir(workflowDir, { recursive: true });
+      await mkdir(join(workflowDir, 'scripts'), { recursive: true });
+      await writeFile(join(workflowDir, 'scripts', 'publish.ts'), 'console.log(1);');
       await writeFile(
         join(workflowDir, 'release.yaml'),
         `name: release\ndescription: release\nnodes:\n  - id: command\n    command: prepare\n  - id: script\n    script: publish\n    runtime: bun\n`
@@ -90,7 +341,7 @@ describe('Workflow Loader', () => {
       const workflow = result.workflows.find(entry => entry.workflow.name === 'release')?.workflow;
       expect(workflow).toBeDefined();
       const command = parsePackagedResourceReference(
-        (workflow?.nodes[0] as { command: string }).command
+        (workflow?.nodes[0] as { source: { name: string } }).source.name
       );
       const script = parsePackagedResourceReference(
         (workflow?.nodes[1] as { script: string }).script
@@ -103,6 +354,46 @@ describe('Workflow Loader', () => {
         owner: { source: 'project', pack: 'team-kit', workflow: 'ship-it' },
         name: 'publish',
       });
+    });
+
+    it("a composed block's named script still resolves to its OWN pack after composition", async () => {
+      // The packaged-ownership claim at the boundary that matters: the script name a
+      // composed node carries has to resolve to the file in the BLOCK's pack, not to a
+      // same-named script in the parent's. Composition into a different pack is the case
+      // (#1764 Task 11 / #2528) — a bare basename would silently pick the wrong program.
+      const parentDir = join(testDir, '.archon', 'workflows', 'product', 'parent');
+      const blockDir = join(testDir, '.archon', 'workflows', 'shared', 'report-block');
+      await mkdir(join(parentDir, 'scripts'), { recursive: true });
+      await mkdir(join(blockDir, 'scripts'), { recursive: true });
+      await writeFile(
+        join(parentDir, 'parent.yaml'),
+        `name: script-parent\ndescription: parent\nnodes:\n  - id: rep\n    include: report-block\n`
+      );
+      await writeFile(
+        join(blockDir, 'block.yaml'),
+        `name: report-block\ndescription: block\nnodes:\n  - id: run\n    script: report\n    runtime: bun\n`
+      );
+      // Same basename in both packs — only the qualified reference tells them apart.
+      await writeFile(join(parentDir, 'scripts', 'report.ts'), 'console.log("parent");\n');
+      await writeFile(join(blockDir, 'scripts', 'report.ts'), 'console.log("block");\n');
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toEqual([]);
+      const parent = result.workflows.find(w => w.workflow.name === 'script-parent')?.workflow;
+      const composed = parent?.nodes.find(n => n.id === 'rep__run') as { script: string };
+      expect(parsePackagedResourceReference(composed.script)).toEqual({
+        owner: { source: 'project', pack: 'shared', workflow: 'report-block' },
+        name: 'report',
+      });
+
+      // And that reference is a live key in the map the executor looks the script up in.
+      // Stored paths go through `normalizeSep()` (script-discovery.ts), so they are
+      // forward-slash on every OS while `join` is backslash on Windows — normalize the
+      // expected side, matching the `norm` helper in script-discovery.test.ts.
+      const scripts = await discoverScriptsForCwd(testDir);
+      expect(scripts.get(composed.script)?.path).toBe(
+        join(blockDir, 'scripts', 'report.ts').replaceAll('\\', '/')
+      );
     });
 
     it('resolves an included workflow command from its own package before compiling it', async () => {
@@ -124,9 +415,40 @@ describe('Workflow Loader', () => {
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       const parent = result.workflows.find(entry => entry.workflow.name === 'parent')?.workflow;
       const included = parent?.nodes.find(node => node.id === 'review__run');
-      expect(included && 'prompt' in included ? included.prompt : '').toBe(
-        'Package-owned review prompt.'
+      expect(inlinePrompt(included) ?? '').toBe('Package-owned review prompt.');
+    });
+
+    it('rejects a shared module used as a named script while loading the workflow', async () => {
+      const pack = join(testDir, '.archon', 'workflows', 'module-pack');
+      await mkdir(join(pack, '.shared'), { recursive: true });
+      await mkdir(join(pack, 'release'), { recursive: true });
+      await writeFile(join(pack, '.shared', 'helper.ts'), 'export const value = 1;');
+      await writeFile(
+        join(pack, 'release', 'release.yaml'),
+        'name: release\ndescription: release\nnodes:\n  - id: run\n    script: helper\n    runtime: bun\n'
       );
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.workflows).toHaveLength(0);
+      expect(result.errors).toEqual([
+        expect.objectContaining({
+          errorType: 'validation_error',
+          error: expect.stringContaining('Named packaged script'),
+        }),
+      ]);
+    });
+
+    it('reserves pack .shared folders for modules without workflow discovery errors', async () => {
+      const pack = join(testDir, '.archon', 'workflows', 'module-pack');
+      await mkdir(join(pack, '.shared'), { recursive: true });
+      await mkdir(join(pack, 'release'), { recursive: true });
+      await writeFile(join(pack, '.shared', 'value.ts'), 'export const value = 1;');
+      await writeFile(
+        join(pack, 'release', 'release.yaml'),
+        'name: release\ndescription: release\nnodes:\n  - id: run\n    bash: echo ok\n'
+      );
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toEqual([]);
+      expect(result.workflows.map(entry => entry.workflow.name)).toContain('release');
     });
 
     it('uses the identical authored structure in home scope', async () => {
@@ -141,7 +463,9 @@ describe('Workflow Loader', () => {
       const workflow = result.workflows.find(entry => entry.workflow.name === 'daily');
       expect(workflow?.source).toBe('global');
       expect(
-        parsePackagedResourceReference((workflow?.workflow.nodes[0] as { command: string }).command)
+        parsePackagedResourceReference(
+          (workflow?.workflow.nodes[0] as { source: { name: string } }).source.name
+        )
       ).toEqual({
         owner: { source: 'global', pack: 'personal-pack', workflow: 'daily' },
         name: 'summarize',
@@ -207,7 +531,9 @@ describe('Workflow Loader', () => {
       const repo = result.workflows.find(entry => entry.workflow.name === 'repo-version');
       expect(repo?.source).toBe('project');
       expect(
-        parsePackagedResourceReference((repo?.workflow.nodes[0] as { command: string }).command)
+        parsePackagedResourceReference(
+          (repo?.workflow.nodes[0] as { source: { name: string } }).source.name
+        )
       ).toEqual({
         owner: { source: 'project', pack: 'repo-pack', workflow: 'flow' },
         name: 'shared',
@@ -215,113 +541,164 @@ describe('Workflow Loader', () => {
     });
   });
 
+  describe('fixtures are not workflows (#3183)', () => {
+    const fixtureYaml = (id: string): string =>
+      `fixture:\n  expect: completed\n  reached: [${id}]\n${id}: {}\n`;
+
+    const writeWorkflowWithFixtures = async (
+      segments: readonly string[],
+      fixtureNames: readonly string[]
+    ): Promise<void> => {
+      const dir = join(testDir, '.archon', 'workflows', ...segments);
+      await mkdir(join(dir, 'fixtures'), { recursive: true });
+      await writeFile(
+        join(dir, 'flow.yaml'),
+        'name: flow\ndescription: flow\nnodes:\n  - id: run\n    bash: echo hi\n'
+      );
+      for (const name of fixtureNames) {
+        await writeFile(join(dir, 'fixtures', `${name}.stubs.yaml`), fixtureYaml('run'));
+      }
+    };
+
+    for (const [label, segments] of [
+      ['directly under the workflows root', ['flow']],
+      ['inside a pack', ['team', 'flow']],
+    ] as const) {
+      for (const [count, fixtureNames] of [
+        ['one fixture', ['greets']],
+        ['several fixtures', ['greets', 'partings']],
+      ] as const) {
+        it(`ignores ${count} ${label}`, async () => {
+          await writeWorkflowWithFixtures(segments, fixtureNames);
+          const result = await discoverWorkflows(testDir, { loadDefaults: false });
+          expect(result.errors).toEqual([]);
+          expect(result.workflows.map(entry => entry.workflow.name)).toEqual(['flow']);
+        });
+      }
+    }
+
+    it('ignores a fixtures directory at the workflows root', async () => {
+      await mkdir(join(testDir, '.archon', 'workflows', 'fixtures', 'nested'), {
+        recursive: true,
+      });
+      await writeFile(
+        join(testDir, '.archon', 'workflows', 'fixtures', 'stray.stubs.yaml'),
+        fixtureYaml('run')
+      );
+      // A subdirectory holds no workflow either: the whole `fixtures/` tree is reserved.
+      await writeFile(
+        join(testDir, '.archon', 'workflows', 'fixtures', 'nested', 'flow.yaml'),
+        'name: buried\ndescription: buried\nnodes:\n  - id: run\n    bash: echo hi\n'
+      );
+      await writeWorkflowFile(
+        testDir,
+        'plain.yaml',
+        'name: plain\ndescription: plain\nnodes:\n  - id: run\n    bash: echo hi\n'
+      );
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toEqual([]);
+      expect(result.workflows.map(entry => entry.workflow.name)).toEqual(['plain']);
+    });
+
+    it('still reports a genuinely malformed workflow', async () => {
+      await writeWorkflowFile(testDir, 'broken.yaml', 'description: no name\nnodes: []\n');
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0].error).toContain("Missing required field 'name'");
+    });
+
+    it('still reports a genuinely malformed workflow inside a pack', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows', 'team', 'flow');
+      await mkdir(workflowDir, { recursive: true });
+      await writeFile(join(workflowDir, 'flow.yaml'), 'description: no name\nnodes: []\n');
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0].error).toContain("Missing required field 'name'");
+      expect(result.workflows).toEqual([]);
+    });
+
+    it('still reports a packaged workflow folder that does not hold exactly one YAML file', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows', 'team', 'flow');
+      await mkdir(workflowDir, { recursive: true });
+      await writeFile(join(workflowDir, 'one.yaml'), 'name: one\ndescription: one\nnodes: []\n');
+      await writeFile(join(workflowDir, 'two.yaml'), 'name: two\ndescription: two\nnodes: []\n');
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0].error).toContain('must contain exactly one .yaml or .yml file');
+      expect(result.workflows).toEqual([]);
+    });
+  });
+
   describe('parseWorkflow (via discoverWorkflows)', () => {
-    it('should parse interactive: true when present', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-      const yaml = `name: test\ndescription: test\ninteractive: true\nnodes:\n  - id: n\n    prompt: p\n`;
-      await writeFile(join(workflowDir, 'test.yaml'), yaml);
-      const result = await discoverWorkflows(testDir, { loadDefaults: false });
-      expect(result.workflows[0].workflow.interactive).toBe(true);
-    });
-
-    it('should omit interactive field when not present', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-      const yaml = `name: test\ndescription: test\nnodes:\n  - id: n\n    prompt: p\n`;
-      await writeFile(join(workflowDir, 'test.yaml'), yaml);
-      const result = await discoverWorkflows(testDir, { loadDefaults: false });
-      expect(result.workflows[0].workflow.interactive).toBeUndefined();
-    });
-
-    it('should preserve interactive: false when explicitly set', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-      const yaml = `name: test\ndescription: test\ninteractive: false\nnodes:\n  - id: n\n    prompt: p\n`;
-      await writeFile(join(workflowDir, 'test.yaml'), yaml);
-      const result = await discoverWorkflows(testDir, { loadDefaults: false });
-      expect(result.workflows[0].workflow.interactive).toBe(false);
-    });
-
-    it('should treat non-boolean interactive value as undefined', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-      // YAML string "yes" is not a boolean — should be dropped
-      const yaml = `name: test\ndescription: test\ninteractive: "yes"\nnodes:\n  - id: n\n    prompt: p\n`;
-      await writeFile(join(workflowDir, 'test.yaml'), yaml);
-      const result = await discoverWorkflows(testDir, { loadDefaults: false });
-      expect(result.workflows[0].workflow.interactive).toBeUndefined();
-    });
+    it.each(['true', 'false', '"yes"'])(
+      'loads workflow-level interactive: %s with a deprecation warning and drops it',
+      async value => {
+        const yaml = `name: test\ndescription: test\ninteractive: ${value}\nnodes:\n  - id: n\n    prompt: p\n`;
+        await writeWorkflowFile(testDir, 'test.yaml', yaml);
+        const result = await discoverWorkflows(testDir, { loadDefaults: false });
+        expect(result.errors).toEqual([]);
+        expect('interactive' in result.workflows[0].workflow).toBe(false);
+        expect(result.workflows[0].parseWarnings).toEqual([
+          "Workflow 'test': workflow-level 'interactive:' is deprecated and has no effect. " +
+            'Any workflow can start in the foreground, in the background or from a trigger; a ' +
+            'pause waits in the attention queue until it is answered. Remove the line.',
+        ]);
+      }
+    );
 
     it('should parse worktree.enabled: false', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
       const yaml = `name: triage\ndescription: read-only\nworktree:\n  enabled: false\nnodes:\n  - id: n\n    prompt: p\n`;
-      await writeFile(join(workflowDir, 'triage.yaml'), yaml);
+      await writeWorkflowFile(testDir, 'triage.yaml', yaml);
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.workflows[0].workflow.worktree).toEqual({ enabled: false });
     });
 
     it('should parse worktree.enabled: true', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
       const yaml = `name: build\ndescription: needs worktree\nworktree:\n  enabled: true\nnodes:\n  - id: n\n    prompt: p\n`;
-      await writeFile(join(workflowDir, 'build.yaml'), yaml);
+      await writeWorkflowFile(testDir, 'build.yaml', yaml);
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.workflows[0].workflow.worktree).toEqual({ enabled: true });
     });
 
     it('should omit worktree block when not present (policy is caller-decides)', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
       const yaml = `name: normal\ndescription: no policy\nnodes:\n  - id: n\n    prompt: p\n`;
-      await writeFile(join(workflowDir, 'normal.yaml'), yaml);
+      await writeWorkflowFile(testDir, 'normal.yaml', yaml);
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.workflows[0].workflow.worktree).toBeUndefined();
     });
 
     it('should parse container policy (enabled + write_back)', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
       const yaml = `name: ops\ndescription: containerized\ncontainer:\n  enabled: true\n  write_back: auto\nnodes:\n  - id: n\n    prompt: p\n`;
-      await writeFile(join(workflowDir, 'ops.yaml'), yaml);
+      await writeWorkflowFile(testDir, 'ops.yaml', yaml);
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.workflows[0].workflow.container).toEqual({ enabled: true, write_back: 'auto' });
     });
 
     it('should ignore an invalid container.write_back value but keep the block', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
       const yaml = `name: ops2\ndescription: bad\ncontainer:\n  enabled: true\n  write_back: bogus\nnodes:\n  - id: n\n    prompt: p\n`;
-      await writeFile(join(workflowDir, 'ops2.yaml'), yaml);
+      await writeWorkflowFile(testDir, 'ops2.yaml', yaml);
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.workflows[0].workflow.container).toEqual({ enabled: true });
     });
 
     it('should parse evidence_policy.required: true (#2230)', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
       const yaml = `name: gated\ndescription: evidence gated\nevidence_policy:\n  required: true\nnodes:\n  - id: n\n    prompt: p\n`;
-      await writeFile(join(workflowDir, 'gated.yaml'), yaml);
+      await writeWorkflowFile(testDir, 'gated.yaml', yaml);
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.errors).toHaveLength(0);
       expect(result.workflows[0].workflow.evidence_policy).toEqual({ required: true });
     });
 
     it('should parse evidence_policy.required: false', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
       const yaml = `name: ungated\ndescription: opt-out\nevidence_policy:\n  required: false\nnodes:\n  - id: n\n    prompt: p\n`;
-      await writeFile(join(workflowDir, 'ungated.yaml'), yaml);
+      await writeWorkflowFile(testDir, 'ungated.yaml', yaml);
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.workflows[0].workflow.evidence_policy).toEqual({ required: false });
     });
 
     it('should omit evidence_policy when not present', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
       const yaml = `name: no-evidence\ndescription: none\nnodes:\n  - id: n\n    prompt: p\n`;
-      await writeFile(join(workflowDir, 'no-evidence.yaml'), yaml);
+      await writeWorkflowFile(testDir, 'no-evidence.yaml', yaml);
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.workflows[0].workflow.evidence_policy).toBeUndefined();
     });
@@ -329,10 +706,8 @@ describe('Workflow Loader', () => {
     it('should REJECT a malformed evidence_policy block (fail-safe, not warn-and-ignore)', async () => {
       // Silently dropping a declared terminal-success gate would let runs
       // complete ungated — a malformed block must fail validation loudly.
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
       const yaml = `name: bad-evidence\ndescription: bad\nevidence_policy:\n  required: "yes"\nnodes:\n  - id: n\n    prompt: p\n`;
-      await writeFile(join(workflowDir, 'bad-evidence.yaml'), yaml);
+      await writeWorkflowFile(testDir, 'bad-evidence.yaml', yaml);
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.workflows).toHaveLength(0);
       expect(result.errors).toHaveLength(1);
@@ -341,10 +716,8 @@ describe('Workflow Loader', () => {
     });
 
     it('should REJECT an empty evidence_policy block (required is mandatory)', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
       const yaml = `name: empty-evidence\ndescription: bad\nevidence_policy: {}\nnodes:\n  - id: n\n    prompt: p\n`;
-      await writeFile(join(workflowDir, 'empty-evidence.yaml'), yaml);
+      await writeWorkflowFile(testDir, 'empty-evidence.yaml', yaml);
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.workflows).toHaveLength(0);
       expect(result.errors).toHaveLength(1);
@@ -352,124 +725,294 @@ describe('Workflow Loader', () => {
       expect(result.errors[0].error).toContain('required: boolean');
     });
 
+    describe('run budget (#2814)', () => {
+      const budgeted = (nodes: string, budget = 'budget:\n  max_spend_usd: 2.5\n'): string =>
+        `name: budgeted\ndescription: d\n${budget}nodes:\n${nodes}`;
+
+      it('parses a budget declaring either ceiling or both', () => {
+        for (const [yaml, expected] of [
+          ['budget:\n  max_work_units: 3\n', { max_work_units: 3 }],
+          ['budget:\n  max_spend_usd: 2.5\n', { max_spend_usd: 2.5 }],
+          [
+            'budget:\n  max_work_units: 3\n  max_spend_usd: 2.5\n',
+            { max_work_units: 3, max_spend_usd: 2.5 },
+          ],
+        ] as const) {
+          const result = parseWorkflow(budgeted('  - id: n\n    prompt: p\n', yaml), 'b.yaml');
+          expect(result.error).toBeNull();
+          expect(result.workflow?.budget).toEqual(expected);
+        }
+      });
+
+      it('rejects a malformed budget instead of running without a ceiling', () => {
+        for (const yaml of [
+          'budget: {}\n',
+          'budget:\n  max_spend_usd: 0\n',
+          'budget:\n  max_work_units: 1.5\n',
+          'budget:\n  max_spend: 5\n',
+          'budget:\n  max_work_units: 3\n  max_spend: 5\n',
+          'budget: lots\n',
+        ]) {
+          const result = parseWorkflow(budgeted('  - id: n\n    prompt: p\n', yaml), 'b.yaml');
+          expect(result.error?.errorType).toBe('validation_error');
+          expect(result.error?.error).toContain('Invalid budget');
+        }
+      });
+
+      it('rejects loops, workflow: children and fan-out under a budget', () => {
+        for (const [nodeYaml, kind] of [
+          ['    loop:\n      until: done\n      max_iterations: 1\n      prompt: p', 'loop'],
+          [
+            '    loop_group:\n      nodes:\n        - id: b\n          bash: echo hi\n      until: done\n      max_iterations: 1',
+            'loop_group',
+          ],
+          ['    workflow: child', 'workflow'],
+          ['    workflow: child\n    fan_out:\n      items: \'["a"]\'\n      as: item', 'workflow'],
+          [
+            '    include: block\n    fan_out:\n      items: \'["a"]\'\n      as: item',
+            'include with fan_out',
+          ],
+        ] as const) {
+          const result = parseWorkflow(budgeted(`  - id: x\n${nodeYaml}\n`), `${kind}.yaml`);
+          expect(result.error?.errorType).toBe('validation_error');
+          expect(result.error?.error).toContain(`node 'x' is a ${kind} node`);
+          // The same shape without a budget is not refused for this reason.
+          const unbudgeted = parseWorkflow(budgeted(`  - id: x\n${nodeYaml}\n`, ''), 'u.yaml');
+          expect(unbudgeted.error?.error ?? '').not.toContain('budget');
+        }
+      });
+
+      it('rejects a loop that reaches a budgeted workflow through include:', async () => {
+        await writeWorkflowFile(
+          testDir,
+          'looping-block.yaml',
+          'name: looping-block\ndescription: block\nnodes:\n  - id: spin\n    loop:\n      until: done\n      max_iterations: 2\n      prompt: p\n'
+        );
+        await writeWorkflowFile(
+          testDir,
+          'budgeted-parent.yaml',
+          budgeted('  - id: blk\n    include: looping-block\n')
+        );
+        const result = await discoverWorkflows(testDir, { loadDefaults: false });
+        const err = result.errors.find(e => e.filename === 'budgeted-parent.yaml');
+        expect(err?.error).toContain("node 'blk__spin' is a loop node");
+        expect(result.workflows.some(w => w.workflow.name === 'looping-block')).toBe(true);
+      });
+
+      it('loads a budgeted workflow of ordinary nodes, gates, waits and halts', async () => {
+        await writeWorkflowFile(
+          testDir,
+          'budgeted-ordinary.yaml',
+          budgeted(
+            [
+              '  - id: plan',
+              '    prompt: p',
+              '  - id: check',
+              '    bash: echo ok',
+              '    depends_on: [plan]',
+              '  - id: tool',
+              '    script: console.log(1)',
+              '    runtime: bun',
+              '    depends_on: [plan]',
+              '  - id: review',
+              '    approval:',
+              '      message: ok?',
+              '      on_reject:',
+              '        prompt: fix it',
+              '    depends_on: [check, tool]',
+              '  - id: pause',
+              '    wait:',
+              '      duration_ms: 1000',
+              '    depends_on: [review]',
+              '  - id: stop',
+              '    cancel: done',
+              '    depends_on: [pause]',
+              '',
+            ].join('\n')
+          )
+        );
+        const result = await discoverWorkflows(testDir, { loadDefaults: false });
+        expect(result.errors).toEqual([]);
+        expect(result.workflows[0].workflow.budget).toEqual({ max_spend_usd: 2.5 });
+      });
+    });
+
     it('should omit container block when not present', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
       const yaml = `name: plain\ndescription: none\nnodes:\n  - id: n\n    prompt: p\n`;
-      await writeFile(join(workflowDir, 'plain.yaml'), yaml);
+      await writeWorkflowFile(testDir, 'plain.yaml', yaml);
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.workflows[0].workflow.container).toBeUndefined();
     });
 
     it('should parse explicit tags array', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
       const yaml = `name: review-mr\ndescription: GitLab MR review\ntags: [GitLab, Review]\nnodes:\n  - id: n\n    prompt: p\n`;
-      await writeFile(join(workflowDir, 'review-mr.yaml'), yaml);
+      await writeWorkflowFile(testDir, 'review-mr.yaml', yaml);
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.workflows[0].workflow.tags).toEqual(['GitLab', 'Review']);
     });
 
     it('should omit tags when not present', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
       const yaml = `name: test\ndescription: no tags\nnodes:\n  - id: n\n    prompt: p\n`;
-      await writeFile(join(workflowDir, 'test.yaml'), yaml);
+      await writeWorkflowFile(testDir, 'test.yaml', yaml);
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.workflows[0].workflow.tags).toBeUndefined();
     });
 
     it('should preserve explicit empty tags array (suppresses inference)', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
       const yaml = `name: test\ndescription: no tags wanted\ntags: []\nnodes:\n  - id: n\n    prompt: p\n`;
-      await writeFile(join(workflowDir, 'test.yaml'), yaml);
+      await writeWorkflowFile(testDir, 'test.yaml', yaml);
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.workflows[0].workflow.tags).toEqual([]);
     });
 
     it('should trim and dedupe tags', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
       const yaml = `name: test\ndescription: messy tags\ntags: ["GitLab", "GitLab ", "  GitLab  ", "Review"]\nnodes:\n  - id: n\n    prompt: p\n`;
-      await writeFile(join(workflowDir, 'test.yaml'), yaml);
+      await writeWorkflowFile(testDir, 'test.yaml', yaml);
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.workflows[0].workflow.tags).toEqual(['GitLab', 'Review']);
     });
 
     it('should filter non-string tag entries', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
       // YAML coerces unquoted scalars: 123 → number, null → null
       const yaml = `name: test\ndescription: mixed\ntags:\n  - GitLab\n  - 123\n  - null\n  - Review\nnodes:\n  - id: n\n    prompt: p\n`;
-      await writeFile(join(workflowDir, 'test.yaml'), yaml);
+      await writeWorkflowFile(testDir, 'test.yaml', yaml);
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.workflows[0].workflow.tags).toEqual(['GitLab', 'Review']);
     });
 
     it('should reduce all-blank tags to empty array (still suppresses inference)', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
       const yaml = `name: test\ndescription: blanks\ntags: ["", "  "]\nnodes:\n  - id: n\n    prompt: p\n`;
-      await writeFile(join(workflowDir, 'test.yaml'), yaml);
+      await writeWorkflowFile(testDir, 'test.yaml', yaml);
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.workflows[0].workflow.tags).toEqual([]);
     });
 
     it('should ignore tags when not an array', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
       // Authoring mistake: scalar instead of list — discarded, workflow still loads
       const yaml = `name: test\ndescription: scalar tags\ntags: GitLab\nnodes:\n  - id: n\n    prompt: p\n`;
-      await writeFile(join(workflowDir, 'test.yaml'), yaml);
+      await writeWorkflowFile(testDir, 'test.yaml', yaml);
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.workflows).toHaveLength(1);
       expect(result.workflows[0].workflow.tags).toBeUndefined();
     });
 
     it('should parse mutates_checkout: false correctly', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
       const yaml = `name: test\ndescription: read-only workflow\nmutates_checkout: false\nnodes:\n  - id: n\n    prompt: p\n`;
-      await writeFile(join(workflowDir, 'test.yaml'), yaml);
+      await writeWorkflowFile(testDir, 'test.yaml', yaml);
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.workflows[0].workflow.mutates_checkout).toBe(false);
     });
 
     it('should parse mutates_checkout: true correctly', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
       const yaml = `name: test\ndescription: explicit true\nmutates_checkout: true\nnodes:\n  - id: n\n    prompt: p\n`;
-      await writeFile(join(workflowDir, 'test.yaml'), yaml);
+      await writeWorkflowFile(testDir, 'test.yaml', yaml);
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.workflows[0].workflow.mutates_checkout).toBe(true);
     });
 
     it('should omit mutates_checkout when not set', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
       const yaml = `name: test\ndescription: no field\nnodes:\n  - id: n\n    prompt: p\n`;
-      await writeFile(join(workflowDir, 'test.yaml'), yaml);
+      await writeWorkflowFile(testDir, 'test.yaml', yaml);
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.workflows[0].workflow.mutates_checkout).toBeUndefined();
     });
 
     it('should warn and omit mutates_checkout for invalid value', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
       // YAML string "yes" is not a boolean — should be dropped and field omitted
       const yaml = `name: test\ndescription: typo\nmutates_checkout: "yes"\nnodes:\n  - id: n\n    prompt: p\n`;
-      await writeFile(join(workflowDir, 'test.yaml'), yaml);
+      await writeWorkflowFile(testDir, 'test.yaml', yaml);
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.workflows).toHaveLength(1);
       expect(result.workflows[0].workflow.mutates_checkout).toBeUndefined();
     });
 
-    it('should parse valid DAG workflow YAML', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
+    // Node-level declaration (#2771): the engine-enforced tree-integrity assertion.
+    it('should parse node-level mutates_checkout onto exec and agent nodes', () => {
+      const { workflow } = parseWorkflowYaml(`name: test-workflow
+description: node-level declarations
+nodes:
+  - id: guarded-bash
+    bash: echo hi
+    mutates_checkout: false
+  - id: guarded-agent
+    prompt: p
+    mutates_checkout: false
+  - id: plain
+    bash: echo hi
+`);
+      const byId = Object.fromEntries(workflow.nodes.map(n => [n.id, n]));
+      const guardedBash = byId['guarded-bash'];
+      expect(
+        guardedBash && 'mutates_checkout' in guardedBash && guardedBash.mutates_checkout === false
+      ).toBe(true);
+      const guardedAgent = byId['guarded-agent'];
+      expect(
+        guardedAgent &&
+          'mutates_checkout' in guardedAgent &&
+          guardedAgent.mutates_checkout === false
+      ).toBe(true);
+      const plain = byId['plain'];
+      expect(plain && !('mutates_checkout' in plain)).toBe(true);
+    });
 
-      const validYaml = `name: test-workflow
+    it('should reject a non-boolean node-level mutates_checkout', () => {
+      const result = parseWorkflow(
+        `name: test-workflow
+description: bad type
+nodes:
+  - id: n
+    bash: echo hi
+    mutates_checkout: "no"
+`,
+        'bad.yaml'
+      );
+      expect(result.error).not.toBeNull();
+    });
+
+    it('should still hard-reject mutates_checkout on an include node', () => {
+      const result = parseWorkflow(
+        `name: test-workflow
+description: include rejection
+nodes:
+  - id: blk
+    include: other
+    mutates_checkout: false
+`,
+        'include-mc.yaml'
+      );
+      expect(result.error).not.toBeNull();
+    });
+
+    it('should warn that mutates_checkout is inert on loop/gate/cancel/loop_group nodes', () => {
+      mockLogger.warn.mockClear();
+      for (const [nodeYaml, kind] of [
+        ['    loop:\n      until: done\n      max_iterations: 1\n      prompt: p', 'loop'],
+        ['    approval:\n      message: m', 'approval'],
+        ['    cancel: stop', 'cancel'],
+        [
+          '    loop_group:\n      nodes:\n        - id: b\n          bash: echo hi\n      until: done\n      max_iterations: 1',
+          'loop_group',
+        ],
+      ] as const) {
+        const result = parseWorkflow(
+          `name: mc-inert-${kind}
+description: d
+nodes:
+  - id: n
+${nodeYaml}
+    mutates_checkout: false
+`,
+          `${kind}-mc.yaml`
+        );
+        expect(result.error).toBeNull();
+        expect(
+          result.warnings?.some(w => w.includes("'mutates_checkout'") && w.includes(`(${kind})`))
+        ).toBe(true);
+      }
+    });
+
+    it('should parse valid DAG workflow YAML', () => {
+      const { workflow } = parseWorkflowYaml(`name: test-workflow
 description: A test workflow
 provider: claude
 nodes:
@@ -478,31 +1021,23 @@ nodes:
   - id: implement
     command: implement
     depends_on: [plan]
-`;
-      await writeFile(join(workflowDir, 'test.yaml'), validYaml);
+`);
 
-      const result = await discoverWorkflows(testDir, { loadDefaults: false });
-      const workflows = result.workflows.map(ws => ws.workflow);
-
-      expect(workflows).toHaveLength(1);
-      expect(workflows[0].name).toBe('test-workflow');
-      expect(workflows[0].description).toBe('A test workflow');
-      expect(workflows[0].provider).toBe('claude');
-      expect(workflows[0].nodes).toHaveLength(2);
-      expect(workflows[0].nodes[0].id).toBe('plan');
-      expect(workflows[0].nodes[1].id).toBe('implement');
+      expect(workflow.name).toBe('test-workflow');
+      expect(workflow.description).toBe('A test workflow');
+      expect(workflow.provider).toBe('claude');
+      expect(workflow.nodes).toHaveLength(2);
+      expect(workflow.nodes[0].id).toBe('plan');
+      expect(workflow.nodes[1].id).toBe('implement');
     });
 
     it('should return empty array for YAML missing name', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
       const invalidYaml = `description: Missing name
 nodes:
   - id: plan
     command: plan
 `;
-      await writeFile(join(workflowDir, 'invalid.yaml'), invalidYaml);
+      await writeWorkflowFile(testDir, 'invalid.yaml', invalidYaml);
 
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       const workflows = result.workflows.map(ws => ws.workflow);
@@ -511,15 +1046,12 @@ nodes:
     });
 
     it('should return empty array for YAML missing description', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
       const invalidYaml = `name: no-description
 nodes:
   - id: plan
     command: plan
 `;
-      await writeFile(join(workflowDir, 'invalid.yaml'), invalidYaml);
+      await writeWorkflowFile(testDir, 'invalid.yaml', invalidYaml);
 
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       const workflows = result.workflows.map(ws => ws.workflow);
@@ -528,16 +1060,13 @@ nodes:
     });
 
     it('should reject workflow with steps: and provide clear error message', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
       const stepsYaml = `name: legacy-workflow
 description: Uses deprecated steps format
 steps:
   - command: plan
   - command: implement
 `;
-      await writeFile(join(workflowDir, 'legacy.yaml'), stepsYaml);
+      await writeWorkflowFile(testDir, 'legacy.yaml', stepsYaml);
 
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
 
@@ -549,16 +1078,13 @@ steps:
     });
 
     it('should leave provider undefined when not specified (executor handles fallback)', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
       const yamlNoProvider = `name: default-provider
 description: No provider specified
 nodes:
   - id: test
     command: test
 `;
-      await writeFile(join(workflowDir, 'test.yaml'), yamlNoProvider);
+      await writeWorkflowFile(testDir, 'test.yaml', yamlNoProvider);
 
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       const workflows = result.workflows.map(ws => ws.workflow);
@@ -568,9 +1094,6 @@ nodes:
     });
 
     it('should reject unknown provider at load time', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
       const yamlInvalidProvider = `name: invalid-provider
 description: Invalid provider specified
 provider: claud
@@ -578,50 +1101,38 @@ nodes:
   - id: test
     command: test
 `;
-      await writeFile(join(workflowDir, 'test.yaml'), yamlInvalidProvider);
+      await writeWorkflowFile(testDir, 'test.yaml', yamlInvalidProvider);
 
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
 
       expect(result.workflows).toHaveLength(0);
       expect(result.errors).toHaveLength(1);
       expect(result.errors[0].errorType).toBe('validation_error');
-      expect(result.errors[0].error).toContain("Unknown provider 'claud'");
+      expect(result.errors[0].error).toContain("Unknown provider: 'claud'");
     });
 
-    it('should accept any model string with a known provider (SDK validates at run time)', async () => {
+    it('should accept any model string with a known provider (SDK validates at run time)', () => {
       // Whatever the user wrote in `model:` passes through to the SDK; the
       // SDK is the source of truth for what model strings exist. Errors
       // surface at run time, not load time.
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      const yaml = `name: any-model
+      const { workflow } = parseWorkflowYaml(`name: any-model
 description: Any model string with a known provider
 provider: claude
 model: claude-opus-4-7[1m]
 nodes:
   - id: test
     command: test
-`;
-      await writeFile(join(workflowDir, 'any-model.yaml'), yaml);
+`);
 
-      const result = await discoverWorkflows(testDir, { loadDefaults: false });
-      const workflows = result.workflows.map(ws => ws.workflow);
-
-      expect(result.errors).toHaveLength(0);
-      expect(workflows).toHaveLength(1);
-      expect(workflows[0].provider).toBe('claude');
-      expect(workflows[0].model).toBe('claude-opus-4-7[1m]');
+      expect(workflow.provider).toBe('claude');
+      expect(workflow.model).toBe('claude-opus-4-7[1m]');
     });
 
-    it('should parse codex options fields (and ignore the removed additionalDirectories field)', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
+    it('should parse codex options fields (and ignore the removed additionalDirectories field)', () => {
       // additionalDirectories was a dead workflow-level field (parsed but never
       // consumed by the DAG executor) — it has been removed. A YAML that still
       // declares it must load fine, with the field simply ignored.
-      const yaml = `name: codex-options
+      const { workflow } = parseWorkflowYaml(`name: codex-options
 description: Codex options are parsed
 provider: codex
 model: gpt-5.6-sol
@@ -633,21 +1144,147 @@ additionalDirectories:
 nodes:
   - id: test
     command: test
-`;
-      await writeFile(join(workflowDir, 'options.yaml'), yaml);
+`);
 
-      const result = await discoverWorkflows(testDir, { loadDefaults: false });
-      const workflows = result.workflows.map(ws => ws.workflow);
-
-      expect(workflows).toHaveLength(1);
-      expect(workflows[0].modelReasoningEffort).toBe('medium');
-      expect(workflows[0].webSearchMode).toBe('live');
+      // #2556: translated into `effort:` at load, never carried forward.
+      expect(workflow.effort).toBe('medium');
+      expect(workflow.modelReasoningEffort).toBeUndefined();
+      expect(workflow.webSearchMode).toBe('live');
       // The removed field is not carried onto the workflow object.
-      expect((workflows[0] as Record<string, unknown>).additionalDirectories).toBeUndefined();
+      expect((workflow as Record<string, unknown>).additionalDirectories).toBeUndefined();
     });
 
-    it('should round-trip workflow-level effort/thinking/fallbackModel/betas/sandbox', async () => {
-      // Regression: these 5 workflow-level fields are declared on
+    it('should translate modelReasoningEffort into effort and say so', () => {
+      // #2556: warn-and-TRANSLATE. The value must survive to the executor — an
+      // author who reads the warning and does nothing must see no change in the
+      // depth their nodes run at — but it survives as `effort:`, the field that
+      // has a node-level counterpart. That is what makes the deprecation
+      // terminal, and what lets a later pass collapse workflow-level config onto
+      // nodes (#1764) without a hole for this field.
+      const { workflow, warnings } = parseWorkflowYaml(`name: deprecated-effort-spelling
+description: Uses the old Codex-only spelling
+provider: codex
+modelReasoningEffort: xhigh
+nodes:
+  - id: test
+    command: test
+`);
+
+      // The value arrives under the canonical spelling; the deprecated key is gone.
+      expect(workflow.effort).toBe('xhigh');
+      expect(workflow.modelReasoningEffort).toBeUndefined();
+
+      const deprecation = warnings.find(w => w.includes('modelReasoningEffort'));
+      expect(deprecation).toBeDefined();
+      expect(deprecation).toContain('deprecated');
+      // The message must name what actually happened, not just what to write —
+      // an author who reads "deprecated" and nothing else cannot tell whether
+      // their value still applies.
+      expect(deprecation).toContain("has been applied as 'effort: xhigh'");
+      // The scope change must be disclosed, not just the rename. The old field
+      // was Codex-only; `effort:` is not, so a workflow that declares only the
+      // deprecated field now reasons deeper on its Claude/Pi/Copilot nodes too,
+      // where before it affected none of them. Silent is exactly what this
+      // issue exists to remove.
+      expect(deprecation).toContain('EVERY node');
+      expect(deprecation).toContain('non-Codex');
+    });
+
+    it('translates for a NON-Codex workflow too — the widening, pinned', () => {
+      // R22's cost, as behavior rather than a sentence. The deprecated field was
+      // Codex-gated in the executor: on a Claude workflow it applied to nothing
+      // and warned. Translation is provider-blind (the loader cannot know which
+      // nodes resolve to Codex), so it now applies. That is deliberate and
+      // disclosed — and a plausible "fix" would be to re-add a Codex gate here,
+      // which would silently restore the two-field hole #1764 Task 1 needs gone.
+      // This test is what makes that regression fail.
+      const { workflow } = parseWorkflowYaml(`name: deprecated-on-claude
+description: Codex-only spelling on a Claude workflow
+provider: claude
+modelReasoningEffort: high
+nodes:
+  - id: test
+    command: test
+`);
+
+      expect(workflow.provider).toBe('claude');
+      // Applied, not dropped, and under the canonical spelling.
+      expect(workflow.effort).toBe('high');
+      expect(workflow.modelReasoningEffort).toBeUndefined();
+    });
+
+    it('should ignore modelReasoningEffort when effort is also declared, and say which won', () => {
+      // The loader cannot know which nodes resolve to Codex, so the deprecated
+      // field's Codex-only precedence is not expressible at load time. `effort:`
+      // wins, and the warning has to say so plainly — silently picking one of
+      // two declared depths is the failure this issue exists to remove.
+      const { workflow, warnings } = parseWorkflowYaml(`name: both-spellings
+description: Declares both reasoning-depth fields
+provider: codex
+effort: minimal
+modelReasoningEffort: xhigh
+nodes:
+  - id: test
+    command: test
+`);
+
+      expect(workflow.effort).toBe('minimal');
+      expect(workflow.modelReasoningEffort).toBeUndefined();
+
+      const deprecation = warnings.find(w => w.includes('modelReasoningEffort'));
+      expect(deprecation).toBeDefined();
+      expect(deprecation).toContain('IGNORED');
+      expect(deprecation).toContain('effort: minimal');
+    });
+
+    it('should not warn about deprecation when modelReasoningEffort is absent', () => {
+      const { workflow, warnings } = parseWorkflowYaml(`name: current-effort-spelling
+description: Uses the one spelling
+provider: codex
+effort: xhigh
+nodes:
+  - id: test
+    command: test
+`);
+
+      expect(workflow.effort).toBe('xhigh');
+      expect(warnings).toEqual([]);
+    });
+
+    it('should accept the widened effort ladder on NODES, not just at workflow level', async () => {
+      // `effortLevelSchema` backs both the workflow field and the node field, but
+      // only the workflow one was proven against real YAML. The node field is the
+      // headline of #2556 — "effort: works per node on every provider" — and it
+      // crosses `dagNodeSchema.safeParse()`, a boundary no other effort test
+      // touches (the executor and provider suites build objects in memory).
+      // Narrowing the node enum would pass every one of those and fail the WHOLE
+      // workflow to load, not just the field.
+      const yaml = `name: node-effort-rungs
+description: Node-level effort across the full ladder
+provider: codex
+nodes:
+  - id: shallow
+    command: test
+    effort: minimal
+  - id: deep
+    command: test
+    effort: xhigh
+    depends_on: [shallow]
+`;
+      await writeWorkflowFile(testDir, 'node-effort.yaml', yaml);
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toEqual([]);
+      expect(result.workflows).toHaveLength(1);
+
+      const nodes = result.workflows[0].workflow.nodes as DagNode[];
+      expect(nodes.find(n => n.id === 'shallow')?.effort).toBe('minimal');
+      expect(nodes.find(n => n.id === 'deep')?.effort).toBe('xhigh');
+      expect(result.workflows[0].parseWarnings ?? []).toEqual([]);
+    });
+
+    it('should round-trip workflow-level effort/fallbackModel/betas/sandbox', () => {
+      // Regression: these workflow-level fields are declared on
       // workflowBaseSchema and consumed by the DAG executor's workflowLevelOptions
       // (the object literal at the top of executeDagWorkflow), but the loader's
       // manual workflow constructor used to silently drop them. YAML → loader →
@@ -655,15 +1292,10 @@ nodes:
       // value never inherited them. See `dag-executor.test.ts`
       // "forwards workflow-level effort to node when no per-node override" — that
       // test passes because it bypasses the loader.
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-      const yaml = `name: defaults
+      const wf = parseWorkflowYaml(`name: defaults
 description: workflow-level fallback options
 provider: claude
 effort: high
-thinking:
-  type: enabled
-  budgetTokens: 4000
 fallbackModel: claude-haiku-4-5
 betas:
   - foo
@@ -673,32 +1305,19 @@ sandbox:
 nodes:
   - id: only
     prompt: p
-`;
-      await writeFile(join(workflowDir, 'defaults.yaml'), yaml);
-      const result = await discoverWorkflows(testDir, { loadDefaults: false });
-      const wf = result.workflows[0].workflow as {
-        effort?: unknown;
-        thinking?: unknown;
-        fallbackModel?: unknown;
-        betas?: unknown;
-        sandbox?: unknown;
-      };
+`).workflow;
       expect(wf.effort).toBe('high');
-      expect(wf.thinking).toEqual({ type: 'enabled', budgetTokens: 4000 });
       expect(wf.fallbackModel).toBe('claude-haiku-4-5');
       expect(wf.betas).toEqual(['foo', 'bar']);
       expect(wf.sandbox).toEqual({ enabled: true });
     });
 
     it('should omit workflow-level fallback fields when not present', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
       const yaml = `name: bare\ndescription: no fallbacks\nnodes:\n  - id: only\n    prompt: p\n`;
-      await writeFile(join(workflowDir, 'bare.yaml'), yaml);
+      await writeWorkflowFile(testDir, 'bare.yaml', yaml);
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
-      const wf = result.workflows[0].workflow as Record<string, unknown>;
+      const wf = result.workflows[0].workflow;
       expect(wf.effort).toBeUndefined();
-      expect(wf.thinking).toBeUndefined();
       expect(wf.fallbackModel).toBeUndefined();
       expect(wf.betas).toBeUndefined();
       expect(wf.sandbox).toBeUndefined();
@@ -707,14 +1326,10 @@ nodes:
     it('should warn-and-drop invalid workflow-level fallback fields without rejecting the workflow', async () => {
       // Same warn-and-ignore policy as `interactive` / `modelReasoningEffort`:
       // a typo in one workflow-level field must not nuke the whole discovery pass.
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
       const yaml = `name: bad
 description: invalid fallback fields are dropped
 provider: claude
 effort: nuclear
-thinking:
-  type: enhanced
 fallbackModel: ''
 betas: []
 sandbox: 'yes'
@@ -722,14 +1337,13 @@ nodes:
   - id: only
     prompt: p
 `;
-      await writeFile(join(workflowDir, 'bad.yaml'), yaml);
+      await writeWorkflowFile(testDir, 'bad.yaml', yaml);
       mockLogger.warn.mockClear();
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.errors).toEqual([]);
       expect(result.workflows).toHaveLength(1);
-      const wf = result.workflows[0].workflow as Record<string, unknown>;
+      const wf = result.workflows[0].workflow;
       expect(wf.effort).toBeUndefined();
-      expect(wf.thinking).toBeUndefined();
       expect(wf.fallbackModel).toBeUndefined();
       expect(wf.betas).toBeUndefined();
       expect(wf.sandbox).toBeUndefined();
@@ -737,52 +1351,58 @@ nodes:
       // The structured warn events are the operator-facing surface — assert each fired.
       const events = mockLogger.warn.mock.calls.map(call => call[1]);
       expect(events).toContain('invalid_workflow_effort_value_ignored');
-      expect(events).toContain('invalid_workflow_thinking_value_ignored');
       expect(events).toContain('invalid_workflow_fallback_model_value_ignored');
       expect(events).toContain('invalid_workflow_betas_value_ignored');
       expect(events).toContain('invalid_workflow_sandbox_value_ignored');
     });
 
-    it('should accept the thinking string shorthand at the workflow level', async () => {
-      // thinkingConfigSchema preprocesses 'enabled' → { type: 'enabled' }. The
-      // round-trip test covers the object form; this covers the shorthand path.
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-      const yaml = `name: thinking-shorthand
-description: thinking as a bare string
+    it('should reject retired thinking config and name effort', () => {
+      const result = parseWorkflow(
+        `name: retired-thinking
+description: retired option
 thinking: enabled
 nodes:
   - id: only
     prompt: p
-`;
-      await writeFile(join(workflowDir, 'ts.yaml'), yaml);
-      const result = await discoverWorkflows(testDir, { loadDefaults: false });
-      const wf = result.workflows[0].workflow as { thinking?: unknown };
-      expect(wf.thinking).toEqual({ type: 'enabled' });
+`,
+        'retired.yaml'
+      );
+      expect(result.workflow).toBeNull();
+      expect(result.error?.errorType).toBe('validation_error');
+      expect(result.error?.error).toContain('effort:');
     });
 
-    it('should trim surrounding whitespace from workflow-level fallbackModel', async () => {
+    it('should reject retired thinking config on a node and name effort', () => {
+      const result = parseWorkflow(
+        `name: retired-node-thinking
+description: retired option
+nodes:
+  - id: only
+    prompt: p
+    thinking: adaptive
+`,
+        'retired-node.yaml'
+      );
+      expect(result.workflow).toBeNull();
+      expect(result.error?.errorType).toBe('validation_error');
+      expect(result.error?.error).toContain('effort:');
+    });
+
+    it('should trim surrounding whitespace from workflow-level fallbackModel', () => {
       // The inline trim (rather than safeParse) exists specifically so a stray
       // surrounding space is normalised rather than rejected.
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-      const yaml = `name: fm-trim
+      const wf = parseWorkflowYaml(`name: fm-trim
 description: fallbackModel with whitespace
 fallbackModel: '  claude-haiku-4-5  '
 nodes:
   - id: only
     prompt: p
-`;
-      await writeFile(join(workflowDir, 'fm.yaml'), yaml);
-      const result = await discoverWorkflows(testDir, { loadDefaults: false });
-      const wf = result.workflows[0].workflow as { fallbackModel?: unknown };
+`).workflow;
       expect(wf.fallbackModel).toBe('claude-haiku-4-5');
     });
 
-    it('should trim and filter empty strings out of workflow-level betas', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-      const yaml = `name: beta-trim
+    it('should trim and filter empty strings out of workflow-level betas', () => {
+      const wf = parseWorkflowYaml(`name: beta-trim
 description: betas with whitespace
 betas:
   - '  alpha  '
@@ -791,26 +1411,20 @@ betas:
 nodes:
   - id: only
     prompt: p
-`;
-      await writeFile(join(workflowDir, 't.yaml'), yaml);
-      const result = await discoverWorkflows(testDir, { loadDefaults: false });
-      const wf = result.workflows[0].workflow as { betas?: unknown };
+`).workflow;
       expect(wf.betas).toEqual(['alpha', 'beta']);
     });
   });
 
   describe('discoverWorkflows', () => {
     it('should discover workflows from .archon/workflows/', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
       const validYaml = `name: discovered
 description: Discovered workflow
 nodes:
   - id: test
     command: test
 `;
-      await writeFile(join(workflowDir, 'workflow.yaml'), validYaml);
+      await writeWorkflowFile(testDir, 'workflow.yaml', validYaml);
 
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       const workflows = result.workflows.map(ws => ws.workflow);
@@ -826,9 +1440,6 @@ nodes:
     });
 
     it('should load both .yaml and .yml files', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
       const yaml1 = `name: workflow-one
 description: First workflow
 nodes:
@@ -841,8 +1452,8 @@ nodes:
   - id: two
     command: two
 `;
-      await writeFile(join(workflowDir, 'one.yaml'), yaml1);
-      await writeFile(join(workflowDir, 'two.yml'), yaml2);
+      await writeWorkflowFile(testDir, 'one.yaml', yaml1);
+      await writeWorkflowFile(testDir, 'two.yml', yaml2);
 
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       const workflows = result.workflows.map(ws => ws.workflow);
@@ -883,16 +1494,13 @@ nodes:
 
   describe('command name validation (Issue #129)', () => {
     it('should reject DAG workflow with path traversal command name', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
       const pathTraversalYaml = `name: path-traversal
 description: Has invalid command name
 nodes:
   - id: bad
     command: ../../../etc/passwd
 `;
-      await writeFile(join(workflowDir, 'invalid.yaml'), pathTraversalYaml);
+      await writeWorkflowFile(testDir, 'invalid.yaml', pathTraversalYaml);
 
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       const workflows = result.workflows.map(ws => ws.workflow);
@@ -901,16 +1509,13 @@ nodes:
     });
 
     it('should reject DAG workflow with dotfile command name', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
       const dotfileYaml = `name: dotfile-workflow
 description: Has dotfile command name
 nodes:
   - id: bad
     command: .hidden
 `;
-      await writeFile(join(workflowDir, 'dotfile.yaml'), dotfileYaml);
+      await writeWorkflowFile(testDir, 'dotfile.yaml', dotfileYaml);
 
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       const workflows = result.workflows.map(ws => ws.workflow);
@@ -919,9 +1524,6 @@ nodes:
     });
 
     it('should accept valid command names in DAG nodes', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
       const validYaml = `name: valid-commands
 description: Has valid command names
 nodes:
@@ -934,7 +1536,7 @@ nodes:
     command: review-pr
     depends_on: [implement]
 `;
-      await writeFile(join(workflowDir, 'valid.yaml'), validYaml);
+      await writeWorkflowFile(testDir, 'valid.yaml', validYaml);
 
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       const workflows = result.workflows.map(ws => ws.workflow);
@@ -946,9 +1548,6 @@ nodes:
 
   describe('edge cases', () => {
     it('should ignore non-yaml files in workflows directory', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
       // Create a valid yaml and some non-yaml files
       const validYaml = `name: valid-workflow
 description: Valid workflow
@@ -956,10 +1555,10 @@ nodes:
   - id: test
     command: test
 `;
-      await writeFile(join(workflowDir, 'valid.yaml'), validYaml);
-      await writeFile(join(workflowDir, 'readme.md'), '# Readme');
-      await writeFile(join(workflowDir, 'config.json'), '{}');
-      await writeFile(join(workflowDir, '.gitkeep'), '');
+      await writeWorkflowFile(testDir, 'valid.yaml', validYaml);
+      await writeWorkflowFile(testDir, 'readme.md', '# Readme');
+      await writeWorkflowFile(testDir, 'config.json', '{}');
+      await writeWorkflowFile(testDir, '.gitkeep', '');
 
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       const workflows = result.workflows.map(ws => ws.workflow);
@@ -969,9 +1568,6 @@ nodes:
     });
 
     it('should handle malformed YAML gracefully', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
       const malformedYaml = `name: test
 description: test
 nodes:
@@ -979,7 +1575,7 @@ nodes:
     command: invalid
     invalid yaml here: [
 `;
-      await writeFile(join(workflowDir, 'malformed.yaml'), malformedYaml);
+      await writeWorkflowFile(testDir, 'malformed.yaml', malformedYaml);
 
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       const workflows = result.workflows.map(ws => ws.workflow);
@@ -988,11 +1584,8 @@ nodes:
       expect(workflows).toHaveLength(0);
     });
 
-    it('should handle workflow with all optional fields', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      const fullWorkflow = `name: full-workflow
+    it('should handle workflow with all optional fields', () => {
+      const { workflow } = parseWorkflowYaml(`name: full-workflow
 description: A workflow with all fields
 provider: codex
 model: gpt-4
@@ -1002,15 +1595,10 @@ nodes:
   - id: step-two
     command: step-two
     depends_on: [step-one]
-`;
-      await writeFile(join(workflowDir, 'full.yaml'), fullWorkflow);
+`);
 
-      const result = await discoverWorkflows(testDir, { loadDefaults: false });
-      const workflows = result.workflows.map(ws => ws.workflow);
-
-      expect(workflows).toHaveLength(1);
-      expect(workflows[0].provider).toBe('codex');
-      expect(workflows[0].model).toBe('gpt-4');
+      expect(workflow.provider).toBe('codex');
+      expect(workflow.model).toBe('gpt-4');
     });
 
     it('should handle empty workflow directory', async () => {
@@ -1025,13 +1613,10 @@ nodes:
     });
 
     it('should handle workflow with missing nodes field', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
       const noNodes = `name: no-nodes
 description: Missing nodes
 `;
-      await writeFile(join(workflowDir, 'nonodes.yaml'), noNodes);
+      await writeWorkflowFile(testDir, 'nonodes.yaml', noNodes);
 
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       const workflows = result.workflows.map(ws => ws.workflow);
@@ -1040,16 +1625,13 @@ description: Missing nodes
     });
 
     it('should handle workflow with null values', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
       const nullValues = `name: null-test
 description: ~
 nodes:
   - id: test
     command: test
 `;
-      await writeFile(join(workflowDir, 'nulltest.yaml'), nullValues);
+      await writeWorkflowFile(testDir, 'nulltest.yaml', nullValues);
 
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       const workflows = result.workflows.map(ws => ws.workflow);
@@ -1059,9 +1641,6 @@ nodes:
     });
 
     it('parses always_run: true on a node', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
       const yaml = `name: always-run-test
 description: Producer opts out of resume caching
 nodes:
@@ -1072,21 +1651,19 @@ nodes:
     command: consume
     depends_on: [persist]
 `;
-      await writeFile(join(workflowDir, 'always-run.yaml'), yaml);
+      await writeWorkflowFile(testDir, 'always-run.yaml', yaml);
 
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       const workflows = result.workflows.map(ws => ws.workflow);
 
       expect(workflows).toHaveLength(1);
-      expect(workflows[0].nodes[0].id).toBe('persist');
-      expect(workflows[0].nodes[0].always_run).toBe(true);
-      expect(workflows[0].nodes[1].always_run).toBeUndefined();
+      const alwaysRunNodes = workflows[0].nodes as DagNode[];
+      expect(alwaysRunNodes[0].id).toBe('persist');
+      expect(alwaysRunNodes[0].always_run).toBe(true);
+      expect(alwaysRunNodes[1].always_run).toBeUndefined();
     });
 
     it('preserves an optional description on a node', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
       const yaml = `name: node-description-test
 description: Node-level description is kept, not stripped
 nodes:
@@ -1097,7 +1674,7 @@ nodes:
     bash: 'echo bye'
     depends_on: [documented]
 `;
-      await writeFile(join(workflowDir, 'node-description.yaml'), yaml);
+      await writeWorkflowFile(testDir, 'node-description.yaml', yaml);
 
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       const workflows = result.workflows.map(ws => ws.workflow);
@@ -1111,16 +1688,12 @@ nodes:
   });
 
   describe('multi-source loading', () => {
-    it('should load real app defaults when enabled', async () => {
+    it('should load app defaults when enabled', async () => {
       // Test dir has no .archon/workflows/
       const result = await discoverWorkflows(testDir, { loadDefaults: true });
       const workflows = result.workflows.map(ws => ws.workflow);
 
-      // Should load the real archon-* prefixed app defaults
-      expect(workflows.length).toBeGreaterThanOrEqual(1);
-      // Check for at least one of the known app defaults
-      const archonAssist = workflows.find(w => w.name === 'archon-assist');
-      expect(archonAssist).toBeDefined();
+      expect(workflows.map(w => w.name)).toEqual(['fake-review']);
     });
 
     it('should override app defaults with repo workflows of same filename', async () => {
@@ -1128,34 +1701,33 @@ nodes:
       const repoWorkflowDir = join(testDir, '.archon', 'workflows');
       await mkdir(repoWorkflowDir, { recursive: true });
       const repoWorkflowYaml = `name: my-custom-assist
-description: My custom assist (overrides archon-assist)
+description: My custom assist (overrides fake-review)
 nodes:
   - id: custom
     command: custom-command
 `;
       // Use exact same filename as app default to override
-      await writeFile(join(repoWorkflowDir, 'archon-assist.yaml'), repoWorkflowYaml);
+      await writeFile(join(repoWorkflowDir, 'fake-review.yaml'), repoWorkflowYaml);
 
       const result = await discoverWorkflows(testDir, { loadDefaults: true });
       const workflows = result.workflows.map(ws => ws.workflow);
 
       // Should have the repo version, not the app default
       const assistWorkflow = workflows.find(
-        w => w.name === 'my-custom-assist' || w.name === 'archon-assist'
+        w => w.name === 'my-custom-assist' || w.name === 'fake-review'
       );
       expect(assistWorkflow).toBeDefined();
       // Repo version should win (has custom name)
       expect(assistWorkflow?.name).toBe('my-custom-assist');
-      expect(assistWorkflow?.description).toBe('My custom assist (overrides archon-assist)');
+      expect(assistWorkflow?.description).toBe('My custom assist (overrides fake-review)');
     });
 
     it('should skip app defaults when loadDefaults is false', async () => {
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       const workflows = result.workflows.map(ws => ws.workflow);
 
-      // Should NOT find any archon-* workflows since app defaults are disabled
-      const archonWorkflow = workflows.find(w => w.name.startsWith('archon-'));
-      expect(archonWorkflow).toBeUndefined();
+      // Should NOT find the bundled workflow since app defaults are disabled
+      expect(workflows.find(w => w.name === 'fake-review')).toBeUndefined();
     });
 
     it('should combine app defaults with repo workflows', async () => {
@@ -1174,9 +1746,9 @@ nodes:
       const workflows = result.workflows.map(ws => ws.workflow);
 
       // Should have both app defaults and repo workflows
-      const archonAssist = workflows.find(w => w.name === 'archon-assist');
+      const bundledReview = workflows.find(w => w.name === 'fake-review');
       const customWorkflow = workflows.find(w => w.name === 'my-custom-workflow');
-      expect(archonAssist).toBeDefined();
+      expect(bundledReview).toBeDefined();
       expect(customWorkflow).toBeDefined();
     });
   });
@@ -1402,13 +1974,89 @@ nodes:
   });
 
   describe('discoverWorkflowsWithConfig', () => {
+    it("treats config.yaml's env: as supplied, suppressing the unbound-env-read warning", async () => {
+      const scriptsDir = join(testDir, '.archon', 'scripts');
+      const workflowsDir = join(testDir, '.archon', 'workflows');
+      await mkdir(scriptsDir, { recursive: true });
+      await mkdir(workflowsDir, { recursive: true });
+      await writeFile(join(scriptsDir, 'verify.ts'), 'console.log(process.env.NAME)\n');
+      await writeFile(
+        join(workflowsDir, 'uses-configured-env.yaml'),
+        `name: uses-configured-env
+description: Reads a variable supplied by config.yaml's env section
+inputs:
+  declared: {}
+nodes:
+  - id: verify
+    script: verify
+    runtime: bun
+`
+      );
+      const mockLoadConfig = mock(async () => ({
+        envVars: { NAME: 'value' },
+      }));
+
+      const result = await discoverWorkflowsWithConfig(testDir, mockLoadConfig, providerRegistry);
+
+      expect(result.errors).toEqual([]);
+      const entry = result.workflows.find(w => w.workflow.name === 'uses-configured-env');
+      expect(entry).toBeDefined();
+      expect(entry?.parseWarnings ?? []).toEqual([]);
+    });
+
+    it("still treats config.yaml's env: as supplied once discovery runs from a frozen capture", async () => {
+      const scriptsDir = join(testDir, '.archon', 'scripts');
+      const workflowsDir = join(testDir, '.archon', 'workflows');
+      await mkdir(scriptsDir, { recursive: true });
+      await mkdir(workflowsDir, { recursive: true });
+      await writeFile(join(scriptsDir, 'verify.ts'), 'console.log(process.env.NAME)\n');
+      await writeFile(
+        join(workflowsDir, 'uses-configured-env.yaml'),
+        `name: uses-configured-env
+description: Reads a variable supplied by config.yaml's env section
+inputs:
+  declared: {}
+nodes:
+  - id: verify
+    script: verify
+    runtime: bun
+`
+      );
+      const { captureWorkflowSource, capturedSourceRoots, DEFAULT_WORKFLOW_SOURCE_CONFIG } =
+        await import('./workflow-source');
+      const capture = await captureWorkflowSource({
+        sourceRoot: testDir,
+        captureRoot: join(testDir, 'home', 'staged-source', 'run-1'),
+        sourceConfig: { ...DEFAULT_WORKFLOW_SOURCE_CONFIG, env_var_names: ['NAME'] },
+      });
+      // A run that already froze its source never calls loadConfig again (see
+      // discoverWorkflowsWithConfig) — proving this stays unbound-env-clean without it is
+      // what distinguishes this test from the live-config one above.
+      const loadConfigShouldNotRun = mock(async () => {
+        throw new Error('loadConfig must not run once a frozen source config is already known');
+      });
+
+      const result = await discoverWorkflowsWithConfig(
+        testDir,
+        loadConfigShouldNotRun,
+        providerRegistry,
+        capturedSourceRoots(capture.anchor)
+      );
+
+      expect(loadConfigShouldNotRun).not.toHaveBeenCalled();
+      expect(result.errors).toEqual([]);
+      const entry = result.workflows.find(w => w.workflow.name === 'uses-configured-env');
+      expect(entry).toBeDefined();
+      expect(entry?.parseWarnings ?? []).toEqual([]);
+    });
+
     it('should pass loadDefaults from config to discoverWorkflows', async () => {
       const { discoverWorkflowsWithConfig } = await import('./workflow-discovery');
       const mockLoadConfig = mock(async () => ({
         defaults: { loadDefaultWorkflows: false },
       }));
 
-      const result = await discoverWorkflowsWithConfig(testDir, mockLoadConfig);
+      const result = await discoverWorkflowsWithConfig(testDir, mockLoadConfig, providerRegistry);
 
       // With loadDefaults: false, no archon-* defaults should appear
       const archonWorkflow = result.workflows.find(w => w.workflow.name.startsWith('archon-'));
@@ -1416,22 +2064,22 @@ nodes:
       expect(mockLoadConfig).toHaveBeenCalledWith(testDir);
     });
 
-    it('should default to loadDefaults: true when config load fails', async () => {
+    it('rejects with the config error instead of listing with defaults', async () => {
       const { discoverWorkflowsWithConfig } = await import('./workflow-discovery');
+      const configError = new Error("Invalid model binding config in 'config.yaml': tiers.medium");
       const mockLoadConfig = mock(async () => {
-        throw new Error('Config not found');
+        throw configError;
       });
 
-      const result = await discoverWorkflowsWithConfig(testDir, mockLoadConfig);
-
-      // With config failure, defaults to true, so archon-* should appear
-      const archonWorkflow = result.workflows.find(w => w.workflow.name === 'archon-assist');
-      expect(archonWorkflow).toBeDefined();
+      await expect(
+        discoverWorkflowsWithConfig(testDir, mockLoadConfig, providerRegistry)
+      ).rejects.toBe(configError);
     });
 
     it('surfaces home-scoped workflows without any option — discovery reads ~/.archon/workflows/ internally', async () => {
-      const { discoverWorkflowsWithConfig, resetLegacyHomeWarningForTests } =
-        await import('./workflow-discovery');
+      const { discoverWorkflowsWithConfig, resetLegacyHomeWarningForTests } = await import(
+        './workflow-discovery'
+      );
       resetLegacyHomeWarningForTests();
 
       const homeDir = join(
@@ -1454,7 +2102,7 @@ nodes:
           defaults: { loadDefaultWorkflows: false },
         }));
 
-        const result = await discoverWorkflowsWithConfig(testDir, mockLoadConfig);
+        const result = await discoverWorkflowsWithConfig(testDir, mockLoadConfig, providerRegistry);
         const entry = result.workflows.find(w => w.workflow.name === 'home-only');
         expect(entry).toBeDefined();
         expect(entry?.source).toBe('global');
@@ -1492,11 +2140,7 @@ nodes:
       const result = await discoverWorkflows(testDir, { loadDefaults: true });
       const workflows = result.workflows.map(ws => ws.workflow);
 
-      // Should load bundled workflows
-      expect(workflows.length).toBeGreaterThanOrEqual(1);
-      // Check that known bundled workflows are loaded
-      const archonAssist = workflows.find(w => w.name === 'archon-assist');
-      expect(archonAssist).toBeDefined();
+      expect(workflows.map(w => w.name)).toEqual(['fake-review']);
     });
 
     it('should skip bundled workflows when loadDefaults is false', async () => {
@@ -1507,8 +2151,7 @@ nodes:
       const workflows = result.workflows.map(ws => ws.workflow);
 
       // Should not have any bundled defaults
-      const archonWorkflow = workflows.find(w => w.name.startsWith('archon-'));
-      expect(archonWorkflow).toBeUndefined();
+      expect(workflows.find(w => w.name === 'fake-review')).toBeUndefined();
     });
 
     it('should allow repo workflows to override bundled defaults', async () => {
@@ -1519,19 +2162,19 @@ nodes:
       const repoWorkflowDir = join(testDir, '.archon', 'workflows');
       await mkdir(repoWorkflowDir, { recursive: true });
       const repoWorkflowYaml = `name: custom-assist-override
-description: Custom override of archon-assist
+description: Custom override of fake-review
 nodes:
   - id: custom
     command: custom
 `;
-      await writeFile(join(repoWorkflowDir, 'archon-assist.yaml'), repoWorkflowYaml);
+      await writeFile(join(repoWorkflowDir, 'fake-review.yaml'), repoWorkflowYaml);
 
       const result = await discoverWorkflows(testDir, { loadDefaults: true });
       const workflows = result.workflows.map(ws => ws.workflow);
 
       // Repo workflow should override bundled default
       const assistWorkflow = workflows.find(
-        w => w.name === 'custom-assist-override' || w.name === 'archon-assist'
+        w => w.name === 'custom-assist-override' || w.name === 'fake-review'
       );
       expect(assistWorkflow).toBeDefined();
       expect(assistWorkflow?.name).toBe('custom-assist-override');
@@ -1556,20 +2199,18 @@ nodes:
       const workflows = result.workflows.map(ws => ws.workflow);
 
       // Should have both bundled and repo workflows
-      const archonAssist = workflows.find(w => w.name === 'archon-assist');
+      const bundledReview = workflows.find(w => w.name === 'fake-review');
       const repoWorkflow = workflows.find(w => w.name === 'my-repo-workflow');
-      expect(archonAssist).toBeDefined();
+      expect(bundledReview).toBeDefined();
       expect(repoWorkflow).toBeDefined();
     });
   });
 
   describe('error accumulation', () => {
     it('should return errors for YAML missing name', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'invalid.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'invalid.yaml',
         'description: Missing name\nnodes:\n  - id: plan\n    command: plan\n'
       );
 
@@ -1583,15 +2224,14 @@ nodes:
     });
 
     it('should load valid workflows and report errors for invalid ones', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'good.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'good.yaml',
         'name: good\ndescription: Works\nnodes:\n  - id: plan\n    command: plan\n'
       );
-      await writeFile(
-        join(workflowDir, 'bad.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'bad.yaml',
         'description: Bad name type\nnodes:\n  - id: plan\n    command: plan\n'
       );
 
@@ -1604,11 +2244,9 @@ nodes:
     });
 
     it('should return empty errors array when all workflows are valid', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'valid.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'valid.yaml',
         'name: valid\ndescription: Valid\nnodes:\n  - id: plan\n    command: plan\n'
       );
 
@@ -1626,10 +2264,7 @@ nodes:
     });
 
     it('should report YAML parse errors', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(join(workflowDir, 'broken.yaml'), 'name: test\ninvalid: [');
+      await writeWorkflowFile(testDir, 'broken.yaml', 'name: test\ninvalid: [');
 
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
 
@@ -1665,10 +2300,7 @@ nodes:
     });
 
     it('should report validation error for empty YAML content', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(join(workflowDir, 'empty.yaml'), '');
+      await writeWorkflowFile(testDir, 'empty.yaml', '');
 
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
 
@@ -1680,10 +2312,7 @@ nodes:
     });
 
     it('should report validation error for YAML that parses to non-object', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(join(workflowDir, 'scalar.yaml'), 'just a string');
+      await writeWorkflowFile(testDir, 'scalar.yaml', 'just a string');
 
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
 
@@ -1720,11 +2349,9 @@ nodes:
 
   describe('bash node parsing', () => {
     it('should parse a valid bash node', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'bash-test.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'bash-test.yaml',
         `
 name: bash-test
 description: Test bash node
@@ -1742,21 +2369,21 @@ nodes:
       expect(result.workflows).toHaveLength(1);
 
       const wf = result.workflows[0].workflow;
-      expect(wf.nodes).toBeDefined();
+      const nodes = wf.nodes as DagNode[];
+      expect(nodes).toBeDefined();
 
-      expect(wf.nodes).toHaveLength(2);
-      expect(isBashNode(wf.nodes[0])).toBe(true);
-      if (isBashNode(wf.nodes[0])) {
-        expect(wf.nodes[0].bash).toBe('echo hello');
+      expect(nodes).toHaveLength(2);
+      const node0 = nodes[0];
+      expect(isExecNode(node0)).toBe(true);
+      if (isExecNode(node0)) {
+        expect(node0.script).toBe('echo hello');
       }
     });
 
     it('should parse bash node with timeout', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'bash-timeout.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'bash-timeout.yaml',
         `
 name: bash-timeout
 description: Bash with timeout
@@ -1770,18 +2397,71 @@ nodes:
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.errors).toHaveLength(0);
       const wf = result.workflows[0].workflow;
-      expect(wf.nodes).toBeDefined();
-      if (isBashNode(wf.nodes[0])) {
-        expect(wf.nodes[0].timeout).toBe(30000);
+      const nodes = wf.nodes as DagNode[];
+      expect(nodes).toBeDefined();
+      const node0 = nodes[0];
+      if (isExecNode(node0)) {
+        expect(node0.timeout).toBe(30000);
       }
     });
 
-    it('should reject bash + command combination', async () => {
+    it('should preserve on_timeout on bash and script nodes', async () => {
       const workflowDir = join(testDir, '.archon', 'workflows');
       await mkdir(workflowDir, { recursive: true });
 
       await writeFile(
-        join(workflowDir, 'bash-cmd.yaml'),
+        join(workflowDir, 'exec-timeout-skip.yaml'),
+        `
+name: exec-timeout-skip
+description: Exec nodes can skip on timeout
+nodes:
+  - id: shell
+    bash: "sleep 30"
+    timeout: 100
+    on_timeout: skip
+  - id: program
+    script: "await Bun.sleep(30_000)"
+    runtime: bun
+    timeout: 100
+    on_timeout: skip
+`
+      );
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toHaveLength(0);
+      expect(result.workflows[0].workflow.nodes).toEqual([
+        expect.objectContaining({ id: 'shell', on_timeout: 'skip' }),
+        expect.objectContaining({ id: 'program', on_timeout: 'skip' }),
+      ]);
+    });
+
+    it('should warn when on_timeout is declared on a non-exec node', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+
+      await writeFile(
+        join(workflowDir, 'prompt-timeout-skip.yaml'),
+        `
+name: prompt-timeout-skip
+description: Unsupported timeout outcome
+nodes:
+  - id: prompt
+    prompt: "work"
+    on_timeout: skip
+`
+      );
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toHaveLength(0);
+      expect(result.workflows[0].parseWarnings).toContain(
+        "Node 'prompt': 'on_timeout' is only supported on bash and script nodes — it is ignored here"
+      );
+    });
+
+    it('should reject bash + command combination', async () => {
+      await writeWorkflowFile(
+        testDir,
+        'bash-cmd.yaml',
         `
 name: bash-cmd-conflict
 description: Bash and command
@@ -1798,11 +2478,9 @@ nodes:
     });
 
     it('should reject bash + prompt combination', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'bash-prompt.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'bash-prompt.yaml',
         `
 name: bash-prompt-conflict
 description: Bash and prompt
@@ -1819,11 +2497,9 @@ nodes:
     });
 
     it('should reject invalid timeout (negative)', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'bad-timeout.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'bad-timeout.yaml',
         `
 name: bad-timeout
 description: Invalid timeout
@@ -1840,11 +2516,9 @@ nodes:
     });
 
     it('should reject invalid timeout (string)', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'string-timeout.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'string-timeout.yaml',
         `
 name: string-timeout
 description: String timeout
@@ -1861,11 +2535,9 @@ nodes:
     });
 
     it('should parse idle_timeout on command node', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'idle-timeout.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'idle-timeout.yaml',
         `
 name: idle-timeout
 description: Node with idle timeout
@@ -1879,16 +2551,14 @@ nodes:
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.errors).toHaveLength(0);
       const wf = result.workflows[0].workflow;
-      expect(wf.nodes).toBeDefined();
-      expect(wf.nodes[0].idle_timeout).toBe(1800000);
+      expect(wf.nodes as DagNode[]).toBeDefined();
+      expect((wf.nodes as DagNode[])[0].idle_timeout).toBe(1800000);
     });
 
     it('should parse idle_timeout on prompt node', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'idle-timeout-prompt.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'idle-timeout-prompt.yaml',
         `
 name: idle-timeout-prompt
 description: Prompt node with idle timeout
@@ -1902,16 +2572,14 @@ nodes:
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.errors).toHaveLength(0);
       const wf = result.workflows[0].workflow;
-      expect(wf.nodes).toBeDefined();
-      expect(wf.nodes[0].idle_timeout).toBe(600000);
+      expect(wf.nodes as DagNode[]).toBeDefined();
+      expect((wf.nodes as DagNode[])[0].idle_timeout).toBe(600000);
     });
 
     it('should parse idle_timeout on bash node', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'idle-timeout-bash.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'idle-timeout-bash.yaml',
         `
 name: idle-timeout-bash
 description: Bash node with idle timeout
@@ -1925,18 +2593,16 @@ nodes:
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.errors).toHaveLength(0);
       const wf = result.workflows[0].workflow;
-      expect(wf.nodes).toBeDefined();
-      if (isBashNode(wf.nodes[0])) {
-        expect(wf.nodes[0].idle_timeout).toBe(900000);
+      expect(wf.nodes as DagNode[]).toBeDefined();
+      if (isExecNode((wf.nodes as DagNode[])[0])) {
+        expect((wf.nodes as DagNode[])[0].idle_timeout).toBe(900000);
       }
     });
 
     it('should reject invalid idle_timeout (negative)', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'bad-idle-timeout.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'bad-idle-timeout.yaml',
         `
 name: bad-idle-timeout
 description: Invalid idle timeout
@@ -1953,11 +2619,9 @@ nodes:
     });
 
     it('should reject invalid idle_timeout (string)', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'string-idle-timeout.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'string-idle-timeout.yaml',
         `
 name: string-idle-timeout
 description: String idle timeout
@@ -1974,11 +2638,9 @@ nodes:
     });
 
     it('should reject invalid idle_timeout (Infinity)', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'inf-idle-timeout.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'inf-idle-timeout.yaml',
         `
 name: inf-idle-timeout
 description: Infinity idle timeout
@@ -1997,11 +2659,9 @@ nodes:
     });
 
     it('should ignore AI-specific fields on bash nodes (parses successfully, fields stripped)', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'bash-ai-fields.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'bash-ai-fields.yaml',
         `
 name: bash-ai-fields
 description: Bash with AI fields
@@ -2019,20 +2679,18 @@ nodes:
       expect(result.workflows).toHaveLength(1);
 
       const wf = result.workflows[0].workflow;
-      expect(wf.nodes).toBeDefined();
+      expect(wf.nodes as DagNode[]).toBeDefined();
       // AI fields should NOT appear on the parsed bash node
-      const node = wf.nodes[0];
-      expect(isBashNode(node)).toBe(true);
+      const node = (wf.nodes as DagNode[])[0];
+      expect(isExecNode(node)).toBe(true);
       expect(node.provider).toBeUndefined();
       expect(node.model).toBeUndefined();
     });
 
     it('should NOT warn about model/provider on loop nodes (they are supported)', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'loop-model.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'loop-model.yaml',
         `
 name: loop-model
 description: Loop with model override
@@ -2047,16 +2705,16 @@ nodes:
 `
       );
 
-      (mockLogger.warn as Mock<() => undefined>).mockClear();
+      mockLogger.debug.mockClear();
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.errors).toHaveLength(0);
       expect(result.workflows).toHaveLength(1);
 
-      const node = result.workflows[0].workflow.nodes[0];
+      const node = (result.workflows[0].workflow.nodes as DagNode[])[0];
       expect(isLoopNode(node)).toBe(true);
 
       // model and provider should NOT trigger a warning
-      const warnCalls = (mockLogger.warn as Mock<() => undefined>).mock.calls;
+      const warnCalls = mockLogger.debug.mock.calls;
       const aiFieldWarnings = warnCalls.filter(
         call => typeof call[1] === 'string' && call[1].includes('ai_fields_ignored')
       );
@@ -2064,11 +2722,9 @@ nodes:
     });
 
     it('should warn about unsupported AI fields on loop nodes (not model/provider)', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'loop-unsupported.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'loop-unsupported.yaml',
         `
 name: loop-unsupported
 description: Loop with unsupported AI fields
@@ -2079,21 +2735,102 @@ nodes:
       until: "COMPLETE"
       max_iterations: 3
     model: claude-opus-4-6
-    output_format:
-      type: object
-      properties:
-        status:
-          type: string
+    mcp: ./mcp.json
 `
       );
 
-      (mockLogger.warn as Mock<() => undefined>).mockClear();
+      mockLogger.debug.mockClear();
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.errors).toHaveLength(0);
 
-      // Should warn about output_format but NOT about model
-      const warnCalls = (mockLogger.warn as Mock<() => undefined>).mock.calls;
+      // Should warn about mcp but NOT about model
+      const warnCalls = mockLogger.debug.mock.calls;
       const aiFieldWarnings = warnCalls.filter(
+        call => typeof call[1] === 'string' && call[1].includes('ai_fields_ignored')
+      );
+      expect(aiFieldWarnings).toHaveLength(1);
+      const warnedFields = (aiFieldWarnings[0][0] as { fields: string[] }).fields;
+      expect(warnedFields).toContain('mcp');
+      expect(warnedFields).not.toContain('model');
+      expect(warnedFields).not.toContain('provider');
+    });
+
+    it('should NOT warn about output_format on a loop node (#2563)', async () => {
+      // A loop: node makes its own sendQuery, so the schema is honoured rather than
+      // warned-and-dropped. It stays warned on loop_group, which never calls sendQuery.
+
+      await writeWorkflowFile(
+        testDir,
+        'loop-structured.yaml',
+        `
+name: loop-structured
+description: Loop with a structured completion channel
+nodes:
+  - id: iterate
+    output_format:
+      type: object
+      properties:
+        done:
+          type: boolean
+      required: [done]
+    loop:
+      prompt: "Do something"
+      max_iterations: 3
+      until_field: done
+`
+      );
+
+      mockLogger.debug.mockClear();
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toHaveLength(0);
+
+      const aiFieldWarnings = mockLogger.debug.mock.calls.filter(
+        call => typeof call[1] === 'string' && call[1].includes('ai_fields_ignored')
+      );
+      expect(aiFieldWarnings).toHaveLength(0);
+
+      const wf = result.workflows[0].workflow;
+      const node0 = (wf.nodes as DagNode[])[0];
+      expect(isLoopNode(node0)).toBe(true);
+      if (isLoopNode(node0)) {
+        expect(node0.loop.until_field).toBe('done');
+        expect(node0.output_format).toBeDefined();
+      }
+    });
+
+    it('warns that output_format is ignored on a loop_group', async () => {
+      await writeWorkflowFile(
+        testDir,
+        'loop-group-structured.yaml',
+        `
+name: loop-group-structured
+description: Group with an unsupported structured output declaration
+nodes:
+  - id: iterate
+    provider: claude
+    model: claude-opus-4-6
+    output_format:
+      type: object
+      properties:
+        done:
+          type: boolean
+      required: [done]
+    loop_group:
+      until_bash: exit 0
+      max_iterations: 1
+      nodes:
+        - id: work
+          bash: echo done
+`
+      );
+
+      mockLogger.debug.mockClear();
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toHaveLength(0);
+      expect(result.workflows).toHaveLength(1);
+      expect(isLoopGroupNode((result.workflows[0].workflow.nodes as DagNode[])[0])).toBe(true);
+
+      const aiFieldWarnings = mockLogger.debug.mock.calls.filter(
         call => typeof call[1] === 'string' && call[1].includes('ai_fields_ignored')
       );
       expect(aiFieldWarnings).toHaveLength(1);
@@ -2103,14 +2840,65 @@ nodes:
       expect(warnedFields).not.toContain('provider');
     });
 
-    it('should NOT warn about pi: on loop nodes and should preserve it (#2133)', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
+    it('does NOT warn about output_format on bash/script nodes, and keeps it (#2453)', async () => {
+      // An exec node with a declared schema certifies its own stdout, so the field is
+      // enforced rather than warned-and-dropped — and it has to survive the transform to
+      // reach that enforcement. `mcp:` on the same node still warns: nothing else changed.
 
+      await writeWorkflowFile(
+        testDir,
+        'exec-contract.yaml',
+        `
+name: exec-contract
+description: Deterministic producers own a result contract
+nodes:
+  - id: shell
+    bash: echo '{"ready":true}'
+    output_format:
+      type: object
+      properties:
+        ready:
+          type: boolean
+      required: [ready]
+  - id: prog
+    runtime: bun
+    script: console.log('{"ready":true}')
+    mcp: ./mcp.json
+    output_format:
+      type: object
+      properties:
+        ready:
+          type: boolean
+      required: [ready]
+`
+      );
+
+      mockLogger.debug.mockClear();
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toHaveLength(0);
+
+      const warnedFields = mockLogger.debug.mock.calls
+        .filter(call => typeof call[1] === 'string' && call[1].includes('ai_fields_ignored'))
+        .flatMap(call => (call[0] as { fields: string[] }).fields);
+      expect(warnedFields).not.toContain('output_format');
+      expect(warnedFields).toContain('mcp');
+
+      for (const node of result.workflows[0].workflow.nodes as DagNode[]) {
+        expect(isExecNode(node)).toBe(true);
+        expect(node.output_format).toEqual({
+          type: 'object',
+          properties: { ready: { type: 'boolean' } },
+          required: ['ready'],
+        });
+      }
+    });
+
+    it('should NOT warn about pi: on loop nodes and should preserve it (#2133)', async () => {
       // The portable pi: posture is threaded into each loop iteration's sendQuery,
       // so it must survive the transform AND not be flagged as an ignored AI field.
-      await writeFile(
-        join(workflowDir, 'loop-pi.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'loop-pi.yaml',
         // No workflow-level provider: (unregistered in this unit context) — the
         // pi: block is plain node data the loader preserves regardless of provider.
         `
@@ -2129,33 +2917,268 @@ nodes:
 `
       );
 
-      (mockLogger.warn as Mock<() => undefined>).mockClear();
+      mockLogger.debug.mockClear();
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.errors).toHaveLength(0);
       expect(result.workflows).toHaveLength(1);
 
-      const node = result.workflows[0].workflow.nodes[0];
+      const node = (result.workflows[0].workflow.nodes as DagNode[])[0];
       expect(isLoopNode(node)).toBe(true);
       expect((node as typeof node & { pi?: unknown }).pi).toEqual({
         interactive: false,
         extensionFlags: { plan: false },
       });
 
-      const warnCalls = (mockLogger.warn as Mock<() => undefined>).mock.calls;
+      const warnCalls = mockLogger.debug.mock.calls;
       const aiFieldWarnings = warnCalls.filter(
         call => typeof call[1] === 'string' && call[1].includes('ai_fields_ignored')
       );
       expect(aiFieldWarnings).toHaveLength(0);
     });
+
+    it("warns, operator-visibly, that an include's denied_tools is dropped rather than enforced", async () => {
+      // The real bug behind #3196: a caller sandboxing a block it did not write got no
+      // signal that its restriction never attached. A log line only an operator tailing
+      // server output can see is not enough; this must land in `parseWarnings`, the
+      // channel the workflow's actual author reads via `/api/workflows` and `/workflow
+      // list` (#2213).
+      await writeWorkflowFile(
+        testDir,
+        'block.yaml',
+        `
+name: block
+description: An included building block
+nodes:
+  - id: build
+    prompt: "do the work"
+`
+      );
+      await writeWorkflowFile(
+        testDir,
+        'include-denied-tools.yaml',
+        `
+name: include-denied-tools
+description: A caller trying to sandbox a block it did not write
+nodes:
+  - id: use
+    include: block
+    denied_tools: ["Bash(rm:*)"]
+`
+      );
+
+      mockLogger.debug.mockClear();
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toHaveLength(0);
+
+      const parent = result.workflows.find(w => w.workflow.name === 'include-denied-tools');
+      const pw = parent?.parseWarnings ?? [];
+      expect(pw).toHaveLength(1);
+      expect(pw[0]).toContain("Node 'use'");
+      expect(pw[0]).toContain("'denied_tools'");
+      expect(pw[0]).toContain('an include attaches a sub-graph and does not reconfigure it');
+
+      // The included block's own node is unrestricted: the caller's denial never applied.
+      const expandedNode = (parent?.workflow.nodes as DagNode[]).find(n => n.id === 'use__build');
+      expect(expandedNode).toBeDefined();
+      expect(expandedNode?.denied_tools).toBeUndefined();
+
+      const aiFieldWarnings = mockLogger.debug.mock.calls.filter(
+        call => typeof call[1] === 'string' && call[1].includes('ai_fields_ignored')
+      );
+      expect(aiFieldWarnings).toHaveLength(1);
+      expect(aiFieldWarnings[0][0]).toMatchObject({ fields: ['denied_tools'], warning: pw[0] });
+    });
+
+    it('should NOT warn about tool restrictions on a loop node and should preserve them (#3324)', async () => {
+      // A loop: node scopes its own per-iteration sendQuery, so the restriction has to
+      // survive the transform. Dropping it was fail-open: there is no workflow-level
+      // allowed_tools/denied_tools for the node to fall back on.
+      await writeWorkflowFile(
+        testDir,
+        'loop-denied.yaml',
+        `
+name: loop-denied
+description: Loop that must not reach the network
+nodes:
+  - id: work
+    denied_tools: [WebFetch, WebSearch]
+    allowed_tools: [Read, Grep]
+    loop:
+      prompt: "Do something"
+      until_bash: "true"
+      max_iterations: 3
+`
+      );
+
+      mockLogger.debug.mockClear();
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toHaveLength(0);
+      expect(result.workflows).toHaveLength(1);
+
+      const node = (result.workflows[0].workflow.nodes as DagNode[])[0];
+      expect(isLoopNode(node)).toBe(true);
+      expect(node.denied_tools).toEqual(['WebFetch', 'WebSearch']);
+      expect(node.allowed_tools).toEqual(['Read', 'Grep']);
+
+      expect(
+        mockLogger.debug.mock.calls.filter(
+          call => typeof call[1] === 'string' && call[1].includes('ai_fields_ignored')
+        )
+      ).toHaveLength(0);
+      expect(result.workflows[0].parseWarnings ?? []).toHaveLength(0);
+    });
+
+    it('reports an ignored AI field to the author, not only to the log (#3324)', async () => {
+      // The defect this closes: the drop was announced by a pino line alone, which
+      // neither `archon validate workflows` nor `archon workflow list` renders — both
+      // read parseWarnings. A field the engine drops has to appear in that list.
+      await writeWorkflowFile(
+        testDir,
+        'loop-ignored-fields.yaml',
+        `
+name: loop-ignored-fields
+description: Loop declaring fields the engine drops
+nodes:
+  - id: work
+    mcp: ./mcp.json
+    skills: [code-review]
+    loop:
+      prompt: "Do something"
+      until_bash: "true"
+      max_iterations: 3
+`
+      );
+
+      mockLogger.debug.mockClear();
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toHaveLength(0);
+
+      const parseWarnings = result.workflows[0].parseWarnings ?? [];
+      expect(parseWarnings).toHaveLength(1);
+      expect(parseWarnings[0]).toContain("Node 'work'");
+      expect(parseWarnings[0]).toContain("'mcp'");
+      expect(parseWarnings[0]).toContain("'skills'");
+      expect(parseWarnings[0]).toContain('ignored at run time');
+
+      // The structured log line keeps its payload and now carries the same prose.
+      const aiFieldWarnings = mockLogger.debug.mock.calls.filter(
+        call => typeof call[1] === 'string' && call[1].includes('ai_fields_ignored')
+      );
+      expect(aiFieldWarnings).toHaveLength(1);
+      const logged = aiFieldWarnings[0][0] as { fields: string[]; warning: string };
+      expect(logged.fields).toEqual(['mcp', 'skills']);
+      expect(logged.warning).toBe(parseWarnings[0]);
+    });
+
+    it('reports ignored AI fields on a non-AI node to the author too (#3324)', async () => {
+      // Same routing for every node kind with an ignored-field list — a bash node is
+      // where an author is most likely to declare a restriction that does nothing.
+      await writeWorkflowFile(
+        testDir,
+        'bash-ignored-fields.yaml',
+        `
+name: bash-ignored-fields
+description: Bash node declaring an AI-only field
+nodes:
+  - id: check
+    bash: echo hi
+    denied_tools: [WebFetch]
+`
+      );
+
+      mockLogger.warn.mockClear();
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toHaveLength(0);
+
+      const parseWarnings = result.workflows[0].parseWarnings ?? [];
+      expect(parseWarnings).toHaveLength(1);
+      expect(parseWarnings[0]).toContain("'denied_tools'");
+      expect(parseWarnings[0]).toContain('(bash)');
+    });
   });
 
   describe('DAG output ref validation', () => {
-    it('should reject a workflow where when: references an unknown node output', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
+    it('accepts nested output paths in approval messages before execution', () => {
+      const result = parseWorkflow(
+        `
+name: nested-approval-output
+description: Nested structured output in a gate
+nodes:
+  - id: review
+    prompt: Review the proposal
+    output_format:
+      type: object
+      properties:
+        proposal:
+          type: object
+          properties:
+            action: { type: string }
+            text: { type: string }
+          required: [action, text]
+      required: [proposal]
+  - id: gate
+    approval:
+      message: |
+        Proposed: $review.output.proposal.action
+        $review.output.proposal.text
+    depends_on: [review]
+`,
+        'nested-approval-output.yaml'
+      );
 
-      await writeFile(
-        join(workflowDir, 'bad-when-ref.yaml'),
+      expect(result.error).toBeNull();
+      expect(result.workflow).not.toBeNull();
+    });
+
+    it('accepts nested canonical output paths in when conditions', () => {
+      const result = parseWorkflow(
+        `
+name: nested-when-output
+description: Nested structured output in a condition
+nodes:
+  - id: review
+    bash: echo review
+  - id: apply
+    bash: echo apply
+    depends_on: [review]
+    when: "$review.output.proposal.action == 'add'"
+`,
+        'nested-when-output.yaml'
+      );
+
+      expect(result.error).toBeNull();
+      expect(result.workflow).not.toBeNull();
+    });
+
+    it('accepts nested prior-iteration output paths in loop-group conditions', () => {
+      const result = parseWorkflow(
+        `
+name: nested-loop-prev-output
+description: Nested structured output from a prior iteration
+nodes:
+  - id: refine
+    loop_group:
+      until: DONE
+      max_iterations: 2
+      nodes:
+        - id: work
+          bash: echo work
+        - id: guarded
+          bash: echo guarded
+          depends_on: [work]
+          when: "$LOOP_PREV.work.output.proposal.action == 'add'"
+`,
+        'nested-loop-prev-output.yaml'
+      );
+
+      expect(result.error).toBeNull();
+      expect(result.workflow).not.toBeNull();
+    });
+
+    it('should reject a workflow where when: references an unknown node output', async () => {
+      await writeWorkflowFile(
+        testDir,
+        'bad-when-ref.yaml',
         `
 name: bad-when-ref
 description: Unknown output ref in when
@@ -2175,12 +3198,37 @@ nodes:
       expect(result.errors[0].error).toContain('clasify');
     });
 
-    it('should reject a workflow where prompt: references an unknown node output', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
+    it('accepts $LOOP_PREV only in a loop_group body when condition', async () => {
+      await writeWorkflowFile(
+        testDir,
+        'loop-prev-when.yaml',
+        `
+name: loop-prev-when
+description: Prior iteration condition
+nodes:
+  - id: refine
+    loop_group:
+      until: DONE
+      max_iterations: 2
+      nodes:
+        - id: work
+          prompt: work
+        - id: guarded
+          prompt: guarded
+          depends_on: [work]
+          when: "$LOOP_PREV.work.output == 'done'"
+`
+      );
 
-      await writeFile(
-        join(workflowDir, 'bad-prompt-ref.yaml'),
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toEqual([]);
+      expect(result.workflows).toHaveLength(1);
+    });
+
+    it('should reject a workflow where prompt: references an unknown node output', async () => {
+      await writeWorkflowFile(
+        testDir,
+        'bad-prompt-ref.yaml',
         `
 name: bad-prompt-ref
 description: Unknown output ref in prompt
@@ -2199,12 +3247,229 @@ nodes:
       expect(result.errors[0].error).toContain('analyize');
     });
 
-    it('should accept a workflow where output refs use valid existing node IDs', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
+    it('rejects unknown and non-upstream output refs in wait conditions', async () => {
+      await writeWorkflowFile(
+        testDir,
+        'bad-wait-ref.yaml',
+        `
+name: bad-wait-ref
+description: Invalid output refs in waits
+nodes:
+  - id: schedule
+    bash: echo 2026-08-25T22:00:00Z
+  - id: wait-for-window
+    wait:
+      until: "$schedule.output"
+`
+      );
 
-      await writeFile(
-        join(workflowDir, 'valid-refs.yaml'),
+      let result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0].error).toContain('not an upstream dependency');
+
+      await writeWorkflowFile(
+        testDir,
+        'bad-wait-ref.yaml',
+        `
+name: bad-wait-ref
+description: Invalid output refs in waits
+nodes:
+  - id: wait-for-checks
+    wait:
+      event: "$missing.output"
+      deadline_ms: 60000
+`
+      );
+
+      result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0].error).toContain("unknown node '$missing.output'");
+
+      await writeWorkflowFile(
+        testDir,
+        'bad-wait-ref.yaml',
+        `
+name: bad-wait-ref
+description: Invalid output refs in waits
+nodes:
+  - id: check
+    bash: echo failed
+  - id: wait-for-action
+    wait:
+      attention: "Rerun $check.output, then resume."
+`
+      );
+
+      result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0].error).toContain('not an upstream dependency');
+    });
+
+    it('rejects suspension nodes that can run concurrently', () => {
+      const suspensionNodes = [
+        `  - id: review
+    approval:
+      message: Review this`,
+        `  - id: refine
+    loop:
+      prompt: Iterate.
+      until: DONE
+      max_iterations: 2
+      interactive: true
+      gate_message: Review.`,
+        `  - id: child
+    workflow: child-workflow`,
+        `  - id: refine-group
+    loop_group:
+      until_bash: exit 0
+      max_iterations: 2
+      interactive: true
+      gate_message: Review.
+      nodes:
+        - id: refine-step
+          bash: echo refine`,
+      ];
+      for (const suspensionNode of suspensionNodes) {
+        const result = parseWorkflow(
+          `
+name: parallel-suspensions
+description: Two nodes cannot own the run cursor together
+nodes:
+  - id: wait-for-time
+    wait:
+      duration_ms: 60000
+${suspensionNode}
+`,
+          'parallel-suspensions.yaml'
+        );
+
+        expect(result.workflow).toBeNull();
+        expect(result.error?.error).toContain("Suspending nodes 'wait-for-time'");
+      }
+    });
+
+    it('rejects a suspension-capable path inside a composed fan-out block', async () => {
+      await writeWorkflowFile(
+        testDir,
+        'gated-block.yaml',
+        `name: gated-block\ndescription: block\nnodes:\n  - id: approve\n    approval:\n      message: Approve?\n`
+      );
+      await writeWorkflowFile(
+        testDir,
+        'cfo-concurrent-suspension.yaml',
+        `
+name: cfo-concurrent-suspension
+description: A wait and a suspending composed block must not race for the run cursor
+nodes:
+  - id: items
+    bash: "echo []"
+  - id: wait-for-time
+    wait:
+      duration_ms: 60000
+  - id: fan-block
+    include: gated-block
+    depends_on: [items]
+    fan_out:
+      items: "$items.output"
+      as: item
+`
+      );
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      const err = result.errors.find(e => e.filename === 'cfo-concurrent-suspension.yaml');
+      expect(err).toBeDefined();
+      expect(err?.error).toContain('contains unsupported suspension-capable path');
+    });
+
+    it('rejects composed fan-out blocks that hide a wait', async () => {
+      await writeWorkflowFile(
+        testDir,
+        'waiting-block.yaml',
+        `name: waiting-block\ndescription: block\nnodes:\n  - id: delay\n    wait:\n      duration_ms: 60000\n`
+      );
+      await writeWorkflowFile(
+        testDir,
+        'cfo-pair-suspension.yaml',
+        `
+name: cfo-pair-suspension
+description: Two unordered composed blocks hiding waits must not race for the run cursor
+nodes:
+  - id: items-a
+    bash: "echo []"
+  - id: items-b
+    bash: "echo []"
+  - id: fan-block-a
+    include: waiting-block
+    depends_on: [items-a]
+    fan_out:
+      items: "$items-a.output"
+      as: item
+  - id: fan-block-b
+    include: waiting-block
+    depends_on: [items-b]
+    fan_out:
+      items: "$items-b.output"
+      as: item
+`
+      );
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      const err = result.errors.find(e => e.filename === 'cfo-pair-suspension.yaml');
+      expect(err).toBeDefined();
+      expect(err?.error).toContain('contains unsupported suspension-capable path');
+    });
+
+    it('allows a deterministic composed fan-out beside an unrelated wait', async () => {
+      await writeWorkflowFile(
+        testDir,
+        'deterministic-block.yaml',
+        `name: deterministic-block\ndescription: block\nmutates_checkout: false\ninputs:\n  item: { required: true }\nnodes:\n  - id: work\n    bash: "echo $INPUTS.item"\n`
+      );
+      await writeWorkflowFile(
+        testDir,
+        'cfo-with-unrelated-wait.yaml',
+        `name: cfo-with-unrelated-wait\ndescription: Deterministic fan-out does not own a pause cursor\nnodes:\n  - id: items\n    bash: 'echo ["a"]'\n  - id: wait-for-time\n    depends_on: [items]\n    wait:\n      duration_ms: 60000\n  - id: fan-block\n    include: deterministic-block\n    depends_on: [items]\n    fan_out:\n      items: "$items.output"\n      as: item\n`
+      );
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(
+        result.errors.find(error => error.filename === 'cfo-with-unrelated-wait.yaml')
+      ).toBeUndefined();
+      expect(
+        result.workflows.some(workflow => workflow.workflow.name === 'cfo-with-unrelated-wait')
+      ).toBe(true);
+    });
+
+    it('rejects waits nested below more than one loop_group boundary', () => {
+      const result = parseWorkflow(
+        `
+name: nested-wait
+description: nested wait
+nodes:
+  - id: outer
+    loop_group:
+      max_iterations: 2
+      until_bash: exit 0
+      nodes:
+        - id: inner
+          loop_group:
+            max_iterations: 2
+            until_bash: exit 0
+            nodes:
+              - id: delay
+                wait:
+                  duration_ms: 1000
+`,
+        '/tmp/nested-wait.yaml'
+      );
+
+      expect(result.error?.error).toContain(
+        'wait nodes nested below another loop_group are not supported'
+      );
+    });
+
+    it('should accept a workflow where output refs use valid existing node IDs', async () => {
+      await writeWorkflowFile(
+        testDir,
+        'valid-refs.yaml',
         `
 name: valid-refs
 description: Valid output refs
@@ -2214,7 +3479,7 @@ nodes:
   - id: implement
     prompt: "Fix this: $classify.output"
     depends_on: [classify]
-    when: "$classify.output == 'BUG'"
+    when: "$classify.output.type == 'BUG'"
 `
       );
 
@@ -2225,11 +3490,10 @@ nodes:
 
     it('should accept a workflow where a node has both when: and prompt: with valid refs', async () => {
       // Exercises the lastIndex = 0 reset across multiple sources per node
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
 
-      await writeFile(
-        join(workflowDir, 'multi-source.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'multi-source.yaml',
         `
 name: multi-source
 description: Node with both when and prompt refs
@@ -2239,7 +3503,7 @@ nodes:
   - id: step2
     prompt: "Based on $step1.output, do step 2"
     depends_on: [step1]
-    when: "$step1.output == 'go'"
+    when: "$step1.output.verdict == 'go'"
 `
       );
 
@@ -2252,11 +3516,10 @@ nodes:
       // bash: (like script/cancel/approval.message/until_bash) is substituted at
       // runtime, so a dangling ref there silently resolves to '' — it must be caught
       // at load time, same as prompt/when refs.
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
 
-      await writeFile(
-        join(workflowDir, 'bash-unknown-ref.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'bash-unknown-ref.yaml',
         `
 name: bash-unknown-ref
 description: Bash node with a dangling output ref
@@ -2312,17 +3575,15 @@ nodes:
         item => item.workflow.name === 'input-output-parent'
       )?.workflow;
       const review = parent?.nodes.find(node => node.id === 'inc__review');
-      expect(review && 'prompt' in review ? review.prompt : undefined).toBe('Review bound-value');
+      expect(inlinePrompt(review)).toBe('Review bound-value');
     });
 
     it('should validate script/cancel/approval.message/until_bash refs at load time', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
       // A script node with a dangling ref is rejected (representative of the other
       // newly-scanned code/text surfaces).
-      await writeFile(
-        join(workflowDir, 'script-unknown-ref.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'script-unknown-ref.yaml',
         `
 name: script-unknown-ref
 description: Script node with a dangling output ref
@@ -2342,11 +3603,9 @@ nodes:
     });
 
     it('should validate $nodeId.output inside fenced code blocks in prompt: bodies', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'fenced-doc.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'fenced-doc.yaml',
         `
 name: fenced-doc
 description: Prompt body with a fenced code example mentioning a literal output ref
@@ -2370,11 +3629,9 @@ nodes:
     });
 
     it('should validate $nodeId.output inside inline backtick code in prompt: bodies', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'inline-doc.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'inline-doc.yaml',
         `
 name: inline-doc
 description: Prompt body that mentions a placeholder via inline backticks
@@ -2393,10 +3650,9 @@ nodes:
     });
 
     it('should validate shorthand when refs at load time', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-      await writeFile(
-        join(workflowDir, 'bad-when-shorthand.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'bad-when-shorthand.yaml',
         `name: bad-when-shorthand
 description: dangling shorthand condition
 nodes:
@@ -2413,10 +3669,9 @@ nodes:
     });
 
     it('should validate approval.on_reject.prompt refs at load time', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-      await writeFile(
-        join(workflowDir, 'bad-rejection-ref.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'bad-rejection-ref.yaml',
         `name: bad-rejection-ref
 description: dangling rejection prompt ref
 nodes:
@@ -2435,13 +3690,12 @@ nodes:
     });
 
     it('should still reject unknown $nodeId.output refs outside code', async () => {
-      // Stripping fenced/inline code must not weaken validation of real refs
-      // that appear in prose outside any code marker.
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
+      // The scan reads the body verbatim, so a real (unknown) ref in prose and a
+      // fenced example are both live; the prose one is reported first.
 
-      await writeFile(
-        join(workflowDir, 'mixed-ref.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'mixed-ref.yaml',
         `
 name: mixed-ref
 description: Real (unknown) ref in prose plus a fenced doc example
@@ -2464,11 +3718,9 @@ nodes:
     });
 
     it('should validate $nodeId.output inside fenced code in loop.prompt', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'loop-fenced.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'loop-fenced.yaml',
         `
 name: loop-fenced
 description: Loop with a fenced doc example in its prompt
@@ -2493,13 +3745,423 @@ nodes:
     });
   });
 
+  describe('when: whole-output comparison against an AI producer (#2566)', () => {
+    /** Write one workflow YAML and load it. */
+    async function loadYaml(filename: string, yaml: string) {
+      await writeWorkflowFile(testDir, filename, yaml);
+      return discoverWorkflows(testDir, { loadDefaults: false });
+    }
+
+    it('rejects a bare $node.output comparison when the producer is a prompt node', async () => {
+      const result = await loadYaml(
+        'ai-whole-output.yaml',
+        `
+name: ai-whole-output
+description: Compares a whole AI reply to a literal
+nodes:
+  - id: analyze
+    prompt: "Analyze the issue"
+  - id: decide
+    prompt: "Decide"
+    depends_on: [analyze]
+    when: "$analyze.output == 'BUG'"
+`
+      );
+      expect(result.workflows).toHaveLength(0);
+      expect(result.errors).toHaveLength(1);
+      const message = result.errors[0].error;
+      expect(message).toContain("compares the whole output of AI node 'analyze'");
+      // The message must name the fix, not just the problem.
+      expect(message).toContain('output_format');
+      expect(message).toContain("$analyze.output.status == 'BUG'");
+    });
+
+    it('rejects it for a command producer — a command file is a prompt in another file', async () => {
+      const result = await loadYaml(
+        'ai-command-output.yaml',
+        `
+name: ai-command-output
+description: Command producer
+nodes:
+  - id: analyze
+    command: analyze-issue
+  - id: decide
+    prompt: "Decide"
+    depends_on: [analyze]
+    when: "$analyze.output == 'BUG'"
+`
+      );
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0].error).toContain("whole output of AI node 'analyze'");
+    });
+
+    it('rejects it for a loop producer', async () => {
+      const result = await loadYaml(
+        'ai-loop-output.yaml',
+        `
+name: ai-loop-output
+description: Loop producer
+nodes:
+  - id: refine
+    loop:
+      prompt: "Refine until done"
+      until: DONE
+      max_iterations: 3
+  - id: decide
+    prompt: "Decide"
+    depends_on: [refine]
+    when: "$refine.output == 'DONE'"
+`
+      );
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0].error).toContain("whole output of AI node 'refine'");
+      // Since #2563 a `loop:` is schema-capable, so it gets the SAME remedy as a
+      // prompt node: declare output_format and compare a field. (A `loop_group:` still
+      // gets its own reason — it never calls the provider itself.)
+      expect(result.errors[0].error).toContain("Declare 'output_format'");
+    });
+
+    it('ACCEPTS a loop producer that declares an output_format (#2563)', async () => {
+      // `output_format` now reaches a LoopNode — it runs its own sendQuery — so the
+      // loop's output IS the validated JSON document and declaring a schema is a real
+      // opt-out, exactly as it is for a prompt node. Before #2563 this was rejected on
+      // the grounds that the schema was dropped at parse, which is no longer true.
+      const result = await loadYaml(
+        'ai-loop-declared-format.yaml',
+        `
+name: ai-loop-declared-format
+description: output_format on a loop node is a real opt-out
+nodes:
+  - id: refine
+    output_format:
+      type: object
+      properties:
+        status:
+          type: string
+    loop:
+      prompt: "Refine until done"
+      until: DONE
+      max_iterations: 3
+  - id: decide
+    prompt: "Decide"
+    depends_on: [refine]
+    when: "$refine.output == 'DONE'"
+`
+      );
+      expect(result.errors).toHaveLength(0);
+    });
+
+    it('rejects it for a loop_group producer that declares output_format, for its own reason', async () => {
+      // Unlike `loop:`, a loop_group KEEPS `output_format` through the transform — so the
+      // "dropped at parse" reason would be wrong here. The group is still rejected
+      // because its completion returns the last iteration's text, never the JSON.
+      const result = await loadYaml(
+        'ai-loop-group-declared-format.yaml',
+        `
+name: ai-loop-group-declared-format
+description: a loop_group keeps output_format but its output is still iteration text
+nodes:
+  - id: refine
+    output_format:
+      type: object
+      properties:
+        status:
+          type: string
+    loop_group:
+      until: DONE
+      max_iterations: 3
+      nodes:
+        - id: body
+          prompt: "Do a pass"
+  - id: decide
+    prompt: "Decide"
+    depends_on: [refine]
+    when: "$refine.output == 'DONE'"
+`
+      );
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0].error).toContain("last iteration's raw text");
+      expect(result.errors[0].error).not.toContain("dropped from a 'loop:' node");
+    });
+
+    it('rejects it for a loop_group producer', async () => {
+      const result = await loadYaml(
+        'ai-loop-group-output.yaml',
+        `
+name: ai-loop-group-output
+description: Loop group producer
+nodes:
+  - id: refine
+    loop_group:
+      until: DONE
+      max_iterations: 3
+      nodes:
+        - id: body
+          prompt: "Do a pass"
+  - id: decide
+    prompt: "Decide"
+    depends_on: [refine]
+    when: "$refine.output == 'DONE'"
+`
+      );
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0].error).toContain("whole output of AI node 'refine'");
+      expect(result.errors[0].error).toContain("last iteration's raw text");
+    });
+
+    it('rejects it under a numeric operator too', async () => {
+      const result = await loadYaml(
+        'ai-numeric.yaml',
+        `
+name: ai-numeric
+description: Numeric comparison on free-form output
+nodes:
+  - id: score
+    prompt: "Score it"
+  - id: gate
+    prompt: "Gate"
+    depends_on: [score]
+    when: "$score.output > '80'"
+`
+      );
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0].error).toContain("whole output of AI node 'score'");
+    });
+
+    it('rejects it inside a compound expression', async () => {
+      const result = await loadYaml(
+        'ai-compound.yaml',
+        `
+name: ai-compound
+description: Hazard hidden in the second half of an AND
+nodes:
+  - id: flag
+    bash: "echo yes"
+  - id: analyze
+    prompt: "Analyze"
+  - id: decide
+    prompt: "Decide"
+    depends_on: [flag, analyze]
+    when: "$flag.output == 'yes' && $analyze.output == 'BUG'"
+`
+      );
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0].error).toContain("whole output of AI node 'analyze'");
+    });
+
+    it('rejects it from a loop_group body referencing an enclosing AI node', async () => {
+      const result = await loadYaml(
+        'ai-enclosing.yaml',
+        `
+name: ai-enclosing
+description: Body node branching on an outer AI node's whole output
+nodes:
+  - id: analyze
+    prompt: "Analyze"
+  - id: refine
+    depends_on: [analyze]
+    loop_group:
+      until: DONE
+      max_iterations: 3
+      nodes:
+        - id: body
+          prompt: "Do a pass"
+          when: "$analyze.output == 'BUG'"
+`
+      );
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0].error).toContain("whole output of AI node 'analyze'");
+    });
+
+    it('accepts a bash producer — its stdout is author-controlled and exact', async () => {
+      const result = await loadYaml(
+        'bash-whole-output.yaml',
+        `
+name: bash-whole-output
+description: Whole-output equality against a shell producer
+nodes:
+  - id: check
+    bash: "test -f README.md && echo 'true' || echo 'false'"
+  - id: notify
+    prompt: "Notify"
+    depends_on: [check]
+    when: "$check.output == 'true'"
+`
+      );
+      expect(result.errors).toHaveLength(0);
+      expect(result.workflows).toHaveLength(1);
+    });
+
+    it('accepts a script producer', async () => {
+      const result = await loadYaml(
+        'script-whole-output.yaml',
+        `
+name: script-whole-output
+description: Whole-output equality against a script producer
+nodes:
+  - id: check
+    runtime: bun
+    script: "console.log('ok')"
+  - id: notify
+    prompt: "Notify"
+    depends_on: [check]
+    when: "$check.output == 'ok'"
+`
+      );
+      expect(result.errors).toHaveLength(0);
+      expect(result.workflows).toHaveLength(1);
+    });
+
+    it('accepts a script producer that declares a contract (#2453)', async () => {
+      // A certified exec node's whole output is its canonical JSON document — still
+      // author-controlled and exact, so the #2566 rejection has no reason to fire.
+      const result = await loadYaml(
+        'script-contract-whole-output.yaml',
+        `
+name: script-contract-whole-output
+description: Whole-output equality against a certified script producer
+nodes:
+  - id: check
+    runtime: bun
+    script: "console.log('{\\"ok\\":true}')"
+    output_format:
+      type: object
+      properties:
+        ok: { type: boolean }
+      required: [ok]
+  - id: notify
+    prompt: "Notify"
+    depends_on: [check]
+    when: "$check.output.ok == 'true'"
+`
+      );
+      expect(result.errors).toHaveLength(0);
+      expect(result.workflows).toHaveLength(1);
+    });
+
+    it('accepts an AI producer that declares output_format', async () => {
+      const result = await loadYaml(
+        'declared-output-format.yaml',
+        `
+name: declared-output-format
+description: AI producer with a declared schema
+nodes:
+  - id: analyze
+    prompt: "Analyze"
+    output_format:
+      type: object
+      properties:
+        status:
+          type: string
+  - id: decide
+    prompt: "Decide"
+    depends_on: [analyze]
+    when: "$analyze.output == '{}'"
+`
+      );
+      expect(result.errors).toHaveLength(0);
+      expect(result.workflows).toHaveLength(1);
+    });
+
+    it('accepts a field access on an AI producer', async () => {
+      const result = await loadYaml(
+        'field-access.yaml',
+        `
+name: field-access
+description: Field access is the supported pattern
+nodes:
+  - id: analyze
+    prompt: "Analyze"
+  - id: decide
+    prompt: "Decide"
+    depends_on: [analyze]
+    when: "$analyze.output.status == 'BUG'"
+`
+      );
+      expect(result.errors).toHaveLength(0);
+      expect(result.workflows).toHaveLength(1);
+    });
+
+    it('accepts a $INPUTS ref, which names no producer at all', async () => {
+      const result = await loadYaml(
+        'inputs-when.yaml',
+        `
+name: inputs-when
+description: Branching on a caller-supplied input
+inputs:
+  mode:
+    default: fast
+nodes:
+  - id: fast-path
+    prompt: "Go fast"
+    when: "$INPUTS.mode == 'fast'"
+`
+      );
+      expect(result.errors).toHaveLength(0);
+      expect(result.workflows).toHaveLength(1);
+    });
+
+    it('fires on the FLATTENED graph, catching a hazard that only appears after include expansion', async () => {
+      // The block's sink is an AI node; the caller gates on `$blk.output`, which the
+      // expander rewrites to that sink. Pre-expansion the producer is an `include:`
+      // node (exempt), so only the post-expansion revalidation can catch this.
+      await writeWorkflowFile(
+        testDir,
+        'block.yaml',
+        `
+name: block
+description: block whose sink is an AI node
+nodes:
+  - id: verdict
+    prompt: "Give a verdict"
+`
+      );
+      const result = await loadYaml(
+        'includes-block.yaml',
+        `
+name: includes-block
+description: gates on an included block's whole output
+nodes:
+  - id: blk
+    include: block
+  - id: act
+    prompt: "Act"
+    depends_on: [blk]
+    when: "$blk.output == 'PASS'"
+`
+      );
+      expect(result.workflows.find(w => w.workflow.name === 'includes-block')).toBeUndefined();
+      const error = result.errors.find(e => e.filename.includes('includes-block'));
+      expect(error?.error).toContain('compares the whole output of AI node');
+    });
+
+    it('rejects an unparseable when: during discovery', async () => {
+      const result = await loadYaml(
+        'unparseable-when.yaml',
+        `
+name: unparseable-when
+description: Malformed condition, valid refs
+nodes:
+  - id: analyze
+    prompt: "Analyze"
+  - id: decide
+    prompt: "Decide"
+    depends_on: [analyze]
+    when: "$analyze.output = 'BUG'"
+`
+      );
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0].error).toContain("Node 'decide' field 'when'");
+      expect(result.errors[0].error).toContain('unsupported condition syntax');
+      expect(result.workflows).toHaveLength(0);
+    });
+  });
+
   describe('retry config parsing', () => {
     it('should parse retry config on DAG command node', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'retry-dag.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'retry-dag.yaml',
         `
 name: retry-dag
 description: DAG node with retry
@@ -2514,15 +4176,13 @@ nodes:
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.errors).toHaveLength(0);
       const wf = result.workflows[0].workflow;
-      expect(wf.nodes[0].retry).toEqual({ max_attempts: 2 });
+      expect((wf.nodes as DagNode[])[0].retry).toEqual({ max_attempts: 2 });
     });
 
     it('should parse retry config on DAG bash node', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'retry-bash.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'retry-bash.yaml',
         `
 name: retry-bash
 description: Bash node with retry
@@ -2539,8 +4199,8 @@ nodes:
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.errors).toHaveLength(0);
       const wf = result.workflows[0].workflow;
-      if (isBashNode(wf.nodes[0])) {
-        expect(wf.nodes[0].retry).toEqual({
+      if (isExecNode((wf.nodes as DagNode[])[0])) {
+        expect((wf.nodes as DagNode[])[0].retry).toEqual({
           max_attempts: 1,
           delay_ms: 2000,
           on_error: 'all',
@@ -2549,11 +4209,9 @@ nodes:
     });
 
     it('should parse retry config on DAG prompt node', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'retry-prompt.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'retry-prompt.yaml',
         `
 name: retry-prompt
 description: Prompt node with retry config
@@ -2570,19 +4228,42 @@ nodes:
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.errors).toHaveLength(0);
       const wf = result.workflows[0].workflow;
-      expect(wf.nodes[0].retry).toEqual({
+      expect((wf.nodes as DagNode[])[0].retry).toEqual({
         max_attempts: 2,
         delay_ms: 4000,
         on_error: 'transient',
       });
     });
 
-    it('should reject retry with missing max_attempts', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
+    it('loads zero-delay retry config on a loop without warnings', async () => {
+      await writeWorkflowFile(
+        testDir,
+        'retry-loop.yaml',
+        `
+name: retry-loop
+description: Loop iteration retry
+nodes:
+  - id: work
+    retry:
+      max_attempts: 1
+      delay_ms: 0
+    loop:
+      prompt: Work
+      until_bash: "true"
+      max_iterations: 2
+`
+      );
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toHaveLength(0);
+      expect(result.workflows).toHaveLength(1);
+      expect(result.workflows[0].workflow.nodes[0].retry).toEqual({ max_attempts: 1, delay_ms: 0 });
+      expect(result.workflows[0].parseWarnings ?? []).toEqual([]);
+    });
 
-      await writeFile(
-        join(workflowDir, 'bad-retry.yaml'),
+    it('should reject retry with missing max_attempts', async () => {
+      await writeWorkflowFile(
+        testDir,
+        'bad-retry.yaml',
         `
 name: bad-retry
 description: Missing required field
@@ -2602,11 +4283,9 @@ nodes:
     });
 
     it('should reject retry with max_attempts out of range', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'bad-retry-range.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'bad-retry-range.yaml',
         `
 name: bad-retry-range
 description: max_attempts too high
@@ -2624,11 +4303,9 @@ nodes:
     });
 
     it('should reject retry with invalid on_error value', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'bad-retry-onerror.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'bad-retry-onerror.yaml',
         `
 name: bad-retry-onerror
 description: Invalid on_error value
@@ -2647,11 +4324,9 @@ nodes:
     });
 
     it('should reject retry with delay_ms out of range', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'bad-retry-delay.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'bad-retry-delay.yaml',
         `
 name: bad-retry-delay
 description: delay_ms too low
@@ -2670,11 +4345,9 @@ nodes:
     });
 
     it('should use defaults when retry fields are omitted', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'retry-defaults.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'retry-defaults.yaml',
         `
 name: retry-defaults
 description: Minimal retry config
@@ -2689,19 +4362,17 @@ nodes:
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.errors).toHaveLength(0);
       const wf = result.workflows[0].workflow;
-      expect(wf.nodes[0].retry).toEqual({ max_attempts: 1 });
-      expect(wf.nodes[0].retry?.delay_ms).toBeUndefined();
-      expect(wf.nodes[0].retry?.on_error).toBeUndefined();
+      expect((wf.nodes as DagNode[])[0].retry).toEqual({ max_attempts: 1 });
+      expect((wf.nodes as DagNode[])[0].retry?.delay_ms).toBeUndefined();
+      expect((wf.nodes as DagNode[])[0].retry?.on_error).toBeUndefined();
     });
   });
 
   describe('loop node parsing', () => {
     it('should parse a valid loop node with all fields', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'loop-test.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'loop-test.yaml',
         `
 name: loop-test
 description: Test loop node
@@ -2722,26 +4393,26 @@ nodes:
       expect(result.workflows).toHaveLength(1);
 
       const wf = result.workflows[0].workflow;
-      expect(wf.nodes).toBeDefined();
+      const nodes = wf.nodes as DagNode[];
+      expect(nodes).toBeDefined();
 
-      expect(wf.nodes).toHaveLength(1);
-      expect(isLoopNode(wf.nodes[0])).toBe(true);
-      if (isLoopNode(wf.nodes[0])) {
-        expect(wf.nodes[0].loop.prompt).toContain('Do one task');
-        expect(wf.nodes[0].loop.until).toBe('COMPLETE');
-        expect(wf.nodes[0].loop.max_iterations).toBe(10);
-        expect(wf.nodes[0].loop.fresh_context).toBe(true);
-        expect(wf.nodes[0].loop.until_bash).toBe('test -f done.txt');
-        expect(wf.nodes[0].idle_timeout).toBe(300000);
+      expect(nodes).toHaveLength(1);
+      const node0 = nodes[0];
+      expect(isLoopNode(node0)).toBe(true);
+      if (isLoopNode(node0)) {
+        expect(node0.loop.prompt).toContain('Do one task');
+        expect(node0.loop.until).toBe('COMPLETE');
+        expect(node0.loop.max_iterations).toBe(10);
+        expect(node0.loop.fresh_context).toBe(true);
+        expect(node0.loop.until_bash).toBe('test -f done.txt');
+        expect(node0.idle_timeout).toBe(300000);
       }
     });
 
     it('should parse minimal loop node (only required fields)', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'loop-min.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'loop-min.yaml',
         `
 name: loop-minimal
 description: Minimal loop node
@@ -2757,20 +4428,20 @@ nodes:
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.errors).toHaveLength(0);
       const wf = result.workflows[0].workflow;
-      expect(wf.nodes).toBeDefined();
-      expect(isLoopNode(wf.nodes[0])).toBe(true);
-      if (isLoopNode(wf.nodes[0])) {
-        expect(wf.nodes[0].loop.fresh_context).toBe(false);
-        expect(wf.nodes[0].loop.until_bash).toBeUndefined();
+      const nodes = wf.nodes as DagNode[];
+      expect(nodes).toBeDefined();
+      const node0 = nodes[0];
+      expect(isLoopNode(node0)).toBe(true);
+      if (isLoopNode(node0)) {
+        expect(node0.loop.fresh_context).toBe(false);
+        expect(node0.loop.until_bash).toBeUndefined();
       }
     });
 
     it('should reject loop node missing loop.prompt', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'loop-no-prompt.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'loop-no-prompt.yaml',
         `
 name: loop-no-prompt
 description: Missing prompt
@@ -2787,12 +4458,10 @@ nodes:
       expect(result.errors[0].error).toContain('loop.prompt');
     });
 
-    it('should reject loop node missing loop.until', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'loop-no-until.yaml'),
+    it('should reject a loop node that declares no completion channel', async () => {
+      await writeWorkflowFile(
+        testDir,
+        'loop-no-until.yaml',
         `
 name: loop-no-until
 description: Missing until
@@ -2806,15 +4475,42 @@ nodes:
 
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.errors.length).toBeGreaterThan(0);
-      expect(result.errors[0].error).toContain('loop.until');
+      expect(result.errors[0].error).toContain('completion channel');
+      expect(result.errors[0].error).toContain('loop.until_bash');
+    });
+
+    it('should load a loop node that declares only until_bash (#2563)', async () => {
+      await writeWorkflowFile(
+        testDir,
+        'loop-deterministic.yaml',
+        `
+name: loop-deterministic
+description: Deterministic completion, no prose sentinel
+nodes:
+  - id: fix
+    loop:
+      prompt: "Fix the failing tests"
+      max_iterations: 5
+      until_bash: "bun run test"
+`
+      );
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toHaveLength(0);
+      const wf = result.workflows[0].workflow;
+      expect(wf.name).toBe('loop-deterministic');
+      const node0 = (wf.nodes as DagNode[])[0];
+      expect(isLoopNode(node0)).toBe(true);
+      if (isLoopNode(node0)) {
+        expect(node0.loop.until).toBeUndefined();
+        expect(node0.loop.until_bash).toBe('bun run test');
+      }
     });
 
     it('should reject loop node with invalid max_iterations', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'loop-bad-max.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'loop-bad-max.yaml',
         `
 name: loop-bad-max
 description: Invalid max_iterations
@@ -2833,11 +4529,9 @@ nodes:
     });
 
     it('should reject node with both loop and command', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'loop-cmd.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'loop-cmd.yaml',
         `
 name: loop-cmd-conflict
 description: Loop + command
@@ -2857,11 +4551,9 @@ nodes:
     });
 
     it('should reject node with both loop and bash', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'loop-bash.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'loop-bash.yaml',
         `
 name: loop-bash-conflict
 description: Loop + bash
@@ -2881,11 +4573,9 @@ nodes:
     });
 
     it('should validate $nodeId.output refs in loop.prompt', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'loop-bad-ref.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'loop-bad-ref.yaml',
         `
 name: loop-bad-ref
 description: Bad ref in loop prompt
@@ -2904,11 +4594,9 @@ nodes:
     });
 
     it('should parse loop node with depends_on', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'loop-deps.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'loop-deps.yaml',
         `
 name: loop-deps
 description: Loop with dependencies
@@ -2927,24 +4615,21 @@ nodes:
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.errors).toHaveLength(0);
       const wf = result.workflows[0].workflow;
-      expect(wf.nodes).toBeDefined();
-      expect(wf.nodes).toHaveLength(2);
-      expect(isLoopNode(wf.nodes[1])).toBe(true);
-      if (isLoopNode(wf.nodes[1])) {
-        expect(wf.nodes[1].depends_on).toEqual(['setup']);
+      expect(wf.nodes as DagNode[]).toBeDefined();
+      expect(wf.nodes as DagNode[]).toHaveLength(2);
+      expect(isLoopNode((wf.nodes as DagNode[])[1])).toBe(true);
+      if (isLoopNode((wf.nodes as DagNode[])[1])) {
+        expect((wf.nodes as DagNode[])[1].depends_on).toEqual(['setup']);
       }
     });
 
     it('should accept interactive loop with gate_message', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'valid-interactive.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'valid-interactive.yaml',
         `
 name: valid-interactive
 description: Valid interactive loop
-interactive: true
 nodes:
   - id: my-loop
     loop:
@@ -2959,22 +4644,20 @@ nodes:
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.errors).toHaveLength(0);
       expect(result.workflows).toHaveLength(1);
-      if (isLoopNode(result.workflows[0].workflow.nodes[0])) {
-        expect(result.workflows[0].workflow.nodes[0].loop.interactive).toBe(true);
-        expect(result.workflows[0].workflow.nodes[0].loop.gate_message).toBe('Review and respond.');
+      const node0 = (result.workflows[0].workflow.nodes as DagNode[])[0];
+      if (isLoopNode(node0)) {
+        expect(node0.loop.interactive).toBe(true);
+        expect(node0.loop.gate_message).toBe('Review and respond.');
       }
     });
 
     it('should reject interactive loop without gate_message', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'bad-interactive.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'bad-interactive.yaml',
         `
 name: bad-interactive
 description: Missing gate_message
-interactive: true
 nodes:
   - id: my-loop
     loop:
@@ -2990,37 +4673,6 @@ nodes:
       expect(result.errors[0].error).toContain('gate_message');
     });
 
-    it('should warn when interactive loop node is in a non-interactive workflow', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'warn-test.yaml'),
-        `
-name: warn-test
-description: Non-interactive workflow with interactive loop
-nodes:
-  - id: my-loop
-    loop:
-      prompt: Iterate.
-      until: DONE
-      max_iterations: 5
-      interactive: true
-      gate_message: Review.
-`
-      );
-
-      const result = await discoverWorkflows(testDir, { loadDefaults: false });
-      // Workflow loads successfully — this is a warning, not an error
-      expect(result.errors).toHaveLength(0);
-      expect(result.workflows).toHaveLength(1);
-      // Logger should have been called with the warning event
-      expect(mockLogger.warn).toHaveBeenCalledWith(
-        expect.objectContaining({ filename: expect.stringContaining('warn-test') }),
-        'interactive_loop_in_non_interactive_workflow'
-      );
-    });
-
     // -----------------------------------------------------------------------
     // loop.command — alternative to loop.prompt that loads the iteration
     // prompt from a command file (parallel to how `command:` nodes work).
@@ -3030,11 +4682,9 @@ nodes:
     // -----------------------------------------------------------------------
 
     it('should parse a loop node with loop.command (no inline prompt)', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'loop-cmd-only.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'loop-cmd-only.yaml',
         `
 name: loop-cmd-only
 description: Command-backed loop
@@ -3051,7 +4701,7 @@ nodes:
       expect(result.errors).toHaveLength(0);
       expect(result.workflows).toHaveLength(1);
 
-      const node = result.workflows[0].workflow.nodes[0];
+      const node = (result.workflows[0].workflow.nodes as DagNode[])[0];
       expect(isLoopNode(node)).toBe(true);
       if (isLoopNode(node)) {
         expect(node.loop.command).toBe('my-loop-cmd');
@@ -3060,11 +4710,9 @@ nodes:
     });
 
     it('should reject a loop node with both loop.prompt and loop.command', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'loop-both.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'loop-both.yaml',
         `
 name: loop-both
 description: Both prompt and command on loop
@@ -3088,11 +4736,9 @@ nodes:
     });
 
     it('should reject a loop node with neither loop.prompt nor loop.command (message mentions both options)', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'loop-neither.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'loop-neither.yaml',
         `
 name: loop-neither
 description: Loop with no prompt source
@@ -3113,11 +4759,9 @@ nodes:
     });
 
     it("should reject a loop node whose loop.command is an unsafe name ('../escape')", async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'loop-unsafe-cmd.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'loop-unsafe-cmd.yaml',
         `
 name: loop-unsafe-cmd
 description: Loop with unsafe command name
@@ -3137,15 +4781,13 @@ nodes:
     });
 
     it('should not false-positive the $nodeId.output ref scan on a command-backed loop with a sibling that consumes its output', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
       // Regression guard for the loader change that skips the ref scan when
       // loop.prompt is absent: the scanner must (a) not crash trying to read
       // the missing inline prompt, and (b) still register the loop's id so a
       // sibling can reference `$my-loop.output` like any other node output.
-      await writeFile(
-        join(workflowDir, 'loop-cmd-with-sibling.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'loop-cmd-with-sibling.yaml',
         `
 name: loop-cmd-with-sibling
 description: Command-backed loop with a downstream consumer
@@ -3168,17 +4810,15 @@ nodes:
     });
 
     it('should trim surrounding whitespace from loop.command so resolution sees the normalized name', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
       // Parsing NORMALIZES the command name (schema-level trim) rather than
       // rejecting it: a quoted YAML value like `" my-loop-cmd "` (or one with a
       // stray trailing newline from awkward block scalars) is stored trimmed,
       // so downstream `loadCommandPrompt` — which resolves the literal filename
       // — sees the same name the author meant instead of failing at runtime
       // with a confusing "not found".
-      await writeFile(
-        join(workflowDir, 'loop-cmd-whitespace.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'loop-cmd-whitespace.yaml',
         `
 name: loop-cmd-whitespace
 description: Command-backed loop with stray whitespace around the name
@@ -3195,7 +4835,7 @@ nodes:
       expect(result.errors).toHaveLength(0);
       expect(result.workflows).toHaveLength(1);
 
-      const node = result.workflows[0].workflow.nodes[0];
+      const node = (result.workflows[0].workflow.nodes as DagNode[])[0];
       expect(isLoopNode(node)).toBe(true);
       if (isLoopNode(node)) {
         expect(node.loop.command).toBe('my-loop-cmd');
@@ -3203,15 +4843,12 @@ nodes:
     });
 
     it('should accept a loop with signal_completes (loads without errors)', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'signal-completes.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'signal-completes.yaml',
         `
 name: signal-completes
 description: Interactive loop that completes autonomously on the signal
-interactive: true
 nodes:
   - id: validate
     loop:
@@ -3230,11 +4867,9 @@ nodes:
     });
 
     it('should warn (non-blocking) when signal_completes is set without interactive', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'sc-no-interactive.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'sc-no-interactive.yaml',
         `
 name: sc-no-interactive
 description: signal_completes without interactive is a no-op
@@ -3259,11 +4894,9 @@ nodes:
     });
 
     it('should reject loop_group with a cyclic body', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'loop-group-cycle.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'loop-group-cycle.yaml',
         `
 name: loop-group-cycle
 description: Cyclic loop_group body
@@ -3289,11 +4922,9 @@ nodes:
     });
 
     it('should reject loop_group body depends_on referencing an unknown node', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'loop-group-bad-dep.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'loop-group-bad-dep.yaml',
         `
 name: loop-group-bad-dep
 description: Body depends_on to unknown node
@@ -3317,12 +4948,226 @@ nodes:
       expect(result.errors[0].error).toContain('unknown node');
     });
 
-    it('should accept a well-formed loop_group', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
+    // --- pause placement inside a loop_group body (#2707 step 3, #4043) -----------
+    // A gate or wait pauses the loop only as the body's sole terminal sink; anywhere
+    // else it is a load error.
 
-      await writeFile(
-        join(workflowDir, 'loop-group-ok.yaml'),
+    it('should accept an attention-terminated loop_group whose completion reads the answer, with no warning', async () => {
+      await writeWorkflowFile(
+        testDir,
+        'loop-group-attention-terminal.yaml',
+        `
+name: loop-group-attention-terminal
+description: An attention wait as the body's sole terminal sink, completion reading its decision
+nodes:
+  - id: grp
+    loop_group:
+      until_bash: 'decision=$check.output.decision; [ "$decision" = "approve" ]'
+      max_iterations: 3
+      nodes:
+        - id: work
+          prompt: "do work. Feedback: $LOOP_PREV.check.output.text"
+        - id: check
+          depends_on: [work]
+          wait:
+            attention: "Continue?"
+            form: approval
+`
+      );
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toHaveLength(0);
+      expect(result.workflows).toHaveLength(1);
+      expect(result.workflows[0].parseWarnings ?? []).toEqual([]);
+    });
+
+    it('does not ask until_bash to read a terminal pause that its own when: can skip', async () => {
+      await writeWorkflowFile(
+        testDir,
+        'loop-group-conditional-attention.yaml',
+        `
+name: loop-group-conditional-attention
+description: Ask only when blocked
+nodes:
+  - id: grp
+    loop_group:
+      until_bash: test $work.output != blocked
+      max_iterations: 3
+      nodes:
+        - id: work
+          bash: "printf done"
+        - id: ask
+          depends_on: [work]
+          when: "$work.output == 'blocked'"
+          wait:
+            attention: "Unblock?"
+`
+      );
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toHaveLength(0);
+      expect(result.workflows[0].parseWarnings ?? []).toEqual([]);
+    });
+
+    it.each([
+      ['an attention wait', 'wait:\n            attention: "Continue?"'],
+      ['a legacy gate', 'approval:\n            message: "Continue?"'],
+    ])(
+      "warns when until_bash does not reference the loop_group's terminal %s",
+      async (_, pause) => {
+        await writeWorkflowFile(
+          testDir,
+          'loop-group-pause-completion-not-referenced.yaml',
+          `
+name: loop-group-pause-completion-not-referenced
+description: A pause-terminated body whose completion channel ignores the answer
+nodes:
+  - id: grp
+    loop_group:
+      until_bash: "exit 0"
+      max_iterations: 3
+      nodes:
+        - id: work
+          prompt: "do work"
+        - id: check
+          depends_on: [work]
+          ${pause}
+`
+        );
+
+        const result = await discoverWorkflows(testDir, { loadDefaults: false });
+        expect(result.errors).toHaveLength(0);
+        const pw = (result.workflows[0].parseWarnings ?? []).filter(w =>
+          w.includes('does not reference')
+        );
+        expect(pw).toHaveLength(1);
+        expect(pw[0]).toContain("Node 'check'");
+        expect(pw[0]).toContain('$check.output');
+      }
+    );
+
+    it('rejects a mid-body gate even when a later gate is the sole terminal sink', async () => {
+      await writeWorkflowFile(
+        testDir,
+        'loop-group-multiple-gates.yaml',
+        `
+name: loop-group-multiple-gates
+description: Two gates in one body — only the last can pause the loop
+nodes:
+  - id: grp
+    loop_group:
+      until_bash: '[ "$second-gate.output.decision" = "approve" ]'
+      max_iterations: 3
+      nodes:
+        - id: first-gate
+          approval:
+            message: "Start?"
+        - id: work
+          depends_on: [first-gate]
+          prompt: "do work"
+        - id: second-gate
+          depends_on: [work]
+          approval:
+            message: "Continue?"
+`
+      );
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.workflows).toHaveLength(0);
+      expect(result.errors[0].error).toContain(
+        "loop_group 'grp' body: approval node 'first-gate' must be the body's sole terminal sink"
+      );
+    });
+
+    it("counts an include: directive's own depends_on when computing terminal-sink status (review fix)", async () => {
+      await writeWorkflowFile(
+        testDir,
+        'block.yaml',
+        `
+name: block
+description: Reusable step
+nodes:
+  - id: step
+    prompt: do the reusable thing
+`
+      );
+      // 'check' has a dependent — the included 'review' node — so it is NOT the
+      // body's terminal sink. Before the fix, an include directive's own
+      // depends_on was excluded from the dependency set, so 'check' was silently
+      // misclassified as terminal.
+      await writeWorkflowFile(
+        testDir,
+        'loop-group-gate-include-dependent.yaml',
+        `
+name: loop-group-gate-include-dependent
+description: A downstream include node depends on the gate
+nodes:
+  - id: grp
+    loop_group:
+      until_bash: "exit 0"
+      max_iterations: 3
+      nodes:
+        - id: check
+          approval:
+            message: "Continue?"
+        - id: review
+          include: block
+          depends_on: [check]
+`
+      );
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      const err = result.errors.find(e => e.filename === 'loop-group-gate-include-dependent.yaml');
+      expect(err?.error).toContain("approval node 'check' must be the body's sole terminal sink");
+    });
+
+    it('counts an include: directive as a co-terminal sink (review fix)', async () => {
+      await writeWorkflowFile(
+        testDir,
+        'block.yaml',
+        `
+name: block
+description: Reusable step
+nodes:
+  - id: step
+    prompt: do the reusable thing
+`
+      );
+      // 'independent-include' has no dependents and nothing depends on it — a
+      // second, genuine terminal sink alongside the gate. Before the fix, include
+      // directives were excluded from the sink set entirely, so this second sink
+      // was invisible and 'check' was wrongly treated as the sole terminal node.
+      await writeWorkflowFile(
+        testDir,
+        'loop-group-gate-include-co-terminal.yaml',
+        `
+name: loop-group-gate-include-co-terminal
+description: An independent include node is a second terminal sink
+nodes:
+  - id: grp
+    loop_group:
+      until_bash: "exit 0"
+      max_iterations: 3
+      nodes:
+        - id: check
+          approval:
+            message: "Continue?"
+        - id: independent-include
+          include: block
+`
+      );
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      const err = result.errors.find(
+        e => e.filename === 'loop-group-gate-include-co-terminal.yaml'
+      );
+      expect(err?.error).toContain("approval node 'check' must be the body's sole terminal sink");
+    });
+
+    it('should accept a well-formed loop_group', async () => {
+      await writeWorkflowFile(
+        testDir,
+        'loop-group-ok.yaml',
         `
 name: loop-group-ok
 description: Valid loop_group
@@ -3343,12 +5188,60 @@ nodes:
       expect(result.workflows).toHaveLength(1);
     });
 
-    it('should accept a body prompt referencing an outer-DAG node via $nodeId.output', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
+    it('should load loop_group until_bash referencing a direct body output', async () => {
+      await writeWorkflowFile(
+        testDir,
+        'loop-group-body-completion-ref.yaml',
+        `
+name: loop-group-body-completion-ref
+description: Group completion reads the current body output
+nodes:
+  - id: group
+    loop_group:
+      until_bash: "test $ready-flag.output = ready"
+      max_iterations: 2
+      nodes:
+        - id: ready-flag
+          bash: "echo ready"
+`
+      );
 
-      await writeFile(
-        join(workflowDir, 'loop-group-outer-ref.yaml'),
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toHaveLength(0);
+      expect(result.workflows).toHaveLength(1);
+    });
+
+    it('should reject unknown loop_group until_bash refs with body-scope guidance', async () => {
+      await writeWorkflowFile(
+        testDir,
+        'loop-group-unknown-completion-ref.yaml',
+        `
+name: loop-group-unknown-completion-ref
+description: Group completion references a node outside its visible scopes
+nodes:
+  - id: group
+    loop_group:
+      until_bash: "test $ghost.output = ready"
+      max_iterations: 2
+      nodes:
+        - id: ready-flag
+          bash: "echo ready"
+`
+      );
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.workflows).toHaveLength(0);
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0].error).toContain("field 'loop_group.until_bash'");
+      expect(result.errors[0].error).toContain("unknown node '$ghost.output'");
+      expect(result.errors[0].error).toContain('loop_group body or current/enclosing DAG scope');
+      expect(result.errors[0].error).not.toContain('In a composed workflow');
+    });
+
+    it('should accept a body prompt referencing an outer-DAG node via $nodeId.output', async () => {
+      await writeWorkflowFile(
+        testDir,
+        'loop-group-outer-ref.yaml',
         `
 name: loop-group-outer-ref
 description: Body prompt reads an outer node output
@@ -3372,11 +5265,9 @@ nodes:
     });
 
     it('should still reject a body prompt referencing a truly unknown node', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'loop-group-unknown-ref.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'loop-group-unknown-ref.yaml',
         `
 name: loop-group-unknown-ref
 description: Body prompt references a node that exists nowhere
@@ -3400,11 +5291,9 @@ nodes:
     });
 
     it('should reject a body node id that shadows an outer-DAG node id', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'loop-group-shadow.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'loop-group-shadow.yaml',
         `
 name: loop-group-shadow
 description: Body node id collides with outer node id
@@ -3426,36 +5315,182 @@ nodes:
       expect(result.errors.length).toBeGreaterThan(0);
       expect(result.errors[0].error).toContain('shadows a node id in the enclosing DAG');
     });
+  });
 
-    it('should warn when an interactive loop_group is in a non-interactive workflow', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
+  describe('single conditional dependency trigger rule warning (#3783)', () => {
+    const CONDITIONAL_JOIN = 'needs a successful dependency';
 
-      await writeFile(
-        join(workflowDir, 'loop-group-gate-warn.yaml'),
-        `
-name: loop-group-gate-warn
-description: Interactive loop_group without workflow-level interactive
+    it.each([
+      {
+        label: 'its only dependency is conditional',
+        deps: ['a'],
+        rule: 'none_failed_min_one_success',
+        warns: true,
+      },
+      {
+        label: 'its only dependency is unconditional',
+        deps: ['c'],
+        rule: 'none_failed_min_one_success',
+        warns: false,
+      },
+      {
+        label: 'it joins conditional branches',
+        deps: ['a', 'b'],
+        rule: 'none_failed_min_one_success',
+        warns: false,
+      },
+      {
+        label: 'it joins conditional and unconditional nodes',
+        deps: ['a', 'c'],
+        rule: 'none_failed_min_one_success',
+        warns: false,
+      },
+      {
+        label: 'it uses all_done after a conditional node',
+        deps: ['a'],
+        rule: 'all_done',
+        warns: false,
+      },
+    ])('warns=$warns when $label', ({ deps, rule, warns }) => {
+      const { warnings } = parseWorkflowYaml(`name: conditional-join
+description: Conditional join warning
+inputs:
+  run: {}
 nodes:
-  - id: grp
+  - id: a
+    bash: echo a
+    when: "$INPUTS.run == true"
+  - id: b
+    bash: echo b
+    when: "$INPUTS.run != true"
+  - id: c
+    bash: echo c
+  - id: join
+    bash: echo joined
+    depends_on: ${JSON.stringify(deps)}
+    trigger_rule: ${rule}
+`);
+      const advisories = warnings.filter(w => w.includes(CONDITIONAL_JOIN));
+      expect(advisories).toHaveLength(warns ? 1 : 0);
+      if (warns) {
+        expect(advisories[0]).toContain("Node 'join'");
+        expect(advisories[0]).toContain("'a'");
+        expect(advisories[0]).toContain('all_done');
+        expect(advisories[0]).toContain('/guides/authoring-workflows/#trigger_rule-values');
+      }
+    });
+
+    it('warns when the only dependency is a conditional include', () => {
+      const { warnings } = parseWorkflowYaml(`name: conditional-include-join
+description: Join after a conditional block
+inputs:
+  run: {}
+nodes:
+  - id: inc
+    include: block
+    when: "$INPUTS.run == true"
+  - id: join
+    depends_on: [inc]
+    trigger_rule: none_failed_min_one_success
+    bash: echo joined
+`);
+      expect(warnings.filter(w => w.includes(CONDITIONAL_JOIN))).toEqual([
+        expect.stringContaining("Node 'join'"),
+      ]);
+    });
+
+    it('warns inside a loop_group body', () => {
+      const { warnings } = parseWorkflowYaml(`name: conditional-loop-join
+description: Conditional join inside a loop
+inputs:
+  run: {}
+nodes:
+  - id: group
     loop_group:
-      until: DONE
-      max_iterations: 3
-      interactive: true
-      gate_message: "Review this iteration"
+      until_bash: exit 0
+      max_iterations: 1
       nodes:
-        - id: work
-          prompt: "do work"
+        - id: optional
+          bash: echo optional
+          when: "$INPUTS.run == true"
+        - id: join
+          depends_on: [optional]
+          trigger_rule: none_failed_min_one_success
+          bash: echo joined
+`);
+      expect(warnings.filter(w => w.includes(CONDITIONAL_JOIN))).toEqual([
+        expect.stringContaining("Node 'join'"),
+      ]);
+    });
+
+    it('does not warn inside a block that a conditional include skips as a whole', async () => {
+      // Expansion copies the include's `when` onto the block's entry node, so judging the
+      // expanded graph would flag `inc__join` even though the whole block skipping is the intent.
+      await writeWorkflowFile(
+        testDir,
+        'block.yaml',
+        `name: block
+description: Unconditional reusable join
+nodes:
+  - id: up
+    bash: echo up
+  - id: join
+    depends_on: [up]
+    trigger_rule: none_failed_min_one_success
+    bash: echo joined
 `
       );
-
-      const result = await discoverWorkflows(testDir, { loadDefaults: false });
-      expect(result.errors).toHaveLength(0);
-      expect(result.workflows).toHaveLength(1);
-      expect(mockLogger.warn).toHaveBeenCalledWith(
-        expect.objectContaining({ filename: expect.stringContaining('loop-group-gate-warn') }),
-        'interactive_loop_in_non_interactive_workflow'
+      await writeWorkflowFile(
+        testDir,
+        'top.yaml',
+        `name: top
+description: Conditional composition
+inputs:
+  run: {}
+nodes:
+  - id: inc
+    include: block
+    when: "$INPUTS.run == true"
+`
       );
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toEqual([]);
+      expect(result.workflows).toHaveLength(2);
+      for (const { parseWarnings } of result.workflows) {
+        expect((parseWarnings ?? []).filter(w => w.includes(CONDITIONAL_JOIN))).toEqual([]);
+      }
+    });
+  });
+
+  describe('parse warnings channel (#3444)', () => {
+    it('reports parse warnings to the author without logging them at warn', () => {
+      // Discovery parses every workflow on each list or run, so a warn log here
+      // would repeat for workflows nobody asked about. The warnings array is the
+      // channel validate, list, run, and the API read.
+      mockLogger.warn.mockClear();
+      const yaml = `
+name: parse-warnings
+description: Deprecated interactive declaration, a legacy gate, a legacy loop, and a typo
+interactive: true
+nodes:
+  - id: gate
+    approval:
+      message: "Review?"
+  - id: legacy
+    loop:
+      prompt: p
+      until: DONE
+      max_iterations: 2
+  - id: typo
+    bash: echo hi
+    contxt: fresh
+`;
+      for (let parse = 0; parse < 2; parse++) {
+        const result = parseWorkflow(yaml, 'parse-warnings.yaml');
+        expect(result.error).toBeNull();
+        expect(result.warnings).toHaveLength(4);
+      }
+      expect(mockLogger.warn).not.toHaveBeenCalled();
     });
   });
 
@@ -3464,9 +5499,7 @@ nodes:
   // -------------------------------------------------------------------------
   describe('workflow (sub-run) nodes', () => {
     async function loadOne(name: string, yaml: string) {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-      await writeFile(join(workflowDir, `${name}.yaml`), yaml);
+      await writeWorkflowFile(testDir, `${name}.yaml`, yaml);
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       return result;
     }
@@ -3517,6 +5550,28 @@ nodes:
       expect(err?.error).toContain("references unknown node '$ghost.output'");
     });
 
+    it.each([
+      ['systemPrompt', '    systemPrompt: "context $ghost.output"'],
+      [
+        'agents.*.prompt',
+        '    agents:\n      helper:\n        description: d\n        prompt: "use $ghost.output"',
+      ],
+      [
+        'agents.*.description',
+        '    agents:\n      helper:\n        description: "reads $ghost.output"\n        prompt: p',
+      ],
+    ])('catches a dangling $node.output ref in %s', async (field, snippet) => {
+      // These three are runtime substitution surfaces since #1764, so a dangling ref has
+      // to fail at load like every other one — before it reaches the provider as text.
+      const name = `bad-${field.replace(/[^a-z]/gi, '')}`;
+      const result = await loadOne(
+        name,
+        `name: ${name}\ndescription: dangling ref in ${field}\nnodes:\n  - id: use\n    prompt: go\n${snippet}\n`
+      );
+      const err = result.errors.find(e => e.filename === `${name}.yaml`);
+      expect(err?.error).toContain("references unknown node '$ghost.output'");
+    });
+
     it("accepts 'with:' on a workflow node (#2470)", async () => {
       const result = await loadOne(
         'with-accept',
@@ -3534,7 +5589,7 @@ nodes:
       expect(err).toBeUndefined();
       const wf = result.workflows.find(w => w.workflow.name === 'with-accept');
       const node = wf?.workflow.nodes.find(n => n.id === 'sub');
-      expect(node && 'with' in node ? node.with : undefined).toEqual({ foo: 'bar' });
+      expect(nodeWith(node)).toEqual({ foo: 'bar' });
     });
 
     it("rejects 'with:' and 'input:' together on a workflow node (#2470)", async () => {
@@ -3759,6 +5814,106 @@ nodes:
       expect(err?.error).toContain('depends_on');
     });
 
+    it('applies the same fan_out.items guards to a compose_fan_out node', async () => {
+      const result = await loadOne(
+        'cfo-dangling',
+        `
+name: cfo-dangling
+description: composed fan-out items reference a node that does not exist
+nodes:
+  - id: work
+    include: cfo-block
+    fan_out:
+      items: "$ghost.output"
+      as: item
+`
+      );
+      const err = result.errors.find(e => e.filename === 'cfo-dangling.yaml');
+      expect(err).toBeDefined();
+      expect(err?.error).toContain("references unknown node '$ghost.output'");
+    });
+
+    it('rejects compose_fan_out items referencing a non-dependency producer', async () => {
+      await mkdir(join(testDir, '.archon', 'workflows'), { recursive: true });
+      await writeFile(
+        join(testDir, '.archon', 'workflows', 'cfo-block.yaml'),
+        `name: cfo-block\ndescription: block\nnodes:\n  - id: run\n    prompt: "do the thing"\n`
+      );
+      const result = await loadOne(
+        'cfo-not-dep',
+        `
+name: cfo-not-dep
+description: composed block fanned out on a downstream producer (would race)
+nodes:
+  - id: list
+    bash: "echo []"
+  - id: work
+    include: cfo-block
+    fan_out:
+      items: "$list.output"
+      as: item
+`
+      );
+      const err = result.errors.find(e => e.filename === 'cfo-not-dep.yaml');
+      expect(err).toBeDefined();
+      expect(err?.error).toContain('not an upstream dependency');
+    });
+
+    it('catches a dangling $node.output ref in a compose_fan_out with value', async () => {
+      await mkdir(join(testDir, '.archon', 'workflows'), { recursive: true });
+      await writeFile(
+        join(testDir, '.archon', 'workflows', 'cfo-block.yaml'),
+        `name: cfo-block\ndescription: block\nnodes:\n  - id: run\n    prompt: "do the thing"\n`
+      );
+      const result = await loadOne(
+        'cfo-with-dangling',
+        `
+name: cfo-with-dangling
+description: with value references a node that does not exist
+nodes:
+  - id: work
+    include: cfo-block
+    with:
+      seed: "$ghost.output"
+    fan_out:
+      items: "[1, 2]"
+      as: item
+`
+      );
+      const err = result.errors.find(e => e.filename === 'cfo-with-dangling.yaml');
+      expect(err).toBeDefined();
+      expect(err?.error).toContain("references unknown node '$ghost.output'");
+    });
+
+    it('rejects compose_fan_out with binding to a non-upstream producer', async () => {
+      await mkdir(join(testDir, '.archon', 'workflows'), { recursive: true });
+      await writeFile(
+        join(testDir, '.archon', 'workflows', 'cfo-block.yaml'),
+        `name: cfo-block\ndescription: block\nnodes:\n  - id: run\n    prompt: "do the thing"\n`
+      );
+      const result = await loadOne(
+        'cfo-with-late',
+        `
+name: cfo-with-late
+description: with value reads a sibling that is not an upstream dependency
+nodes:
+  - id: seed
+    bash: "echo hi"
+  - id: work
+    include: cfo-block
+    with:
+      seed: "$seed.output"
+    fan_out:
+      items: "[1]"
+      as: item
+`
+      );
+      const err = result.errors.find(e => e.filename === 'cfo-with-late.yaml');
+      expect(err).toBeDefined();
+      expect(err?.error).toContain("binding 'with.seed'");
+      expect(err?.error).toContain('not an upstream dependency');
+    });
+
     it("rejects 'fan_out' on a non-workflow node", async () => {
       const result = await loadOne(
         'fan-wrong-node',
@@ -3904,11 +6059,9 @@ nodes:
 
   describe('include nodes', () => {
     it('should load and expand a workflow with an include node', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'block.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'block.yaml',
         `
 name: block
 description: Reusable building block
@@ -3920,8 +6073,9 @@ nodes:
     depends_on: [first]
 `
       );
-      await writeFile(
-        join(workflowDir, 'parent.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'parent.yaml',
         `
 name: parent
 description: Includes the block
@@ -3958,39 +6112,80 @@ nodes:
       expect(finish?.depends_on).toEqual(['sub__second']);
     });
 
-    it('should reject an include node inside a loop_group body', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'include-in-loop-group.yaml'),
+    it('should expand an include node inside a loop_group body', async () => {
+      await writeWorkflowFile(
+        testDir,
+        'block.yaml',
+        `
+name: block
+description: Reusable review block
+returns: decide
+nodes:
+  - id: decide
+    prompt: Decide whether the work is done
+    output_format:
+      type: object
+      properties:
+        done:
+          type: boolean
+      required: [done]
+  - id: cleanup
+    bash: echo cleanup
+    depends_on: [decide]
+`
+      );
+      await writeWorkflowFile(
+        testDir,
+        'include-in-loop-group.yaml',
         `
 name: include-in-loop-group
-description: Include nested in a loop_group body (rejected in v1)
+description: Include nested in a loop_group body
 nodes:
   - id: grp
     loop_group:
-      until: DONE
+      until_bash: test "$review.output.done" = true
       max_iterations: 3
       nodes:
-        - id: bad
+        - id: setup
+          bash: echo setup
+        - id: review
           include: block
+          depends_on: [setup]
+        - id: summarize
+          prompt: result=$review.output.done
+          depends_on: [review]
 `
       );
 
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
-      const err = result.errors.find(e => e.filename === 'include-in-loop-group.yaml');
-      expect(err).toBeDefined();
-      expect(err?.error).toContain('loop_group');
-      expect(err?.error).toContain("'include' is not supported");
+      expect(result.errors.filter(e => e.filename === 'include-in-loop-group.yaml')).toHaveLength(
+        0
+      );
+      const workflow = result.workflows.find(
+        entry => entry.workflow.name === 'include-in-loop-group'
+      )?.workflow;
+      expect(workflow).toBeDefined();
+      const group = (workflow?.nodes as DagNode[] | undefined)?.find(node => node.id === 'grp');
+      expect(group && isLoopGroupNode(group)).toBe(true);
+      if (!group || !isLoopGroupNode(group)) throw new Error('expected loop_group');
+      expect(group.loop_group.nodes.map(node => node.id)).toEqual([
+        'setup',
+        'review__decide',
+        'review__cleanup',
+        'summarize',
+      ]);
+      expect(group.loop_group.nodes.some(node => 'include' in node)).toBe(false);
+      expect(group.loop_group.until_bash).toBe('test "$review__decide.output.done" = true');
+      expect(group.loop_group.nodes.find(node => node.id === 'summarize')).toMatchObject({
+        source: { kind: 'inline', prompt: 'result=$review__decide.output.done' },
+        depends_on: ['review__cleanup'],
+      });
     });
 
     it('should error two files that declare the same workflow name', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'first.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'first.yaml',
         `
 name: dup-name
 description: First file with this name
@@ -3999,8 +6194,9 @@ nodes:
     prompt: "a"
 `
       );
-      await writeFile(
-        join(workflowDir, 'second.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'second.yaml',
         `
 name: dup-name
 description: Second file with the same name
@@ -4023,11 +6219,9 @@ nodes:
     });
 
     it('should drop a workflow whose include target is missing but keep others', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'broken-include.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'broken-include.yaml',
         `
 name: broken-include
 description: Includes a target that does not exist
@@ -4036,8 +6230,9 @@ nodes:
     include: does-not-exist
 `
       );
-      await writeFile(
-        join(workflowDir, 'healthy.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'healthy.yaml',
         `
 name: healthy
 description: No includes here
@@ -4057,24 +6252,64 @@ nodes:
       expect(err?.error).toContain('not found');
     });
 
-    it('should warn when an included block drops meaningful workflow-level fields', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
+    it("rejects 'mutates_checkout' on an include node, naming workflow level and workflow:", async () => {
+      // The one launch-only option the schema cannot see — it is workflow-level, so Zod
+      // strips it before superRefine runs (#1764 Task 8).
+      await writeWorkflowFile(
+        testDir,
+        'mc-block.yaml',
+        `name: mc-block\ndescription: b\nnodes:\n  - id: work\n    prompt: work\n`
+      );
+      await writeWorkflowFile(
+        testDir,
+        'mc-parent.yaml',
+        `name: mc-parent\ndescription: p\nnodes:\n  - id: sub\n    include: mc-block\n    mutates_checkout: false\n`
+      );
 
-      await writeFile(
-        join(workflowDir, 'gated-block.yaml'),
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      const err = result.errors.find(e => e.filename === 'mc-parent.yaml');
+      expect(err?.error).toContain("'mutates_checkout' is not supported on an include node");
+      expect(err?.error).toContain("'workflow:' node");
+      expect(result.workflows.some(w => w.workflow.name === 'mc-parent')).toBe(false);
+    });
+
+    it("rejects a node-level 'mutates_checkout' on a composed fan-out", async () => {
+      await writeWorkflowFile(
+        testDir,
+        'mc-fan-block.yaml',
+        `name: mc-fan-block\ndescription: b\ninputs:\n  item: { required: true }\nnodes:\n  - id: work\n    bash: echo work\n`
+      );
+      await writeWorkflowFile(
+        testDir,
+        'mc-fan-parent.yaml',
+        `name: mc-fan-parent\ndescription: p\nnodes:\n  - id: items\n    bash: 'echo ["a"]'\n  - id: fan\n    include: mc-fan-block\n    depends_on: [items]\n    mutates_checkout: false\n    fan_out:\n      items: "$items.output"\n      as: item\n`
+      );
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      const err = result.errors.find(e => e.filename === 'mc-fan-parent.yaml');
+      expect(err?.error).toContain('share its checkout');
+      expect(err?.error).toContain('fan_out.max_parallel: 1');
+    });
+
+    it('warns only about the RUN-owned fields a composed workflow cannot carry', async () => {
+      await writeWorkflowFile(
+        testDir,
+        'gated-block.yaml',
         `
 name: gated-block
-description: A block that declares workflow-level fields (dropped on inline)
+description: A block whose node config travels but whose run config cannot
 provider: claude
 requires: [github]
+worktree:
+  enabled: true
 nodes:
   - id: work
     prompt: "do the work"
 `
       );
-      await writeFile(
-        join(workflowDir, 'parent.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'parent.yaml',
         `
 name: parent
 description: Includes the gated block
@@ -4102,27 +6337,49 @@ nodes:
         safetyNote?: string;
       };
       expect(payload.include).toBe('sub');
-      expect(payload.droppedFields).toContain('provider');
-      expect(payload.droppedFields).toContain('requires');
+      // Run-owned: whoever starts the run decides these, so the composed file's
+      // values cannot apply and the author gets told.
+      expect(payload.droppedFields).toContain('worktree');
+      // Node-affecting: `provider` travelled onto the block's own nodes (#1764), so
+      // reporting it as dropped would now be a lie.
+      expect(payload.droppedFields).not.toContain('provider');
+      // `requires:` is unioned into the composing workflow's gate, not dropped.
+      expect(payload.droppedFields).not.toContain('requires');
+      expect(payload.requiresNote).toBeUndefined();
       // The always-present-but-undefined keys parseWorkflow emits are filtered out, so a
       // generic key derivation must NOT report them as dropped.
       expect(payload.droppedFields).not.toContain('model');
-      expect(payload.droppedFields).not.toContain('interactive');
-      // requires:[github] gets its explicit callout; no safety fields here.
-      expect(payload.requiresNote).toContain('github');
       expect(payload.safetyNote).toBeUndefined();
     });
 
-    it('should warn — with a safety callout — when a block drops mutates_checkout and sandbox', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
+    it("unions a composed block's requires: into the composing workflow", async () => {
+      await writeWorkflowFile(
+        testDir,
+        'gh-block.yaml',
+        `name: gh-block\ndescription: needs github\nrequires: [github]\nnodes:\n  - id: work\n    prompt: work\n`
+      );
+      await writeWorkflowFile(
+        testDir,
+        'gh-parent.yaml',
+        `name: gh-parent\ndescription: composes it\nnodes:\n  - id: sub\n    include: gh-block\n`
+      );
 
-      await writeFile(
-        join(workflowDir, 'safety-block.yaml'),
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      const parent = result.workflows.find(w => w.workflow.name === 'gh-parent');
+      // The capability gate reads this, so a user without GitHub connected is refused at
+      // invocation instead of failing mid-run inside a block the parent cannot inspect.
+      expect(parent?.workflow.requires).toEqual(['github']);
+    });
+
+    it('should warn — with a safety callout — when a block drops mutates_checkout', async () => {
+      await writeWorkflowFile(
+        testDir,
+        'safety-block.yaml',
         `
 name: safety-block
-description: A block declaring isolation/concurrency-safety fields
+description: A block declaring concurrency-safety and a field that cannot travel
 mutates_checkout: false
+webSearchMode: live
 sandbox:
   enabled: true
 nodes:
@@ -4130,8 +6387,9 @@ nodes:
     prompt: "do the work"
 `
       );
-      await writeFile(
-        join(workflowDir, 'safety-parent.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'safety-parent.yaml',
         `
 name: safety-parent
 description: Includes the safety block
@@ -4150,23 +6408,82 @@ nodes:
           (c[0] as { include?: string }).include === 'safety-sub'
       );
       expect(call).toBeDefined();
-      const payload = call![0] as { droppedFields: string[]; safetyNote?: string };
+      const payload = call![0] as {
+        droppedFields: string[];
+        safetyNote?: string;
+        webSearchModeNote?: string;
+      };
       expect(payload.droppedFields).toContain('mutates_checkout');
-      expect(payload.droppedFields).toContain('sandbox');
-      // Explicit safety callout naming BOTH.
       expect(payload.safetyNote).toContain('mutates_checkout');
-      expect(payload.safetyNote).toContain('sandbox');
+      // `sandbox:` is node-affecting and now travels onto the block's own nodes.
+      expect(payload.droppedFields).not.toContain('sandbox');
+      const work = result.workflows
+        .find(w => w.workflow.name === 'safety-parent')
+        ?.workflow.nodes.find(n => n.id === 'safety-sub__work') as
+        | Record<string, unknown>
+        | undefined;
+      expect(work?.sandbox).toEqual({ enabled: true });
+      // `webSearchMode:` is the one node-affecting field with no per-node landing spot,
+      // so it genuinely cannot travel — named explicitly rather than left to read as a
+      // run-level decision it is not.
+      expect(payload.droppedFields).toContain('webSearchMode');
+      expect(payload.webSearchModeNote).toContain('no per-node form');
+    });
+
+    it('warns that a composed fan-out drops the block mutates_checkout, like any include', async () => {
+      await writeWorkflowFile(
+        testDir,
+        'read-only-block.yaml',
+        `name: read-only-block\ndescription: Safe to run concurrently\nmutates_checkout: false\ninputs:\n  item: { required: true }\nnodes:\n  - id: work\n    bash: "echo $INPUTS.item"\n`
+      );
+      await writeWorkflowFile(
+        testDir,
+        'fan-parent.yaml',
+        `name: fan-parent\ndescription: Fans out the block\nnodes:\n  - id: list\n    bash: 'echo ["a"]'\n  - id: fan\n    include: read-only-block\n    depends_on: [list]\n    fan_out:\n      items: "$list.output"\n      as: item\n      max_parallel: 2\n`
+      );
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors.filter(e => e.filename === 'fan-parent.yaml')).toHaveLength(0);
+      const call = (mockLogger.warn as Mock<(...args: unknown[]) => unknown>).mock.calls.find(
+        c =>
+          c[1] === 'include.workflow_level_fields_dropped' &&
+          (c[0] as { include?: string }).include === 'fan'
+      );
+      expect((call?.[0] as { droppedFields?: string[] } | undefined)?.droppedFields).toContain(
+        'mutates_checkout'
+      );
+    });
+
+    it('does not warn that an included block dropped its deprecated: notice', async () => {
+      await writeWorkflowFile(
+        testDir,
+        'deprecated-block.yaml',
+        `name: deprecated-block\ndescription: Superseded block\ndeprecated:\n  message: Use the new block.\nnodes:\n  - id: work\n    bash: "echo work"\n`
+      );
+      await writeWorkflowFile(
+        testDir,
+        'deprecated-parent.yaml',
+        `name: deprecated-parent\ndescription: Includes the deprecated block\nnodes:\n  - id: old-sub\n    include: deprecated-block\n`
+      );
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors.filter(e => e.filename === 'deprecated-parent.yaml')).toHaveLength(0);
+      const call = (mockLogger.warn as Mock<(...args: unknown[]) => unknown>).mock.calls.find(
+        c =>
+          c[1] === 'include.workflow_level_fields_dropped' &&
+          (c[0] as { include?: string }).include === 'old-sub'
+      );
+      expect(call).toBeUndefined();
     });
 
     it('should compile a block command file and namespace a local sibling ref', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
       const commandsDir = join(testDir, '.archon', 'commands');
-      await mkdir(workflowDir, { recursive: true });
       await mkdir(commandsDir, { recursive: true });
 
       await writeFile(join(commandsDir, 'blk-runner.md'), 'Summarize $sib.output for the report.');
-      await writeFile(
-        join(workflowDir, 'cmd-block.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'cmd-block.yaml',
         `
 name: cmd-block
 description: Block whose command references a sibling
@@ -4178,8 +6495,9 @@ nodes:
     depends_on: [sib]
 `
       );
-      await writeFile(
-        join(workflowDir, 'cmd-parent.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'cmd-parent.yaml',
         `
 name: cmd-parent
 description: Includes the command block
@@ -4193,20 +6511,17 @@ nodes:
       expect(result.errors.filter(error => error.filename === 'cmd-parent.yaml')).toHaveLength(0);
       const parent = result.workflows.find(w => w.workflow.name === 'cmd-parent')?.workflow;
       const runner = parent?.nodes.find(node => node.id === 'rev__runner');
-      expect(runner && 'prompt' in runner ? runner.prompt : '').toBe(
-        'Summarize $rev__sib.output for the report.'
-      );
+      expect(inlinePrompt(runner) ?? '').toBe('Summarize $rev__sib.output for the report.');
     });
 
     it('should compile a resolved block command file with a declared include input', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
       const commandsDir = join(testDir, '.archon', 'commands');
-      await mkdir(workflowDir, { recursive: true });
       await mkdir(commandsDir, { recursive: true });
 
       await writeFile(join(commandsDir, 'parameterized-runner.md'), 'Review $INPUTS.scope.');
-      await writeFile(
-        join(workflowDir, 'parameterized-block.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'parameterized-block.yaml',
         `
 name: parameterized-block
 description: Block whose command references an include input
@@ -4217,8 +6532,9 @@ nodes:
     command: parameterized-runner
 `
       );
-      await writeFile(
-        join(workflowDir, 'parameterized-parent.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'parameterized-parent.yaml',
         `
 name: parameterized-parent
 description: Includes the parameterized command block
@@ -4238,21 +6554,20 @@ nodes:
         workflow => workflow.workflow.name === 'parameterized-parent'
       )?.workflow;
       const runner = parent?.nodes.find(node => node.id === 'review__runner');
-      expect(runner && 'prompt' in runner ? runner.prompt : '').toBe('Review main.');
+      expect(inlinePrompt(runner) ?? '').toBe('Review main.');
     });
 
     it('should compile block commands from a configured custom command folder', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
       const customCmds = join(testDir, 'my-cmds');
-      await mkdir(workflowDir, { recursive: true });
       await mkdir(customCmds, { recursive: true });
 
       await writeFile(
         join(customCmds, 'custom-runner.md'),
         'Summarize $sib.output for the report.'
       );
-      await writeFile(
-        join(workflowDir, 'cc-block.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'cc-block.yaml',
         `
 name: cc-block
 description: block whose command lives in a custom folder
@@ -4264,8 +6579,9 @@ nodes:
     depends_on: [sib]
 `
       );
-      await writeFile(
-        join(workflowDir, 'cc-parent.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'cc-parent.yaml',
         `
 name: cc-parent
 description: includes cc-block
@@ -4275,28 +6591,27 @@ nodes:
 `
       );
 
-      const result = await discoverWorkflowsWithConfig(testDir, () =>
-        Promise.resolve({
-          defaults: { loadDefaultWorkflows: false },
-          commands: { folder: 'my-cmds' },
-        })
+      const result = await discoverWorkflowsWithConfig(
+        testDir,
+        () =>
+          Promise.resolve({
+            defaults: { loadDefaultWorkflows: false },
+            commands: { folder: 'my-cmds' },
+          }),
+        providerRegistry
       );
       expect(result.errors.filter(error => error.filename === 'cc-parent.yaml')).toHaveLength(0);
       const parent = result.workflows.find(
         workflow => workflow.workflow.name === 'cc-parent'
       )?.workflow;
       const runner = parent?.nodes.find(node => node.id === 'rev__runner');
-      expect(runner && 'prompt' in runner ? runner.prompt : '').toBe(
-        'Summarize $rev__sib.output for the report.'
-      );
+      expect(inlinePrompt(runner) ?? '').toBe('Summarize $rev__sib.output for the report.');
     });
 
     it('should fail closed when a block command file cannot be resolved', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'ghost-block.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'ghost-block.yaml',
         `
 name: ghost-block
 description: Block whose command file does not exist on disk
@@ -4305,8 +6620,9 @@ nodes:
     command: ghost-cmd-does-not-exist-xyz
 `
       );
-      await writeFile(
-        join(workflowDir, 'ghost-parent.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'ghost-parent.yaml',
         `
 name: ghost-parent
 description: Includes the ghost block
@@ -4325,13 +6641,12 @@ nodes:
     });
 
     it('should compile an included loop.command file with declared inputs', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
       const commandDir = join(testDir, '.archon', 'commands');
-      await mkdir(workflowDir, { recursive: true });
       await mkdir(commandDir, { recursive: true });
       await writeFile(join(commandDir, 'loop-review.md'), 'Review $INPUTS.scope.');
-      await writeFile(
-        join(workflowDir, 'loop-block.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'loop-block.yaml',
         `
 name: loop-block
 description: Block with a deferred loop prompt
@@ -4345,8 +6660,9 @@ nodes:
       max_iterations: 1
 `
       );
-      await writeFile(
-        join(workflowDir, 'loop-parent.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'loop-parent.yaml',
         `
 name: loop-parent
 description: Includes the loop block
@@ -4369,7 +6685,9 @@ nodes:
           ? (repeat.loop as typeof repeat.loop & LoopWithCompiledCommand)[COMPILED_LOOP_COMMAND]
           : undefined;
       expect(compiled?.prompt).toBe('Review production.');
-      expect(repeat && 'loop' in repeat ? repeat.loop.command : undefined).toBe('loop-review');
+      expect(repeat && 'loop' in repeat && repeat.loop ? repeat.loop.command : undefined).toBe(
+        'loop-review'
+      );
     });
   });
 
@@ -4378,11 +6696,9 @@ nodes:
   // -------------------------------------------------------------------------
   describe('cancel nodes', () => {
     it('should parse a valid cancel node', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'cancel-test.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'cancel-test.yaml',
         `
 name: cancel-test
 description: Cancel node test
@@ -4398,19 +6714,19 @@ nodes:
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.errors).toHaveLength(0);
       const wf = result.workflows[0].workflow;
-      expect(wf.nodes).toHaveLength(2);
-      expect(isCancelNode(wf.nodes[1])).toBe(true);
-      if (isCancelNode(wf.nodes[1])) {
-        expect(wf.nodes[1].cancel).toBe('Precondition failed');
+      const nodes = wf.nodes as DagNode[];
+      expect(nodes).toHaveLength(2);
+      const node1 = nodes[1];
+      expect(isHaltNode(node1)).toBe(true);
+      if (isHaltNode(node1)) {
+        expect(node1.reason).toBe('Precondition failed');
       }
     });
 
     it('should reject cancel node with empty reason', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'cancel-empty.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'cancel-empty.yaml',
         `
 name: cancel-empty
 description: Empty cancel
@@ -4425,11 +6741,9 @@ nodes:
     });
 
     it('should reject node with both cancel and prompt', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'cancel-prompt.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'cancel-prompt.yaml',
         `
 name: cancel-prompt-conflict
 description: Cancel + prompt conflict
@@ -4446,11 +6760,9 @@ nodes:
     });
 
     it('should warn about AI-specific fields on cancel nodes', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-
-      await writeFile(
-        join(workflowDir, 'cancel-ai-fields.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'cancel-ai-fields.yaml',
         `
 name: cancel-ai-fields
 description: Cancel with AI fields
@@ -4464,8 +6776,9 @@ nodes:
 
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.errors).toHaveLength(0);
-      // AI fields should produce a warning log
-      expect(mockLogger.warn).toHaveBeenCalled();
+      expect(result.workflows[0].parseWarnings?.[0]).toContain(
+        "'provider', 'model' are not supported"
+      );
     });
   });
 
@@ -4507,33 +6820,445 @@ nodes:
       // project context — running loadConfig with no cwd would silently apply
       // home-dir or working-dir defaults to a request that has neither.
       const mockLoadConfig = mock(async () => ({ defaults: { loadDefaultWorkflows: true } }));
-      await discoverWorkflowsWithConfig(null, mockLoadConfig);
+      await discoverWorkflowsWithConfig(null, mockLoadConfig, providerRegistry);
       expect(mockLoadConfig).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('scalar shared session context', () => {
+    function parseSessionContext(yaml: string): ParseResult {
+      return parseWorkflow(yaml, 'session-context.yaml');
+    }
+
+    it('rejects scalar shared on a node in a structurally parallel layer', () => {
+      const result = parseSessionContext(`
+name: parallel-shared
+description: parallel shared
+nodes:
+  - id: source
+    prompt: source
+  - id: shared
+    prompt: continue
+    depends_on: [source]
+    context: shared
+  - id: sibling
+    prompt: independent
+    depends_on: [source]
+`);
+
+      expect(result.error?.error).toContain(
+        "Node 'shared' uses scalar context: 'shared' in a structurally parallel layer"
+      );
+      expect(result.error?.error).toContain('context: { resume: <upstream-node-id> }');
+      expect(result.error?.error).toContain('depends_on');
+    });
+
+    it('rejects scalar shared when parallel sibling conditions appear mutually exclusive', () => {
+      const result = parseSessionContext(`
+name: conditional-parallel-shared
+description: conditional parallel shared
+nodes:
+  - id: choice
+    bash: echo left
+  - id: left
+    prompt: continue left
+    depends_on: [choice]
+    when: "$choice.output == 'left'"
+    context: shared
+  - id: right
+    prompt: start right
+    depends_on: [choice]
+    when: "$choice.output == 'right'"
+`);
+
+      expect(result.error?.error).toContain(
+        "Node 'left' uses scalar context: 'shared' in a structurally parallel layer"
+      );
+    });
+
+    it('accepts scalar shared in a sequential chain', () => {
+      const result = parseSessionContext(`
+name: sequential-shared
+description: sequential shared
+nodes:
+  - id: source
+    prompt: source
+  - id: continuation
+    prompt: continue
+    depends_on: [source]
+    context: shared
+`);
+
+      expect(result.error).toBeNull();
+    });
+
+    it('accepts named resume in a structurally parallel layer', () => {
+      const result = parseSessionContext(`
+name: parallel-named-resume
+description: parallel named resume
+provider: claude
+nodes:
+  - id: source
+    prompt: source
+  - id: continuation
+    prompt: continue
+    depends_on: [source]
+    context: { resume: source }
+  - id: sibling
+    prompt: independent
+    depends_on: [source]
+`);
+
+      expect(result.error).toBeNull();
+    });
+
+    it('rejects scalar shared in a structurally parallel loop_group body', () => {
+      const result = parseSessionContext(`
+name: loop-group-parallel-shared
+description: loop group parallel shared
+nodes:
+  - id: group
+    loop_group:
+      until: DONE
+      max_iterations: 2
+      nodes:
+        - id: source
+          prompt: source
+        - id: shared
+          prompt: continue
+          depends_on: [source]
+          context: shared
+        - id: sibling
+          prompt: independent
+          depends_on: [source]
+`);
+
+      expect(result.error?.error).toContain("loop_group 'group' body: Node 'shared'");
+      expect(result.error?.error).toContain('pre-loop-node-id');
+      expect(result.error?.error).toContain('depends_on');
+    });
+  });
+
+  describe('addressable session resume', () => {
+    function parseAddressable(yaml: string): ParseResult {
+      return parseWorkflow(yaml, 'addressable.yaml');
+    }
+
+    it('accepts transitively upstream command, prompt, and plain loop sources', () => {
+      const result = parseAddressable(`
+name: addressable
+description: addressable sessions
+provider: claude
+nodes:
+  - id: command-source
+    command: scope
+  - id: prompt-source
+    prompt: review
+    depends_on: [command-source]
+  - id: loop-source
+    loop:
+      prompt: refine
+      until: DONE
+      max_iterations: 2
+    depends_on: [prompt-source]
+  - id: consumer
+    prompt: synthesize
+    depends_on: [loop-source]
+    context:
+      resume: command-source
+`);
+      expect(result.error).toBeNull();
+      expect((result.workflow?.nodes as DagNode[] | undefined)?.at(-1)?.context).toEqual({
+        resume: 'command-source',
+      });
+    });
+
+    for (const [label, sourceNode] of [
+      ['bash', '  - id: source\n    bash: echo scope'],
+      ['script', '  - id: source\n    script: console.log(1)\n    runtime: bun'],
+      ['approval', "  - id: source\n    approval:\n      message: 'Approve?'"],
+      ['workflow', '  - id: source\n    workflow: child'],
+    ] as const) {
+      it(`rejects a ${label} source`, () => {
+        const result = parseAddressable(`
+name: bad-source
+description: bad source
+provider: claude
+nodes:
+${sourceNode}
+  - id: consumer
+    prompt: continue
+    depends_on: [source]
+    context: { resume: source }
+`);
+        expect(result.error?.error).toContain('not a session-producing command, prompt, or loop');
+      });
+    }
+
+    it('rejects missing, self, downstream, and sibling sources', () => {
+      const missing = parseAddressable(`
+name: missing
+description: missing
+nodes:
+  - id: consumer
+    prompt: continue
+    context: { resume: ghost }
+`);
+      expect(missing.error?.error).toContain("references unknown node 'ghost'");
+
+      const self = parseAddressable(`
+name: self
+description: self
+nodes:
+  - id: consumer
+    prompt: continue
+    context: { resume: consumer }
+`);
+      expect(self.error?.error).toContain('not an upstream dependency');
+
+      const downstream = parseAddressable(`
+name: downstream
+description: downstream
+nodes:
+  - id: consumer
+    prompt: continue
+    context: { resume: later }
+  - id: later
+    prompt: later
+    depends_on: [consumer]
+`);
+      expect(downstream.error?.error).toContain('not an upstream dependency');
+
+      const sibling = parseAddressable(`
+name: sibling
+description: sibling
+nodes:
+  - id: source
+    prompt: source
+  - id: consumer
+    prompt: continue
+    context: { resume: source }
+`);
+      expect(sibling.error?.error).toContain('not an upstream dependency');
+    });
+
+    it('accepts a named pre-loop owner and rejects unordered and non-session sources', () => {
+      const workflow = (source: string, dependencies = '[source]') => `
+name: owners
+description: owners
+nodes:
+  - id: source
+    ${source}
+  - id: corrections
+    depends_on: ${dependencies}
+    loop_group:
+      until_bash: 'test $review.output.done = true'
+      max_iterations: 3
+      nodes:
+        - id: owner
+          prompt: correct
+          context: { resume: source }
+        - id: review
+          prompt: review
+          context: fresh
+          depends_on: [owner]
+          output_format:
+            type: object
+            properties:
+              done: { type: boolean }
+            required: [done]
+`;
+      expect(parseAddressable(workflow('prompt: implement')).error).toBeNull();
+      expect(parseAddressable(workflow('command: implement')).error).toBeNull();
+      expect(parseAddressable(workflow('prompt: implement', '[]')).error?.error).toContain(
+        'upstream dependency'
+      );
+      expect(parseAddressable(workflow('bash: echo ready')).error?.error).toContain(
+        'not a session-producing'
+      );
+      expect(
+        parseAddressable(
+          workflow('prompt: implement\n    provider: claude').replace(
+            'prompt: correct',
+            'prompt: correct\n          provider: codex'
+          )
+        ).error?.error
+      ).toContain("consumer uses 'codex'");
+    });
+
+    it('proves nested ancestry at each enclosing group entry with provider defaults', () => {
+      const yaml = `
+name: nested-owner
+description: nested owner
+provider: claude
+nodes:
+  - id: source
+    loop: { prompt: implement, until: DONE, max_iterations: 1 }
+  - id: outer
+    depends_on: [source]
+    loop_group:
+      until_bash: exit 0
+      max_iterations: 2
+      nodes:
+        - id: local
+          prompt: local
+        - id: inner
+          depends_on: [local]
+          loop_group:
+            until_bash: exit 0
+            max_iterations: 2
+            nodes:
+              - id: owner
+                prompt: owner
+                context: { resume: local }
+              - id: ancestor-owner
+                prompt: owner
+                context: { resume: source }
+`;
+      expect(parseAddressable(yaml).error).toBeNull();
+      expect(
+        parseAddressable(yaml.replace('depends_on: [local]', 'depends_on: []')).error?.error
+      ).toContain('upstream dependency');
+      expect(
+        parseAddressable(yaml.replace('depends_on: [source]', 'depends_on: []')).error?.error
+      ).toContain('upstream dependency');
+      expect(
+        parseAddressable(yaml.replace('id: outer', 'id: outer\n    provider: codex')).error?.error
+      ).toContain("consumer uses 'codex'");
+    });
+
+    it('rejects named resume from the same loop_group body', () => {
+      const result = parseAddressable(`
+name: nested
+description: nested
+nodes:
+  - id: group
+    loop_group:
+      until: DONE
+      max_iterations: 2
+      nodes:
+        - id: source
+          prompt: source
+        - id: consumer
+          prompt: continue
+          depends_on: [source]
+          context: { resume: source }
+`);
+      expect(result.error?.error).toContain('inside the same loop_group body');
+    });
+
+    it('rejects statically mismatched and fork-incapable providers', () => {
+      const mismatch = parseAddressable(`
+name: mismatch
+description: mismatch
+nodes:
+  - id: source
+    prompt: source
+    provider: claude
+  - id: consumer
+    prompt: continue
+    provider: codex
+    depends_on: [source]
+    context: { resume: source }
+`);
+      expect(mismatch.error?.error).toContain("source 'source' uses provider 'claude'");
+      expect(mismatch.error?.error).toContain("consumer uses 'codex'");
+
+      registerCommunityProviders();
+      try {
+        const incapable = parseAddressable(`
+name: incapable
+description: incapable
+provider: copilot
+nodes:
+  - id: source
+    prompt: source
+  - id: consumer
+    prompt: continue
+    depends_on: [source]
+    context: { resume: source }
+`);
+        expect(incapable.error?.error).toContain("provider 'copilot' does not support sessionFork");
+      } finally {
+        clearRegistry();
+        registerBuiltinProviders();
+      }
+    });
+
+    it('defers implicit provider resolution to runtime', () => {
+      const result = parseAddressable(`
+name: implicit
+description: implicit
+nodes:
+  - id: source
+    prompt: source
+  - id: consumer
+    prompt: continue
+    depends_on: [source]
+    context: { resume: source }
+`);
+      expect(result.error).toBeNull();
     });
   });
 
   describe('persist_session capability gating', () => {
     it('parses persist_session: true on a node', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
       const yaml = `name: t\ndescription: t\nprovider: claude\nnodes:\n  - id: planner\n    prompt: p\n    persist_session: true\n`;
-      await writeFile(join(workflowDir, 't.yaml'), yaml);
+      await writeWorkflowFile(testDir, 't.yaml', yaml);
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.errors).toEqual([]);
       const node = result.workflows[0].workflow.nodes[0];
       expect('persist_session' in node ? node.persist_session : undefined).toBe(true);
     });
 
-    it('parses persist_sessions: true at workflow root', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-      const yaml = `name: t\ndescription: t\nprovider: claude\npersist_sessions: true\nnodes:\n  - id: planner\n    prompt: p\n`;
-      await writeFile(join(workflowDir, 't.yaml'), yaml);
+    it('parses persist_sessions: true at workflow root', () => {
+      const { workflow } = parseWorkflowYaml(
+        `name: t\ndescription: t\nprovider: claude\npersist_sessions: true\nnodes:\n  - id: planner\n    prompt: p\n`
+      );
+      expect(workflow.persist_sessions).toBe(true);
+    });
+
+    it('collapses persist_sessions onto AI nodes only, so composition preserves it', async () => {
+      // The workflow-level default is what the executor's `nodeUsesPersistedScope`
+      // reads for a node with no `persist_session:` of its own. Once composition
+      // removes the workflow-level layer (#1764) the default has to have landed on
+      // the nodes that can use it — and NOT on the ones that cannot, or the loader's
+      // capability gate and the executor's predicate disagree about the same file.
+      await writeWorkflowFile(
+        testDir,
+        'persist.yaml',
+        `name: persist-collapse\ndescription: t\nprovider: claude\npersist_sessions: true\nnodes:\n  - id: planner\n    prompt: p\n  - id: shell\n    bash: echo hi\n`
+      );
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.errors).toEqual([]);
-      expect(
-        (result.workflows[0].workflow as { persist_sessions?: boolean }).persist_sessions
-      ).toBe(true);
+      const expanded = result.workflows[0].workflow;
+      expect(expanded.persist_sessions).toBeUndefined();
+      const byId = new Map((expanded.nodes as DagNode[]).map(n => [n.id, n]));
+      expect(byId.get('planner')?.persist_session).toBe(true);
+      expect(byId.get('shell')?.persist_session).toBeUndefined();
+    });
+
+    it('does NOT collapse persist_sessions into a loop_group body', async () => {
+      // A body runs in a context the executor builds with `workflowPersistSessions: false`,
+      // so the workflow-level default has never reached it. `nodeUsesPersistedScope` reads
+      // the NODE value first, so pushing it here would override that deliberate false and
+      // grant a body cross-run persistence it never had — and could trip the runtime
+      // sessionResume guard on a provider that lacks it.
+      await writeWorkflowFile(
+        testDir,
+        'lg-persist.yaml',
+        `name: lg-persist\ndescription: t\nprovider: claude\npersist_sessions: true\nnodes:\n  - id: group\n    loop_group:\n      until: DONE\n      max_iterations: 2\n      nodes:\n        - id: body\n          prompt: p\n  - id: after\n    prompt: p\n`
+      );
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toEqual([]);
+      const nodes = result.workflows[0].workflow.nodes as DagNode[];
+      const group = nodes.find(n => n.id === 'group');
+      expect(group && isLoopGroupNode(group)).toBe(true);
+      const body = group && isLoopGroupNode(group) ? group.loop_group.nodes[0] : undefined;
+      expect(body).toBeDefined();
+      expect((body as DagNode | undefined)?.persist_session).toBeUndefined();
+      // The top-level AI node still receives it — only the body is excluded.
+      expect(nodes.find(n => n.id === 'after')?.persist_session).toBe(true);
     });
 
     it('does NOT capability-check non-AI nodes when persist_sessions is workflow-level', async () => {
@@ -4546,52 +7271,66 @@ nodes:
         id: 'no-resume-skip-test',
         displayName: 'No Resume Skip Test',
         builtIn: false,
-        credentials: { kind: 'static', specs: [] },
+        credentials: { kind: 'static', specs: [], vendorFor: () => undefined },
+        parseConfig: (raw: ProviderDefaults): ProviderDefaults => raw,
         capabilities: {
+          backgroundWork: 'unobserved' as const,
           sessionResume: false,
           mcp: false,
           hooks: false,
           skills: false,
+          plugins: false,
           agents: false,
           toolRestrictions: false,
           structuredOutput: false,
           envInjection: false,
           costControl: false,
+          costReporting: false,
           effortControl: false,
-          thinkingControl: false,
           fallbackModel: false,
           sandbox: false,
+          settingSources: false,
+          nativeTools: false,
+          containerExec: false,
+          requiresAllPropertiesRequired: false,
         },
         factory: () => ({
+          checkCredential: async () => ({
+            state: 'not_checked' as const,
+            source: 'native' as const,
+          }),
           getType: () => 'no-resume-skip-test',
           getCapabilities: () => ({
+            backgroundWork: 'unobserved' as const,
             sessionResume: false,
             mcp: false,
             hooks: false,
             skills: false,
+            plugins: false,
             agents: false,
             toolRestrictions: false,
             structuredOutput: false,
             envInjection: false,
             costControl: false,
+            costReporting: false,
             effortControl: false,
-            thinkingControl: false,
             fallbackModel: false,
             sandbox: false,
+            settingSources: false,
+            nativeTools: false,
+            containerExec: false,
+            requiresAllPropertiesRequired: false,
           }),
-          // eslint-disable-next-line require-yield
           async *sendQuery() {
             return;
           },
         }),
       });
       try {
-        const workflowDir = join(testDir, '.archon', 'workflows');
-        await mkdir(workflowDir, { recursive: true });
         // Workflow opts in at root; the only node is bash. Should LOAD CLEAN because
         // bash never invokes a provider session.
         const yaml = `name: t\ndescription: t\nprovider: no-resume-skip-test\npersist_sessions: true\nnodes:\n  - id: build\n    bash: 'echo hello'\n`;
-        await writeFile(join(workflowDir, 't.yaml'), yaml);
+        await writeWorkflowFile(testDir, 't.yaml', yaml);
         const result = await discoverWorkflows(testDir, { loadDefaults: false });
         expect(result.errors).toEqual([]);
         expect(result.workflows.length).toBe(1);
@@ -4599,6 +7338,29 @@ nodes:
         clearRegistry();
         registerBuiltinProviders();
       }
+    });
+
+    it('warns, and still loads, when the provider cannot fork the persisted session', () => {
+      registerCommunityProviders();
+      try {
+        const copilot = parseWorkflow(
+          `name: t\ndescription: t\nprovider: copilot\npersist_sessions: true\nnodes:\n  - id: planner\n    prompt: p\n`,
+          't.yaml'
+        );
+        expect(copilot.error).toBeNull();
+        expect(copilot.warnings?.filter(w => w.includes('cannot fork a session'))).toEqual([
+          expect.stringContaining("Node 'planner'"),
+        ]);
+      } finally {
+        clearRegistry();
+        registerBuiltinProviders();
+      }
+
+      const claude = parseWorkflow(
+        `name: t\ndescription: t\nprovider: claude\npersist_sessions: true\nnodes:\n  - id: planner\n    prompt: p\n`,
+        't.yaml'
+      );
+      expect(claude.warnings?.some(w => w.includes('cannot fork a session'))).toBe(false);
     });
 
     it('rejects persist_session: true on a provider without sessionResume', async () => {
@@ -4609,50 +7371,64 @@ nodes:
         id: 'no-resume-test',
         displayName: 'No Resume Test',
         builtIn: false,
-        credentials: { kind: 'static', specs: [] },
+        credentials: { kind: 'static', specs: [], vendorFor: () => undefined },
+        parseConfig: (raw: ProviderDefaults): ProviderDefaults => raw,
         capabilities: {
+          backgroundWork: 'unobserved' as const,
           sessionResume: false,
           mcp: false,
           hooks: false,
           skills: false,
+          plugins: false,
           agents: false,
           toolRestrictions: false,
           structuredOutput: false,
           envInjection: false,
           costControl: false,
+          costReporting: false,
           effortControl: false,
-          thinkingControl: false,
           fallbackModel: false,
           sandbox: false,
+          settingSources: false,
+          nativeTools: false,
+          containerExec: false,
+          requiresAllPropertiesRequired: false,
         },
         factory: () => ({
+          checkCredential: async () => ({
+            state: 'not_checked' as const,
+            source: 'native' as const,
+          }),
           getType: () => 'no-resume-test',
           getCapabilities: () => ({
+            backgroundWork: 'unobserved' as const,
             sessionResume: false,
             mcp: false,
             hooks: false,
             skills: false,
+            plugins: false,
             agents: false,
             toolRestrictions: false,
             structuredOutput: false,
             envInjection: false,
             costControl: false,
+            costReporting: false,
             effortControl: false,
-            thinkingControl: false,
             fallbackModel: false,
             sandbox: false,
+            settingSources: false,
+            nativeTools: false,
+            containerExec: false,
+            requiresAllPropertiesRequired: false,
           }),
-          // eslint-disable-next-line require-yield
           async *sendQuery() {
             return;
           },
         }),
       });
       try {
-        const workflowDir = join(testDir, '.archon', 'workflows');
-        await mkdir(workflowDir, { recursive: true });
         const yaml = `name: t\ndescription: t\nprovider: no-resume-test\nnodes:\n  - id: planner\n    prompt: p\n    persist_session: true\n`;
-        await writeFile(join(workflowDir, 't.yaml'), yaml);
+        await writeWorkflowFile(testDir, 't.yaml', yaml);
         const result = await discoverWorkflows(testDir, { loadDefaults: false });
         expect(result.workflows).toEqual([]);
         expect(result.errors.length).toBeGreaterThan(0);
@@ -4667,8 +7443,6 @@ nodes:
 
   describe('unknown key warnings (#2213)', () => {
     it('should warn when a node has an unknown key', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
       const yaml = [
         'name: test',
         'description: test',
@@ -4677,7 +7451,7 @@ nodes:
         '    command: my-command',
         '    unknown_field: true',
       ].join('\n');
-      await writeFile(join(workflowDir, 'test.yaml'), yaml);
+      await writeWorkflowFile(testDir, 'test.yaml', yaml);
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.workflows.length).toBe(1);
       const pw = result.workflows[0].parseWarnings ?? [];
@@ -4687,8 +7461,6 @@ nodes:
     });
 
     it('should hint when a workflow-level key is misplaced on a node', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
       // 'interactive' is valid at workflow level but not on individual nodes
       const yaml = [
         'name: test',
@@ -4698,23 +7470,18 @@ nodes:
         '    command: my-command',
         '    interactive: true',
       ].join('\n');
-      await writeFile(join(workflowDir, 'test.yaml'), yaml);
+      await writeWorkflowFile(testDir, 'test.yaml', yaml);
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.workflows.length).toBe(1);
       const pw = result.workflows[0].parseWarnings ?? [];
       expect(pw.length).toBe(1);
       expect(pw[0]).toContain("'interactive'");
-      // The hint must name BOTH loop fields: the executor gates on
-      // `loop.interactive && loop.gate_message`, so an author who follows a
-      // gate_message-only hint gets a loop with a message and no gate.
-      expect(pw[0]).toContain('loop.interactive: true');
-      expect(pw[0]).toContain('gate_message');
-      expect(pw[0]).toContain('approval:');
+      // The hint names the attention wait, never a deprecated channel.
+      expect(pw[0]).toContain('wait: { attention: <message> }');
+      expect(pw[0]).not.toContain('approval:');
     });
 
     it('should warn when the workflow itself has an unknown key', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
       const yaml = [
         'name: test',
         'description: test',
@@ -4723,7 +7490,7 @@ nodes:
         '  - id: n',
         '    prompt: p',
       ].join('\n');
-      await writeFile(join(workflowDir, 'test.yaml'), yaml);
+      await writeWorkflowFile(testDir, 'test.yaml', yaml);
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.workflows.length).toBe(1);
       const pw = result.workflows[0].parseWarnings ?? [];
@@ -4732,8 +7499,6 @@ nodes:
     });
 
     it('should not warn for valid node keys', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
       const yaml = [
         'name: test',
         'description: test',
@@ -4743,7 +7508,7 @@ nodes:
         '    model: some-model',
         '    context: fresh',
       ].join('\n');
-      await writeFile(join(workflowDir, 'test.yaml'), yaml);
+      await writeWorkflowFile(testDir, 'test.yaml', yaml);
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.workflows.length).toBe(1);
       const pw = result.workflows[0].parseWarnings ?? [];
@@ -4751,8 +7516,6 @@ nodes:
     });
 
     it('should collect warnings from multiple nodes', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
       const yaml = [
         'name: test',
         'description: test',
@@ -4764,7 +7527,7 @@ nodes:
         '    bash: echo hi',
         '    another_typo: 2',
       ].join('\n');
-      await writeFile(join(workflowDir, 'test.yaml'), yaml);
+      await writeWorkflowFile(testDir, 'test.yaml', yaml);
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.workflows.length).toBe(1);
       const pw = result.workflows[0].parseWarnings ?? [];
@@ -4774,8 +7537,6 @@ nodes:
     });
 
     it('should hint when a node-only key is misplaced at workflow level', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
       // 'command' is valid on nodes but not at workflow level
       const yaml = [
         'name: test',
@@ -4785,7 +7546,7 @@ nodes:
         '  - id: n',
         '    prompt: p',
       ].join('\n');
-      await writeFile(join(workflowDir, 'test.yaml'), yaml);
+      await writeWorkflowFile(testDir, 'test.yaml', yaml);
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.workflows.length).toBe(1);
       const pw = result.workflows[0].parseWarnings ?? [];
@@ -4798,9 +7559,7 @@ nodes:
   describe('unknown key warnings — nested (#2213)', () => {
     /** Write a single workflow and return its parse warnings. */
     const warningsFor = async (lines: string[]): Promise<string[]> => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-      await writeFile(join(workflowDir, 'test.yaml'), lines.join('\n'));
+      await writeWorkflowFile(testDir, 'test.yaml', lines.join('\n'));
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.workflows.length).toBe(1);
       return [...(result.workflows[0].parseWarnings ?? [])];
@@ -4816,9 +7575,10 @@ nodes:
         '      message: ok?',
         '      capture_reponse: true', // typo for capture_response
       ]);
-      expect(pw.length).toBe(1);
-      expect(pw[0]).toContain("Node 'gate'");
-      expect(pw[0]).toContain("unknown key 'approval.capture_reponse'");
+      const unknownKeyWarnings = pw.filter(w => w.includes('unknown key'));
+      expect(unknownKeyWarnings.length).toBe(1);
+      expect(unknownKeyWarnings[0]).toContain("Node 'gate'");
+      expect(unknownKeyWarnings[0]).toContain("unknown key 'approval.capture_reponse'");
     });
 
     it('should warn on an unknown key inside approval.on_reject (two levels down)', async () => {
@@ -4833,8 +7593,12 @@ nodes:
         '        prompt: try again',
         '        max_retries: 2', // real field is max_attempts
       ]);
-      expect(pw.length).toBe(1);
-      expect(pw[0]).toContain("unknown key 'approval.on_reject.max_retries'");
+      // Also carries the on_reject deprecation warning — the unknown-key warning
+      // under test is asserted independently of it.
+      const unknownKeyWarnings = pw.filter(w => w.includes('unknown key'));
+      expect(unknownKeyWarnings.length).toBe(1);
+      expect(unknownKeyWarnings[0]).toContain("unknown key 'approval.on_reject.max_retries'");
+      expect(pw.some(w => w.includes("'approval.on_reject' and '$REJECTION_REASON'"))).toBe(true);
     });
 
     it('should warn on an unknown key inside retry:', async () => {
@@ -4850,6 +7614,49 @@ nodes:
       ]);
       expect(pw.length).toBe(1);
       expect(pw[0]).toContain("unknown key 'retry.backoff_ms'");
+    });
+
+    it('should warn on an unknown key inside context:', async () => {
+      const pw = await warningsFor([
+        'name: test',
+        'description: test',
+        'nodes:',
+        '  - id: source',
+        '    prompt: source',
+        '  - id: consumer',
+        '    prompt: consumer',
+        '    depends_on: [source]',
+        '    context:',
+        '      resume: source',
+        '      fork: false',
+      ]);
+      expect(pw.length).toBe(1);
+      expect(pw[0]).toContain("unknown key 'context.fork'");
+    });
+
+    it('should accept every strict wait key at the nested warning boundary', async () => {
+      const pw = await warningsFor([
+        'name: test',
+        'description: test',
+        'nodes:',
+        '  - id: duration',
+        '    wait:',
+        '      duration_ms: 1000',
+        '  - id: until',
+        '    depends_on: [duration]',
+        '    wait:',
+        "      until: '2026-09-01T12:00:00Z'",
+        '  - id: event',
+        '    depends_on: [until]',
+        '    wait:',
+        '      event: checks.complete',
+        '      deadline_ms: 60000',
+        '  - id: attention',
+        '    depends_on: [event]',
+        '    wait:',
+        '      attention: Re-run CI, then resume.',
+      ]);
+      expect(pw).toEqual([]);
     });
 
     it('should warn on an unknown key inside an agents entry', async () => {
@@ -4878,7 +7685,7 @@ nodes:
         'nodes:',
         '  - id: refine',
         '    loop_group:',
-        '      until: DONE',
+        '      until_bash: "exit 0"',
         '      max_iterations: 3',
         '      nodes:',
         '        - id: check',
@@ -4889,7 +7696,7 @@ nodes:
       expect(pw[0]).toContain("Node 'refine' → loop_group node 'check'");
       expect(pw[0]).toContain("unknown key 'interactive'");
       // The body node gets the same actionable guidance as a top-level node.
-      expect(pw[0]).toContain('loop.interactive: true');
+      expect(pw[0]).toContain('wait: { attention: <message> }');
     });
 
     it('should warn on an unknown key inside the loop_group control block', async () => {
@@ -4899,7 +7706,7 @@ nodes:
         'nodes:',
         '  - id: refine',
         '    loop_group:',
-        '      until: DONE',
+        '      until_bash: "exit 0"',
         '      max_iterations: 3',
         '      max_attempts: 4', // not a loop control field
         '      nodes:',
@@ -4954,7 +7761,18 @@ nodes:
         '        prompt: again',
         '        max_attempts: 2',
       ]);
-      expect(pw).toEqual([]);
+      // Every key used here IS valid — none should trip the unknown-key check
+      // this describe block covers. The interactive loop, `on_reject`,
+      // `capture_response` and the prose `until:` channel are deliberately
+      // deprecated, so this fixture legitimately produces THOSE warnings too,
+      // asserted in their own describe block below.
+      expect(pw.some(w => w.includes('unknown key'))).toBe(false);
+      expect(pw).toEqual([
+        expect.stringContaining("Node 'refine': the prose 'loop_group.until' completion signal"),
+        expect.stringContaining("Node 'refine': loop 'interactive:'"),
+        expect.stringContaining("Node 'gate': 'approval.on_reject'"),
+        expect.stringContaining("Node 'gate': 'approval.capture_response'"),
+      ]);
     });
 
     it('should not treat free-form output_format keys as unknown', async () => {
@@ -4972,22 +7790,47 @@ nodes:
       ]);
       expect(pw).toEqual([]);
     });
+  });
 
-    it('should not treat a thinking: config as an unknown-key surface', async () => {
-      // `thinking` is a z.preprocess over a union, not an object shape — there
-      // is nothing to compare keys against, so it must stay exempt rather than
-      // warning on its own legitimate fields.
-      const pw = await warningsFor([
+  describe('deprecated marker (#2781)', () => {
+    /** Write a single workflow and return its parsed definition + warnings. */
+    const parseSingle = async (lines: string[]) => {
+      await writeWorkflowFile(testDir, 'test.yaml', lines.join('\n'));
+      return discoverWorkflows(testDir, { loadDefaults: false });
+    };
+
+    it('parses a declared deprecation cleanly and keeps the field', async () => {
+      const result = await parseSingle([
         'name: test',
         'description: test',
+        'deprecated:',
+        '  message: Switch to the sdlc pack instead.',
         'nodes:',
         '  - id: n',
-        '    prompt: hello',
-        '    thinking:',
-        '      type: enabled',
-        '      budgetTokens: 4096',
+        '    prompt: p',
       ]);
-      expect(pw).toEqual([]);
+      expect(result.workflows.length).toBe(1);
+      expect(result.errors).toEqual([]);
+      expect(result.workflows[0].parseWarnings).toBeUndefined();
+      expect(result.workflows[0].workflow.deprecated?.message).toBe(
+        'Switch to the sdlc pack instead.'
+      );
+    });
+
+    it('rejects a malformed deprecated block instead of dropping it silently', async () => {
+      // An empty block would mean a bundled default with no removal warning at
+      // all — the exact failure the notice exists to prevent.
+      const result = await parseSingle([
+        'name: test',
+        'description: test',
+        'deprecated: {}',
+        'nodes:',
+        '  - id: n',
+        '    prompt: p',
+      ]);
+      expect(result.workflows.length).toBe(0);
+      expect(result.errors[0].errorType).toBe('validation_error');
+      expect(result.errors[0].error).toContain('Invalid deprecated');
     });
   });
 
@@ -4999,10 +7842,9 @@ nodes:
     // a deliberate follow-up — this test exists so that change is a visible,
     // intentional edit rather than a silent behaviour shift.
     it('reports on the included block, not the includer', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      await mkdir(workflowDir, { recursive: true });
-      await writeFile(
-        join(workflowDir, 'block.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'block.yaml',
         [
           'name: block',
           'description: shared block',
@@ -5012,8 +7854,9 @@ nodes:
           '    interactive: true', // dropped, warned — on THIS file
         ].join('\n')
       );
-      await writeFile(
-        join(workflowDir, 'parent.yaml'),
+      await writeWorkflowFile(
+        testDir,
+        'parent.yaml',
         [
           'name: parent',
           'description: includes the block',
@@ -5110,59 +7953,606 @@ nodes:
     });
   });
 
-  describe('no false positives on the real workflow corpus (#2213)', () => {
+  describe('legacy pause and loop deprecation warnings', () => {
+    /** Write a single workflow and return its parse warnings. */
+    const warningsFor = async (lines: string[]): Promise<string[]> => {
+      await writeWorkflowFile(testDir, 'test.yaml', lines.join('\n'));
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.workflows.length).toBe(1);
+      return [...(result.workflows[0].parseWarnings ?? [])];
+    };
+    const loadErrorFor = async (lines: string[]): Promise<string | undefined> => {
+      await writeWorkflowFile(testDir, 'test.yaml', lines.join('\n'));
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.workflows).toHaveLength(0);
+      return result.errors[0]?.error;
+    };
+
+    // Each legacy answerable pause warns once per file, naming its attention-form
+    // replacement (#4042). The runtime is unchanged, so every shape still loads.
+    it.each([
+      [
+        'a plain approval gate',
+        ['  - id: gate', '    approval:', '      message: ok?'],
+        [
+          "Node 'gate': 'approval:' is deprecated. Write 'wait: { attention: <message>, form: approval }' instead; the next node reads '$<id>.output.decision' and '$<id>.output.text'. A legacy reject cancels the run, while an attention wait continues with decision 'reject', so add a 'cancel:' node with when: \"$<id>.output.decision == 'reject'\" where rejecting should end the run. It keeps running as before until rewritten.",
+        ],
+      ],
+      [
+        'approval.decisions',
+        [
+          '  - id: gate',
+          '    approval:',
+          '      message: ok?',
+          '      decisions:',
+          '        - id: approve',
+          '        - id: needs-work',
+        ],
+        [
+          "Node 'gate': 'approval.decisions' is deprecated. Write 'wait: { attention: <message>, form: select, options: <the same decisions> }' instead; the output is the same {decision, text}. It keeps running as before until rewritten.",
+        ],
+      ],
+      [
+        'approval.capture_response',
+        ['  - id: gate', '    approval:', '      message: ok?', '      capture_response: false'],
+        [
+          expect.stringContaining("Node 'gate': 'approval:' is deprecated."),
+          "Node 'gate': 'approval.capture_response' is deprecated. An attention wait always records the answer; the next node reads '$<id>.output.text'. It keeps running as before until rewritten.",
+        ],
+      ],
+      [
+        'approval.on_reject',
+        [
+          '  - id: gate',
+          '    approval:',
+          '      message: ok?',
+          '      on_reject:',
+          '        prompt: fix it',
+        ],
+        [
+          "Node 'gate': 'approval.on_reject' and '$REJECTION_REASON' are deprecated. Write 'wait: { attention: <message>, form: approval }' followed by a rework node with when: \"$<id>.output.decision == 'reject'\" that reads '$<id>.output.text'. To repeat the rework, write a 'loop_group' whose body ends in the wait; the rework node comes first and reads '$LOOP_PREV.<id>.output.text'. It keeps running as before until rewritten.",
+        ],
+      ],
+      [
+        'an interactive loop',
+        [
+          '  - id: iterate',
+          '    loop:',
+          '      prompt: work',
+          '      until_bash: "exit 0"',
+          '      max_iterations: 5',
+          '      interactive: true',
+          '      gate_message: continue?',
+        ],
+        [
+          "Node 'iterate': loop 'interactive:' with 'gate_message' and '$LOOP_USER_INPUT' is deprecated. Write a 'loop_group' whose body ends in a 'wait: attention' node instead; the next iteration reads '$LOOP_PREV.<id>.output.text', and 'until_bash' checks the answer at '$<id>.output'. It keeps running as before until rewritten.",
+        ],
+      ],
+      [
+        'an interactive loop_group',
+        [
+          '  - id: iterate',
+          '    loop_group:',
+          '      until_bash: "exit 0"',
+          '      max_iterations: 5',
+          '      interactive: true',
+          '      gate_message: continue?',
+          '      nodes:',
+          '        - id: work',
+          '          prompt: work',
+        ],
+        [expect.stringContaining("Node 'iterate': loop 'interactive:' with 'gate_message'")],
+      ],
+    ])('warns on %s with its attention-form replacement', async (_, nodeLines, expected) => {
+      const pw = await warningsFor(['name: test', 'description: test', 'nodes:', ...nodeLines]);
+      expect(pw).toEqual(expected);
+    });
+
+    it('warns once per file per shape, naming every node that uses it, loop_group bodies included', async () => {
+      const pw = await warningsFor([
+        'name: test',
+        'description: test',
+        'nodes:',
+        '  - id: first',
+        '    approval:',
+        '      message: ok?',
+        '  - id: grp',
+        '    depends_on: [first]',
+        '    loop_group:',
+        '      until_bash: \'decision=$second.output.decision; test "$decision" = approve\'',
+        '      max_iterations: 2',
+        '      nodes:',
+        '        - id: work',
+        '          prompt: work',
+        '        - id: second',
+        '          depends_on: [work]',
+        '          approval:',
+        '            message: again?',
+      ]);
+      expect(pw).toEqual([
+        expect.stringContaining("Nodes 'first', 'second': 'approval:' is deprecated."),
+      ]);
+    });
+
+    it("the on_reject replacement repeats rework by reading $LOOP_PREV, keeping the wait as the body's sink", async () => {
+      const groupLines = (bodyLines: string[]): string[] => [
+        'name: test',
+        'description: test',
+        'nodes:',
+        '  - id: grp',
+        '    loop_group:',
+        '      until_bash: \'decision=$review.output.decision; test "$decision" = approve\'',
+        '      max_iterations: 3',
+        '      nodes:',
+        ...bodyLines,
+      ];
+      const pw = await warningsFor(
+        groupLines([
+          '        - id: rework',
+          '          prompt: "Revise. Feedback, if any: $LOOP_PREV.review.output.text"',
+          '        - id: review',
+          '          depends_on: [rework]',
+          '          wait: { attention: ok?, form: approval }',
+        ])
+      );
+      expect(pw).toEqual([]);
+
+      // A rework node after the wait, as a one-shot replacement writes it, cannot repeat.
+      const error = await loadErrorFor(
+        groupLines([
+          '        - id: review',
+          '          wait: { attention: ok?, form: approval }',
+          '        - id: rework',
+          '          depends_on: [review]',
+          '          when: "$review.output.decision == \'reject\'"',
+          '          prompt: "Revise: $review.output.text"',
+        ])
+      );
+      expect(error).toContain("wait node 'review' must be the body's sole terminal sink");
+    });
+
+    it('does not warn on attention waits, the replacement', async () => {
+      const pw = await warningsFor([
+        'name: test',
+        'description: test',
+        'nodes:',
+        '  - id: ask',
+        '    wait:',
+        '      attention: Which base?',
+        '      form: select',
+        '      options:',
+        '        - id: use-main',
+        '        - id: use-dev',
+        '  - id: stop',
+        '    depends_on: [ask]',
+        '    when: "$ask.output.decision == \'use-dev\'"',
+        '    cancel: not supported yet',
+      ]);
+      expect(pw).toEqual([]);
+    });
+
+    it('does not warn about nested group pauses when an enclosing group owns a named session', async () => {
+      const pw = await warningsFor([
+        'name: test',
+        'description: test',
+        'nodes:',
+        '  - id: source',
+        '    prompt: Start the owner session',
+        '  - id: outer',
+        '    depends_on: [source]',
+        '    loop_group:',
+        '      until_bash: "exit 1"',
+        '      max_iterations: 2',
+        '      nodes:',
+        '        - id: owner',
+        '          prompt: Continue',
+        '          context: { resume: source }',
+        '        - id: middle',
+        '          depends_on: [owner]',
+        '          loop_group:',
+        '            until_bash: "exit 1"',
+        '            max_iterations: 2',
+        '            nodes:',
+        '              - id: inner',
+        '                loop_group:',
+        '                  until_bash: "exit 1"',
+        '                  max_iterations: 2',
+        '                  interactive: true',
+        '                  gate_message: Review',
+        '                  nodes:',
+        '                    - id: work',
+        '                      prompt: Work',
+      ]);
+      expect(pw.some(w => w.includes('#2753'))).toBe(false);
+    });
+
+    it('warns on an interactive loop nested inside a loop_group body', async () => {
+      // Exercises the recursion into loop_group.nodes — the outer group's own
+      // body-terminal sink is 'inner-loop' (a plain interactive `loop:` node).
+      // That makes two warnings: the deprecation notice on 'inner-loop', and —
+      // #2753 — 'outer' itself, whose only escalatable sink is an interactive
+      // loop and therefore can't stop on a pause inside it.
+      const pw = await warningsFor([
+        'name: test',
+        'description: test',
+        'nodes:',
+        '  - id: outer',
+        '    loop_group:',
+        '      until_bash: "exit 0"',
+        '      max_iterations: 2',
+        '      nodes:',
+        '        - id: inner-loop',
+        '          loop:',
+        '            prompt: work',
+        '            until_bash: "exit 0"',
+        '            max_iterations: 5',
+        '            interactive: true',
+        '            gate_message: continue?',
+      ]);
+      expect(pw).toHaveLength(2);
+      expect(pw.some(w => w.includes("Node 'inner-loop'") && w.includes('interactive'))).toBe(true);
+      expect(
+        pw.some(w => w.includes("Node 'outer'") && w.includes('inner-loop') && w.includes('#2753'))
+      ).toBe(true);
+    });
+
+    it('warns on a loop_group whose sole terminal sink is a gate-terminated nested loop_group (#2753)', async () => {
+      const pw = await warningsFor([
+        'name: test',
+        'description: test',
+        'nodes:',
+        '  - id: outer',
+        '    loop_group:',
+        '      until_bash: "exit 0"',
+        '      max_iterations: 2',
+        '      nodes:',
+        '        - id: inner',
+        '          loop_group:',
+        '            until_bash: test "$review.output.decision" = approve',
+        '            max_iterations: 3',
+        '            nodes:',
+        '              - id: review',
+        '                approval:',
+        '                  message: ok?',
+      ]);
+      const escalation = pw.filter(w => w.includes('#2753'));
+      expect(escalation).toHaveLength(1);
+      expect(escalation[0]).toContain("Node 'outer'");
+      expect(escalation[0]).toContain("'inner'");
+    });
+
+    it('warns at every level of a 3-deep nested loop_group chain (#2753)', async () => {
+      const pw = await warningsFor([
+        'name: test',
+        'description: test',
+        'nodes:',
+        '  - id: grandparent',
+        '    loop_group:',
+        '      until_bash: "exit 0"',
+        '      max_iterations: 2',
+        '      nodes:',
+        '        - id: middle',
+        '          loop_group:',
+        '            until_bash: "exit 0"',
+        '            max_iterations: 2',
+        '            nodes:',
+        '              - id: inner',
+        '                loop_group:',
+        '                  until_bash: test "$review.output.decision" = approve',
+        '                  max_iterations: 3',
+        '                  nodes:',
+        '                    - id: review',
+        '                      approval:',
+        '                        message: ok?',
+      ]);
+      const escalation = pw.filter(w => w.includes('#2753'));
+      expect(escalation).toHaveLength(2);
+      expect(escalation.some(w => w.includes("Node 'grandparent'") && w.includes("'middle'"))).toBe(
+        true
+      );
+      expect(escalation.some(w => w.includes("Node 'middle'") && w.includes("'inner'"))).toBe(true);
+    });
+
+    it('does not warn when a nested loop_group has nothing interactive to escalate (#2753)', async () => {
+      const pw = await warningsFor([
+        'name: test',
+        'description: test',
+        'nodes:',
+        '  - id: outer',
+        '    loop_group:',
+        '      until_bash: "exit 0"',
+        '      max_iterations: 2',
+        '      nodes:',
+        '        - id: inner',
+        '          loop_group:',
+        '            until_bash: "exit 0"',
+        '            max_iterations: 3',
+        '            nodes:',
+        '              - id: work',
+        '                prompt: do work',
+      ]);
+      expect(pw).toEqual([]);
+    });
+
     /**
-     * The unknown-key check is only useful if a legitimate key never trips it.
-     * Detection reaches into nested config blocks and `loop_group` bodies, so a
-     * schema field that drifts out of a derived key set would start warning on
-     * valid YAML — and a warning nobody can act on is worse than none.
-     *
-     * Runs over Archon's own `.archon/workflows/` — its largest real corpus —
-     * and asserts nothing OUTSIDE a known-bad allowlist warns. Deliberately
-     * one-directional: the allowlist may shrink freely (fixing
-     * `e2e-opencode-smoke.yaml` must not break this), but a new name appearing
-     * is a false positive and fails.
-     *
-     * Calls `parseWorkflow` per file rather than `discoverWorkflows`. Parsing is
-     * the only thing under test — running full discovery would additionally do
-     * include expansion, command-file resolution and config loading, which is
-     * both a looser unit and heavy enough to starve the other package test
-     * processes running in parallel (`bun --filter '*' --parallel test`). It
-     * measurably did: on a 2-core Windows CI runner it pushed an unrelated
-     * SQLite test from 250 ms past Bun's 5000 ms per-test timeout.
+     * The sink-shape checks judge the EXPANDED graph (#2756). An `include:` is a
+     * legal loop_group body entry, so the shape these checks exist to catch can
+     * arrive through composition — and pre-expansion there is nothing but an
+     * unresolved include id to look at.
      */
-    const KNOWN_BAD = new Set([
-      // `agent:` at workflow and node level — a real bug, silently dropped since
-      // April. Remove from this list when the file is fixed.
-      'e2e-opencode-smoke',
-    ]);
+    describe('include-composed sinks (#2756)', () => {
+      /** Write a parent plus a reusable block and return the PARENT's warnings. */
+      const parentWarningsFor = async (parent: string[], block: string[]): Promise<string[]> => {
+        await writeWorkflowFile(testDir, 'parent.yaml', parent.join('\n'));
+        await writeWorkflowFile(testDir, 'block.yaml', block.join('\n'));
+        const result = await discoverWorkflows(testDir, { loadDefaults: false });
+        expect(result.errors).toEqual([]);
+        const found = result.workflows.find(w => w.workflow.name === 'parent');
+        expect(found).toBeDefined();
+        return [...(found?.parseWarnings ?? [])];
+      };
 
-    it('warns only on workflows already known to carry unknown keys', async () => {
-      // packages/workflows/src/ → repo root
-      const corpusDir = join(import.meta.dir, '..', '..', '..', '.archon', 'workflows');
+      it("warns when an include's own terminal sink makes it an unescalatable loop_group sink", async () => {
+        const pw = await parentWarningsFor(
+          [
+            'name: parent',
+            'description: composes a review block',
+            'nodes:',
+            '  - id: outer',
+            '    loop_group:',
+            '      until_bash: "exit 0"',
+            '      max_iterations: 5',
+            '      nodes:',
+            '        - id: step-a',
+            '          bash: "echo work"',
+            '        - id: review',
+            '          include: review-block',
+            '          depends_on: [step-a]',
+          ],
+          [
+            'name: review-block',
+            'description: reusable interactive review',
+            'nodes:',
+            '  - id: iterate',
+            '    loop_group:',
+            '      interactive: true',
+            '      gate_message: continue?',
+            '      until_bash: "exit 0"',
+            '      max_iterations: 3',
+            '      nodes:',
+            '        - id: work',
+            '          prompt: do work',
+          ]
+        );
+        expect(pw).toHaveLength(1);
+        expect(pw[0]).toContain("Node 'outer'");
+        expect(pw[0]).toContain("'review__iterate'");
+        expect(pw[0]).toContain('#2753');
+      });
 
-      // Discovery descends one level; mirror that without invoking it.
-      const files: string[] = [];
-      for (const entry of await readdir(corpusDir, { withFileTypes: true })) {
-        const full = join(corpusDir, entry.name);
-        if (entry.isDirectory()) {
-          for (const sub of await readdir(full)) {
-            if (sub.endsWith('.yaml') || sub.endsWith('.yml')) files.push(join(full, sub));
-          }
-        } else if (entry.name.endsWith('.yaml') || entry.name.endsWith('.yml')) {
-          files.push(full);
-        }
-      }
-      // Guard against silently testing nothing if the corpus moves.
-      expect(files.length).toBeGreaterThan(20);
+      it("rejects an included gate that is not the expanded body's sole terminal sink", async () => {
+        await writeWorkflowFile(
+          testDir,
+          'parent.yaml',
+          [
+            'name: parent',
+            'description: composes a gate block mid-body',
+            'nodes:',
+            '  - id: outer',
+            '    loop_group:',
+            '      until_bash: "exit 0"',
+            '      max_iterations: 5',
+            '      nodes:',
+            '        - id: review',
+            '          include: gate-block',
+            '        - id: after',
+            '          depends_on: [review]',
+            '          bash: "echo more work"',
+          ].join('\n')
+        );
+        await writeWorkflowFile(
+          testDir,
+          'block.yaml',
+          [
+            'name: gate-block',
+            'description: reusable approval',
+            'nodes:',
+            '  - id: check',
+            '    approval:',
+            '      message: ok?',
+          ].join('\n')
+        );
+        const result = await discoverWorkflows(testDir, { loadDefaults: false });
+        expect(result.workflows.some(w => w.workflow.name === 'parent')).toBe(false);
+        expect(result.errors.find(e => e.filename === 'parent.yaml')?.error).toContain(
+          "approval node 'review__check' must be the body's sole terminal sink"
+        );
+      });
 
-      const unexpected: string[] = [];
-      for (const file of files) {
-        const result = parseWorkflow(await readFile(file, 'utf-8'), basename(file));
-        if (!result.workflow || result.warnings.length === 0) continue;
-        if (!KNOWN_BAD.has(result.workflow.name)) unexpected.push(result.workflow.name);
-      }
-      expect(unexpected).toEqual([]);
+      it("accepts a composed gate sink whose decision the group's until_bash reads", async () => {
+        // The gate is the expanded body's sole terminal sink and 'until_bash' reaches it
+        // through the include alias, which expansion rewrites to the namespaced id — the
+        // completion-reference half of the #2707 step 3 check has to see it rewritten.
+        const pw = await parentWarningsFor(
+          [
+            'name: parent',
+            'description: composes an approval as the loop sink',
+            'nodes:',
+            '  - id: outer',
+            '    loop_group:',
+            '      until_bash: test "$review.output.decision" = approve',
+            '      max_iterations: 5',
+            '      nodes:',
+            '        - id: step-a',
+            '          bash: "echo work"',
+            '        - id: review',
+            '          include: gate-block',
+            '          depends_on: [step-a]',
+          ],
+          [
+            'name: gate-block',
+            'description: reusable approval',
+            'nodes:',
+            '  - id: check',
+            '    approval:',
+            '      message: ok?',
+          ]
+        );
+        expect(pw).toEqual([]);
+      });
+
+      it('does not warn when the composed sink has no pause to escalate', async () => {
+        const pw = await parentWarningsFor(
+          [
+            'name: parent',
+            'description: composes a deterministic block',
+            'nodes:',
+            '  - id: outer',
+            '    loop_group:',
+            '      until_bash: "exit 0"',
+            '      max_iterations: 5',
+            '      nodes:',
+            '        - id: step-a',
+            '          bash: "echo work"',
+            '        - id: review',
+            '          include: work-block',
+            '          depends_on: [step-a]',
+          ],
+          [
+            'name: work-block',
+            'description: reusable deterministic work',
+            'nodes:',
+            '  - id: check',
+            '    bash: "echo checked"',
+          ]
+        );
+        expect(pw).toEqual([]);
+      });
+    });
+
+    it('rejects a gate node with a dependent inside a loop_group body', async () => {
+      const err = await loadErrorFor([
+        'name: test',
+        'description: test',
+        'nodes:',
+        '  - id: grp',
+        '    loop_group:',
+        '      until_bash: "exit 0"',
+        '      max_iterations: 3',
+        '      nodes:',
+        '        - id: check',
+        '          approval:',
+        '            message: ok?',
+        '        - id: after',
+        '          depends_on: [check]',
+        '          prompt: do more work',
+      ]);
+      expect(err).toContain(
+        "loop_group 'grp' body: approval node 'check' must be the body's sole terminal sink"
+      );
+    });
+
+    it('rejects a gate node sharing terminal-sink status with another body node', async () => {
+      const err = await loadErrorFor([
+        'name: test',
+        'description: test',
+        'nodes:',
+        '  - id: grp',
+        '    loop_group:',
+        '      until_bash: "exit 0"',
+        '      max_iterations: 3',
+        '      nodes:',
+        '        - id: check',
+        '          approval:',
+        '            message: ok?',
+        '        - id: also-terminal',
+        '          prompt: an independent branch',
+      ]);
+      expect(err).toContain(
+        "loop_group 'grp' body: approval node 'check' must be the body's sole terminal sink"
+      );
+    });
+
+    it('warns on the prose until: channel on a loop node', async () => {
+      const pw = await warningsFor([
+        'name: test',
+        'description: test',
+        'nodes:',
+        '  - id: iterate',
+        '    loop:',
+        '      prompt: work',
+        '      until: DONE',
+        '      max_iterations: 5',
+      ]);
+      expect(pw).toHaveLength(1);
+      expect(pw[0]).toContain(
+        "Node 'iterate': the prose 'loop.until' completion signal is deprecated"
+      );
+      expect(pw[0]).toContain('until_bash');
+      expect(pw[0]).toContain('until_field');
+      expect(pw[0]).toContain('<promise>SIGNAL</promise>');
+      expect(pw[0]).toContain('final standalone signal line');
+    });
+
+    it('warns on the prose until: channel on a loop_group node, with loop_group-specific guidance (no until_field)', async () => {
+      const pw = await warningsFor([
+        'name: test',
+        'description: test',
+        'nodes:',
+        '  - id: grp',
+        '    loop_group:',
+        '      until: DONE',
+        '      max_iterations: 3',
+        '      nodes:',
+        '        - id: work',
+        '          prompt: do work',
+      ]);
+      expect(pw).toHaveLength(1);
+      expect(pw[0]).toContain(
+        "Node 'grp': the prose 'loop_group.until' completion signal is deprecated"
+      );
+      expect(pw[0]).toContain('loop_group.until_bash');
+      expect(pw[0]).not.toContain('until_field');
+      expect(pw[0]).toContain('<promise>SIGNAL</promise>');
+      expect(pw[0]).toContain('final standalone signal line');
+    });
+
+    it('does NOT warn on until_bash or until_field alone', async () => {
+      const pw = await warningsFor([
+        'name: test',
+        'description: test',
+        'nodes:',
+        '  - id: iterate',
+        '    loop:',
+        '      prompt: work',
+        '      until_bash: "exit 0"',
+        '      max_iterations: 5',
+        '  - id: grp',
+        '    depends_on: [iterate]',
+        '    loop_group:',
+        '      until_bash: "exit 0"',
+        '      max_iterations: 3',
+        '      nodes:',
+        '        - id: work',
+        '          prompt: do work',
+      ]);
+      expect(pw).toEqual([]);
+    });
+
+    it('warns on a typo inside a decisions: entry (R5 fix — array typo protection)', async () => {
+      const pw = await warningsFor([
+        'name: test',
+        'description: test',
+        'nodes:',
+        '  - id: gate',
+        '    approval:',
+        '      message: ok?',
+        '      decisions:',
+        '        - id: approve',
+        '        - id: reject',
+        '          lable: Needs work', // typo for 'label'
+      ]);
+      expect(pw.some(w => w.includes("unknown key 'approval.decisions.1.lable'"))).toBe(true);
     });
   });
 });
@@ -5347,6 +8737,195 @@ nodes:
 });
 
 // ---------------------------------------------------------------------------
+// Authored workflow outcome (#2618)
+// ---------------------------------------------------------------------------
+
+describe('workflow authored outcome declaration (#2618)', () => {
+  const parseOutcomeWorkflow = (
+    declaration: string,
+    outputFormat = `
+    output_format:
+      type: object
+      properties:
+        green:
+          type: boolean
+      required: [green]`
+  ): ReturnType<typeof parseWorkflow> =>
+    parseWorkflow(
+      `
+name: authored-outcome
+description: independently reports the authored verdict
+${declaration}
+nodes:
+  - id: result
+    prompt: report the verdict${outputFormat}
+`,
+      'authored-outcome.yaml'
+    );
+
+  it('accepts a trimmed field naming a required boolean on the selected return node', () => {
+    const { workflow, error } = parseOutcomeWorkflow('returns: result\noutcome_field: "  green  "');
+
+    expect(error).toBeNull();
+    expect(workflow?.returns).toBe('result');
+    expect(workflow?.outcome_field).toBe('green');
+  });
+
+  it('rejects outcome_field without an explicit returns node', () => {
+    const { workflow, error } = parseOutcomeWorkflow('outcome_field: green');
+
+    expect(workflow).toBeNull();
+    expect(error?.error).toContain('without returns:');
+  });
+
+  it.each([
+    ['blank', 'returns: result\noutcome_field: "   "'],
+    ['non-string', 'returns: result\noutcome_field: { field: green }'],
+  ])('rejects a %s outcome_field instead of silently dropping it', (_label, declaration) => {
+    const { workflow, error } = parseOutcomeWorkflow(declaration);
+
+    expect(workflow).toBeNull();
+    expect(error?.error).toContain("Invalid 'outcome_field'");
+  });
+
+  it.each([
+    ['no output_format', ''],
+    [
+      'undeclared property',
+      `
+    output_format:
+      type: object
+      properties:
+        ready: { type: boolean }
+      required: [ready]`,
+    ],
+    [
+      'optional property',
+      `
+    output_format:
+      type: object
+      properties:
+        green: { type: boolean }`,
+    ],
+    [
+      'non-boolean property',
+      `
+    output_format:
+      type: object
+      properties:
+        green: { type: string }
+      required: [green]`,
+    ],
+    [
+      'non-object root schema',
+      `
+    output_format:
+      type: string
+      properties:
+        green: { type: boolean }
+      required: [green]`,
+    ],
+  ])('rejects an outcome field with %s', (_label, outputFormat) => {
+    const { workflow, error } = parseOutcomeWorkflow(
+      'returns: result\noutcome_field: green',
+      outputFormat
+    );
+
+    expect(workflow).toBeNull();
+    expect(error?.errorType).toBe('validation_error');
+    expect(error?.error).toContain('outcome_field');
+  });
+
+  it('rejects a fan-out workflow node because its runtime output is an aggregate array', () => {
+    const { workflow, error } = parseWorkflow(
+      `
+name: fan-out-outcome
+description: invalid direct outcome over child aggregates
+returns: work
+outcome_field: green
+nodes:
+  - id: plan
+    prompt: emit tasks
+    output_format:
+      type: object
+      properties:
+        tasks:
+          type: array
+          items: { type: string }
+      required: [tasks]
+  - id: work
+    workflow: child-workflow
+    depends_on: [plan]
+    fan_out:
+      items: "$plan.output.tasks"
+`,
+      'fan-out-outcome.yaml'
+    );
+
+    expect(workflow).toBeNull();
+    expect(error?.error).toContain('fan-out workflow node');
+    expect(error?.error).toContain('collector node');
+  });
+
+  it('rejects a composed fan-out node because its runtime output is an aggregate array', () => {
+    const { workflow, error } = parseWorkflow(
+      `
+name: compose-fan-out-outcome
+description: invalid direct outcome over an in-parent instance aggregate
+returns: fan
+outcome_field: green
+nodes:
+  - id: fan
+    include: some-block
+    fan_out:
+      items: "['a']"
+      as: item
+    output_format:
+      type: object
+      properties:
+        green: { type: boolean }
+      required: [green]
+`,
+      'compose-fan-out-outcome.yaml'
+    );
+
+    expect(workflow).toBeNull();
+    expect(error?.error).toContain('composed fan-out node');
+    expect(error?.error).toContain('collector node');
+  });
+
+  it('rejects a loop_group because its declared output format is ignored at runtime', () => {
+    const { workflow, error } = parseWorkflow(
+      `
+name: loop-group-outcome
+description: invalid outcome over a raw loop group result
+returns: group
+outcome_field: green
+nodes:
+  - id: group
+    output_format:
+      type: object
+      properties:
+        green: { type: boolean }
+      required: [green]
+    loop_group:
+      until: DONE
+      max_iterations: 2
+      nodes:
+        - id: author
+          prompt: author a result
+`,
+      'loop-group-outcome.yaml'
+    );
+
+    expect(workflow).toBeNull();
+    expect(error?.error).toContain('loop_group');
+    expect(error?.error).toContain('raw text');
+    expect(error?.error).toContain('collector node');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Workflow-level field parity (#2457)
 // ---------------------------------------------------------------------------
 
@@ -5361,7 +8940,8 @@ nodes:
  * 2d7bf587 (2026-07-16) — six weeks in which the GitHub capability gate could never
  * fire for any discovered workflow, fixed incidentally inside an unrelated PR.
  *
- * This is the guard. The field list is DERIVED from `workflowDefinitionSchema.shape`,
+ * This is the guard. The field list is derived from `KNOWN_WORKFLOW_KEYS`, which
+ * itself derives from the workflow object schema,
  * so a new schema field fails the test until it is given a fixture here — the same
  * "the derived check fails until the new thing is registered" ratchet used by
  * `check:capability-matrix` and the schema-parity test in `sqlite.test.ts`.
@@ -5379,7 +8959,7 @@ describe('workflow-level field parity (#2457)', () => {
    * One fixture per workflow-level schema key: a YAML fragment setting the field, and a
    * predicate proving it survived `parseWorkflow`. `present` is deliberately a survival
    * check rather than deep equality — several fields are normalised on the way through
-   * (tags deduped, betas trimmed, thinking preprocessed), and this guard is about the
+   * (tags deduped, betas trimmed), and this guard is about the
    * field reaching the result at all, not about how it is parsed.
    */
   const FIELD_FIXTURES: Record<
@@ -5391,14 +8971,17 @@ describe('workflow-level field parity (#2457)', () => {
     nodes: { yaml: '', present: w => w.nodes?.length === 1 },
     provider: { yaml: 'provider: claude', present: w => w.provider === 'claude' },
     model: { yaml: 'model: sonnet', present: w => w.model === 'sonnet' },
+    // The one field that survives as a DIFFERENT key. #2556 deprecated it and
+    // the loader translates it into `effort:`, so asserting `w.modelReasoningEffort`
+    // would now fail for the right reason. The guard's invariant is "a schema
+    // field must not be silently inert", and translation satisfies it — so the
+    // fixture proves the value arrived, and that the deprecated key did not.
     modelReasoningEffort: {
       yaml: 'modelReasoningEffort: high',
-      present: w => w.modelReasoningEffort === 'high',
+      present: w => w.effort === 'high' && w.modelReasoningEffort === undefined,
     },
     webSearchMode: { yaml: 'webSearchMode: live', present: w => w.webSearchMode === 'live' },
-    interactive: { yaml: 'interactive: true', present: w => w.interactive === true },
     effort: { yaml: 'effort: high', present: w => w.effort === 'high' },
-    thinking: { yaml: 'thinking: adaptive', present: w => w.thinking?.type === 'adaptive' },
     fallbackModel: {
       yaml: 'fallbackModel: haiku',
       present: w => w.fallbackModel === 'haiku',
@@ -5413,6 +8996,10 @@ describe('workflow-level field parity (#2457)', () => {
     evidence_policy: {
       yaml: 'evidence_policy:\n  required: true',
       present: w => w.evidence_policy?.required === true,
+    },
+    budget: {
+      yaml: 'budget:\n  max_work_units: 3',
+      present: w => w.budget?.max_work_units === 3,
     },
     mutates_checkout: {
       yaml: 'mutates_checkout: false',
@@ -5433,9 +9020,17 @@ describe('workflow-level field parity (#2457)', () => {
     },
     // `returns` must name a real top-level node id — the fixture's single node is `only`.
     returns: { yaml: 'returns: only', present: w => w.returns === 'only' },
+    outcome_field: {
+      yaml: 'returns: only\noutcome_field: green',
+      present: w => w.outcome_field === 'green',
+    },
+    deprecated: {
+      yaml: 'deprecated:\n  message: Switch instead.',
+      present: w => w.deprecated?.message === 'Switch instead.',
+    },
   };
 
-  const schemaKeys = Object.keys(workflowDefinitionSchema.shape);
+  const schemaKeys = [...KNOWN_WORKFLOW_KEYS];
 
   it('has a fixture for every workflow-level schema key (the ratchet)', () => {
     const missing = schemaKeys.filter(k => !(k in FIELD_FIXTURES));
@@ -5465,6 +9060,11 @@ describe('workflow-level field parity (#2457)', () => {
         'nodes:',
         '  - id: only',
         '    prompt: hello',
+        '    output_format:',
+        '      type: object',
+        '      properties:',
+        '        green: { type: boolean }',
+        '      required: [green]',
       ]
         .filter(line => line !== '')
         .join('\n');
@@ -5496,4 +9096,937 @@ describe('workflow-level field parity (#2457)', () => {
       expect(fixture.present(result.workflow as WorkflowDefinition), message).toBe(true);
     });
   }
+});
+
+// ---------------------------------------------------------------------------
+// #2637 — node-local `with:` bindings on command/script nodes, and JSON-valued
+// `with:` maps. Load-time validation: shape, whole-ref grammar, upstream
+// dependency, env-key uniqueness, and the ignored-elsewhere warning.
+// ---------------------------------------------------------------------------
+
+describe('node-local with: bindings (#2637)', () => {
+  it('accepts and round-trips typed values and a binding directive on command and script nodes', () => {
+    const { workflow } = parseWorkflowYaml(`
+name: bind-ok
+description: node-local bindings load and survive the transform
+nodes:
+  - id: producer
+    prompt: emit
+    output_format:
+      type: object
+      properties:
+        green: { type: boolean }
+  - id: consume
+    command: review
+    depends_on: [producer]
+    with:
+      green: $producer.output.green
+      typed: 42
+      guarded:
+        from: $producer.output.green
+        if_skipped: false
+  - id: emit
+    script: console.log("x")
+    runtime: bun
+    depends_on: [producer]
+    with:
+      payload: $producer.output
+`);
+    const consume = workflow.nodes.find(n => n.id === 'consume');
+    expect(nodeWith(consume)).toEqual({
+      green: '$producer.output.green',
+      typed: 42,
+      guarded: { from: '$producer.output.green', if_skipped: false },
+    });
+    const emit = workflow.nodes.find(n => n.id === 'emit');
+    expect(nodeWith(emit)).toEqual({
+      payload: '$producer.output',
+    });
+  });
+
+  it('accepts typed JSON values on a workflow node with: map (previously a load error)', () => {
+    const { workflow } = parseWorkflowYaml(`
+name: typed-with
+description: pure relaxation — with values are JSON now
+nodes:
+  - id: sub
+    workflow: some-child
+    with:
+      flag: true
+      count: 3
+      tags: [a, b]
+`);
+    const sub = workflow.nodes.find(n => n.id === 'sub');
+    expect(nodeWith(sub)).toEqual({
+      flag: true,
+      count: 3,
+      tags: ['a', 'b'],
+    });
+  });
+
+  it('rejects a binding ref to an unknown producer at load time', () => {
+    const result = parseWorkflow(
+      `
+name: bind-unknown
+description: binding names a node that does not exist
+nodes:
+  - id: consume
+    command: review
+    with:
+      v: $ghost.output
+`,
+      'bind-unknown.yaml'
+    );
+    expect(result.error?.error).toContain("references unknown node '$ghost.output'");
+  });
+
+  it('rejects a binding whose producer is not an upstream dependency, naming the fix', () => {
+    const result = parseWorkflow(
+      `
+name: bind-not-upstream
+description: producer exists but there is no depends_on edge
+nodes:
+  - id: producer
+    prompt: emit
+  - id: consume
+    command: review
+    with:
+      v: $producer.output
+`,
+      'bind-not-upstream.yaml'
+    );
+    expect(result.error?.error).toContain(
+      "add 'producer' to 'consume'.depends_on so its value is produced first"
+    );
+  });
+
+  it('rejects a directive whose from is not a whole ref, and enforces upstream for directive refs too', () => {
+    const badFrom = parseWorkflow(
+      `
+name: bind-bad-from
+description: from must be exactly one whole ref
+nodes:
+  - id: producer
+    prompt: emit
+  - id: consume
+    command: review
+    depends_on: [producer]
+    with:
+      v:
+        from: "prefix $producer.output"
+`,
+      'bind-bad-from.yaml'
+    );
+    expect(badFrom.error?.error).toContain(
+      "'from' must be exactly one whole '$node.output[.a.b]' reference"
+    );
+
+    const notUpstream = parseWorkflow(
+      `
+name: bind-directive-race
+description: directive producer without a depends_on edge
+nodes:
+  - id: producer
+    prompt: emit
+  - id: consume
+    command: review
+    with:
+      v:
+        from: $producer.output.green
+`,
+      'bind-directive-race.yaml'
+    );
+    expect(notUpstream.error?.error).toContain("add 'producer' to 'consume'.depends_on");
+  });
+
+  it('does not validate output references in an if_skipped literal default', () => {
+    const result = parseWorkflow(
+      `
+name: bind-default-literal
+description: defaults are delivered literally when a producer is skipped
+nodes:
+  - id: producer
+    prompt: emit
+  - id: consume
+    command: review
+    depends_on: [producer]
+    with:
+      value:
+        from: $producer.output
+        if_skipped: $not-a-producer.output
+`,
+      'bind-default-literal.yaml'
+    );
+    expect(result.error).toBeNull();
+  });
+
+  it('rejects an object binding value that is not the directive shape, naming both accepted forms', () => {
+    const result = parseWorkflow(
+      `
+name: bind-bad-object
+description: plain object literals are reserved for the directive
+nodes:
+  - id: consume
+    command: review
+    with:
+      v:
+        some: thing
+`,
+      'bind-bad-object.yaml'
+    );
+    expect(result.error?.error).toContain('must be a binding directive');
+    expect(result.error?.error).toContain('literal value');
+  });
+
+  it("rejects $LOOP_PREV in a directive's from, naming the string form that works", () => {
+    // $LOOP_PREV is per-iteration text substitution, not a node ref — the directive
+    // needs a producer to check for `if_skipped`. The generic grammar error would be
+    // technically true and useless; the message must point at the supported spelling.
+    const result = parseWorkflow(
+      `
+name: bind-loopprev-directive
+description: directive from cannot read the previous iteration
+nodes:
+  - id: grp
+    loop_group:
+      until: DONE
+      max_iterations: 3
+      nodes:
+        - id: gen
+          prompt: Draft.
+        - id: consume
+          script: console.log("x")
+          runtime: bun
+          depends_on: [gen]
+          with:
+            prev:
+              from: $LOOP_PREV.gen.output
+              if_skipped: ''
+`,
+      'bind-loopprev-directive.yaml'
+    );
+    expect(result.error?.error).toContain("'from' cannot read '$LOOP_PREV'");
+    expect(result.error?.error).toContain('prev: $LOOP_PREV.gen.output');
+  });
+
+  it('rejects two binding names that fold to one INPUTS_<UPPER_SNAKE> env key', () => {
+    const result = parseWorkflow(
+      `
+name: bind-env-collision
+description: foo-bar and foo_bar collide on INPUTS_FOO_BAR
+nodes:
+  - id: emit
+    script: console.log("x")
+    runtime: bun
+    with:
+      foo-bar: a
+      foo_bar: b
+`,
+      'bind-env-collision.yaml'
+    );
+    expect(result.error?.error).toContain("both map to env var 'INPUTS_FOO_BAR'");
+  });
+
+  it('warns (never errors) about with: on a node type that ignores it', () => {
+    const { workflow, warnings } = parseWorkflowYaml(`
+name: with-ignored
+description: with on bash is dropped with a visible warning
+nodes:
+  - id: run
+    bash: echo hi
+    with: [ignored]
+`);
+    expect(workflow.nodes).toHaveLength(1);
+    expect(
+      warnings.some(w => w.includes("'with' is only supported on command, script, include"))
+    ).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Declared contract schemas compile at load time (#2453)
+// ---------------------------------------------------------------------------
+
+describe('output_format compiles at load time (#2453)', () => {
+  it('rejects output_format on a workflow: node, naming the child returns: node as the owner', () => {
+    const { workflow, error } = parseWorkflow(
+      `
+name: caller-schema
+description: the caller repeats a contract the child already owns
+nodes:
+  - id: sub
+    workflow: child-workflow
+    output_format:
+      type: object
+      properties:
+        green: { type: boolean }
+      required: [green]
+`,
+      'caller-schema.yaml'
+    );
+
+    expect(workflow).toBeNull();
+    expect(error?.errorType).toBe('validation_error');
+    expect(error?.error).toBe(
+      "Node 'sub' declares output_format on a workflow: node; the result contract belongs to the child's returns: node — declare it there"
+    );
+  });
+
+  it('rejects an output_format ajv cannot compile, naming the node', () => {
+    const { workflow, error } = parseWorkflow(
+      `
+name: broken-contract
+description: declares a contract that can never be enforced
+nodes:
+  - id: plan
+    prompt: emit the plan result
+    output_format:
+      type: object
+      properties:
+        ready:
+          $ref: "#/$defs/missing"
+`,
+      'broken-contract.yaml'
+    );
+
+    expect(workflow).toBeNull();
+    expect(error?.errorType).toBe('validation_error');
+    expect(error?.error).toContain("Node 'plan' declares an output_format that cannot be compiled");
+    expect(error?.error).toContain('missing');
+  });
+
+  it('does not compile the inert output_format on a loop_group itself', () => {
+    // The group's own schema governs nothing (warned and ignored), so a dangling $ref
+    // there must not reject the file; only enforced schemas are compiled at load.
+    const result = parseWorkflow(
+      `
+name: inert-group-schema
+description: A loop_group whose own schema is inert
+nodes:
+  - id: group
+    output_format:
+      type: object
+      properties: { done: { $ref: '#/$defs/missing' } }
+    loop_group:
+      until_bash: exit 0
+      max_iterations: 1
+      nodes:
+        - id: work
+          bash: echo done
+`,
+      'inert-group-schema.yaml'
+    );
+    expect(result.error).toBeNull();
+    expect(result.workflow?.nodes).toHaveLength(1);
+  });
+
+  it('rejects an uncompilable output_format on a loop_group body node', () => {
+    const { workflow, error } = parseWorkflow(
+      `
+name: broken-body-contract
+description: a body node runs its own turn, so its schema must compile too
+nodes:
+  - id: refine
+    loop_group:
+      max_iterations: 2
+      until: "$check.output.done == true"
+      nodes:
+        - id: check
+          prompt: judge the work
+          output_format:
+            type: object
+            properties:
+              done:
+                $ref: "#/$defs/nope"
+`,
+      'broken-body-contract.yaml'
+    );
+
+    expect(workflow).toBeNull();
+    expect(error?.error).toContain(
+      "Node 'check' declares an output_format that cannot be compiled"
+    );
+  });
+
+  it('still loads a schema carrying tolerated annotations and unknown formats', () => {
+    const { workflow, error } = parseWorkflow(
+      `
+name: annotated-contract
+description: ajv stays strict:false, so annotations are not errors
+nodes:
+  - id: plan
+    prompt: emit the plan result
+    output_format:
+      type: object
+      title: Plan result
+      x-archon-note: an annotation ajv does not know
+      properties:
+        ready: { type: boolean }
+        when: { type: string, format: not-a-known-format }
+      required: [ready]
+`,
+      'annotated-contract.yaml'
+    );
+
+    expect(error).toBeNull();
+    const annotated = (workflow?.nodes as DagNode[] | undefined)?.[0];
+    expect(annotated !== undefined && isAgentNode(annotated)).toBe(true);
+    if (annotated === undefined || !isAgentNode(annotated)) throw new Error('unreachable');
+    expect(annotated.output_format).toBeDefined();
+  });
+
+  it('leaves a schemaless node untouched', () => {
+    const { workflow, error } = parseWorkflow(
+      `
+name: schemaless
+description: no declared contract, nothing to compile
+nodes:
+  - id: run
+    bash: echo hi
+`,
+      'schemaless.yaml'
+    );
+
+    expect(error).toBeNull();
+    const schemaless = (workflow?.nodes as DagNode[] | undefined)?.[0];
+    expect(schemaless !== undefined && isExecNode(schemaless)).toBe(true);
+    if (schemaless === undefined || !isExecNode(schemaless)) throw new Error('unreachable');
+    expect(schemaless.output_format).toBeUndefined();
+  });
+});
+
+describe('$node.execution.checkoutStart bindings (#3375)', () => {
+  const load = (withValue: string, producerBody = 'prompt: work'): ParseResult =>
+    parseWorkflow(
+      `
+name: checkout-binding
+description: binds a producer's recorded checkout start
+nodes:
+  - id: implement
+    ${producerBody}
+  - id: guard
+    script: guard
+    runtime: bun
+    depends_on: [implement]
+    with:
+      baseline: ${JSON.stringify(withValue)}
+`,
+      'checkout-binding.yaml'
+    );
+
+  it('accepts a whole binding to an upstream node that executes against the checkout', () => {
+    const result = load('$implement.execution.checkoutStart');
+    expect(result.error).toBeNull();
+  });
+
+  it('rejects the reference inside other text', () => {
+    const result = load('start: $implement.execution.checkoutStart');
+    expect(result.error?.error).toContain('only valid as the whole value');
+  });
+
+  it('rejects a producer that records no checkout start', () => {
+    const result = load('$implement.execution.checkoutStart', 'cancel: stop here');
+    expect(result.error?.error).toContain('records no checkout start');
+  });
+
+  it('rejects an unknown producer', () => {
+    const result = load('$ghost.execution.checkoutStart');
+    expect(result.error?.error).toContain("no node 'ghost' exists");
+  });
+
+  it('rejects the reference on a workflow: node, which cannot pass it to the child run', () => {
+    const result = parseWorkflow(
+      `
+name: checkout-binding-child
+description: a child launch cannot carry an execution fact
+nodes:
+  - id: implement
+    prompt: work
+  - id: child
+    workflow: some-child
+    depends_on: [implement]
+    with:
+      baseline: "$implement.execution.checkoutStart"
+`,
+      'checkout-binding-child.yaml'
+    );
+    expect(result.error?.error).toContain('a workflow: node cannot pass to its child run');
+  });
+});
+
+describe('strict nested path validation', () => {
+  const workflow = (reference: string, field = 'message'): string => `
+name: nested-contract
+description: nested access
+nodes:
+  - id: review
+    bash: echo json
+    output_format:
+      properties:
+        proposal:
+          type: object
+          properties:
+            action: {type: string}
+            items: {type: array, items: {type: object, properties: {value: {type: string}}}}
+  - id: read
+    depends_on: [review]
+    ${field === 'when' ? `bash: echo read\n    when: "${reference} == 'add'"` : `approval: {message: "${reference}"}`}
+`;
+  for (const [path, segment] of [
+    ['typo', 'typo'],
+    ['typo.action', 'typo'],
+    ['proposal.typo.action', 'typo'],
+    ['proposal.action.typo', 'typo'],
+    ['proposal.items.value', 'value'],
+  ] as const) {
+    it(`rejects undeclared segment of ${path} in templates and conditions`, () => {
+      for (const surface of ['message', 'when']) {
+        const result = parseWorkflow(workflow(`$review.output.${path}`, surface), 'nested.yaml');
+        expect(result.workflow).toBeNull();
+        expect(result.error?.error).toContain(`$review.output.${path}`);
+        expect(result.error?.error).toContain(`field '${segment}'`);
+      }
+    });
+  }
+  it('rejects an unsupported suffix in current and prior templates and conditions', () => {
+    for (const prefix of ['$review', '$LOOP_PREV.review']) {
+      for (const surface of ['message', 'when']) {
+        const reference = `${prefix}.output.proposal.action[0]`;
+        const result = parseWorkflow(workflow(reference, surface), 'nested.yaml');
+        expect(result.workflow).toBeNull();
+        expect(result.error?.error).toContain('Unsupported output reference');
+        expect(result.error?.error).toContain(reference);
+      }
+    }
+  });
+
+  it('ignores reference-shaped RHS text', () => {
+    const yaml = workflow('$review.output.proposal.action', 'when').replace(
+      "== 'add'",
+      "== '$review.output.proposal.typo[0]'"
+    );
+    expect(parseWorkflow(yaml, 'nested.yaml').workflow).not.toBeNull();
+  });
+  it('preserves named input macros starting with output', () => {
+    const yaml = workflow('$INPUTS.outputMode').replace(
+      'nodes:',
+      'inputs:\n  outputMode: {required: true}\nnodes:'
+    );
+    expect(parseWorkflow(yaml, 'nested.yaml').error).toBeNull();
+  });
+
+  it('does not authorize undeclared prior fields in the enclosing loop body', () => {
+    const result = parseWorkflow(
+      `
+name: prior-contract
+description: prior access
+nodes:
+  - id: group
+    loop_group:
+      max_iterations: 2
+      until_bash: 'test $LOOP_PREV.work.output.proposal.typo = add'
+      nodes:
+        - id: work
+          bash: echo json
+          output_format:
+            properties:
+              proposal: {type: object, properties: {action: {type: string}}}
+`,
+      'prior.yaml'
+    );
+    expect(result.error?.error).toContain('$LOOP_PREV.work.output.proposal.typo');
+    expect(result.error?.error).toContain("field 'typo'");
+  });
+});
+
+describe('loop_group prose completion with structured terminal output (#2998)', () => {
+  function parseGroup(outputFormat?: Record<string, unknown>, untilBash?: string): ParseResult {
+    return parseWorkflow(
+      Bun.YAML.stringify({
+        name: 'structured-group',
+        description: 'test',
+        nodes: [
+          {
+            id: 'refine',
+            loop_group: {
+              until: 'DONE',
+              ...(untilBash === undefined ? {} : { until_bash: untilBash }),
+              max_iterations: 3,
+              nodes: [
+                { id: 'work', prompt: 'work' },
+                {
+                  id: 'review',
+                  depends_on: ['work'],
+                  prompt: 'review',
+                  ...(outputFormat === undefined ? {} : { output_format: outputFormat }),
+                },
+              ],
+            },
+          },
+        ],
+      }),
+      'structured-group.yaml'
+    );
+  }
+
+  it('rejects an object terminal schema when until is the sole completion channel', () => {
+    const result = parseGroup({ type: 'object', properties: { done: { type: 'boolean' } } });
+    expect(result.workflow).toBeNull();
+    expect(result.error?.errorType).toBe('validation_error');
+    expect(result.error?.error).toContain("'refine'");
+    expect(result.error?.error).toContain("'review'");
+    expect(result.error?.error).toContain('serialized structured output');
+    expect(result.error?.error).toContain('until_bash');
+    expect(result.error?.error).toContain('structured field');
+  });
+
+  it.each([
+    { type: 'array' },
+    { type: 'number' },
+    { type: 'integer' },
+    { type: 'boolean' },
+    { type: 'null' },
+    { type: ['object', 'null'] },
+  ])('rejects a non-string terminal schema: %j', schema => {
+    expect(parseGroup(schema).error?.errorType).toBe('validation_error');
+  });
+
+  it.each([{}, { type: ['string', 'object'] }])(
+    'accepts a schema that permits string output: %j',
+    schema => {
+      expect(parseGroup(schema).error).toBeNull();
+    }
+  );
+
+  it('judges the node a terminal gate reads past to (#4043)', () => {
+    const result = parseWorkflow(
+      Bun.YAML.stringify({
+        name: 'structured-group-gate',
+        description: 'test',
+        nodes: [
+          {
+            id: 'refine',
+            loop_group: {
+              until: 'DONE',
+              max_iterations: 3,
+              nodes: [
+                {
+                  id: 'work',
+                  prompt: 'work',
+                  output_format: { type: 'object', properties: { done: { type: 'boolean' } } },
+                },
+                { id: 'ask', depends_on: ['work'], approval: { message: 'ok?' } },
+              ],
+            },
+          },
+        ],
+      }),
+      'structured-group-gate.yaml'
+    );
+    expect(result.error?.error).toContain("node 'work', which the group's output is read from");
+  });
+
+  it('judges every node a terminal gate reads past to (#4043)', () => {
+    const result = parseWorkflow(
+      Bun.YAML.stringify({
+        name: 'structured-group-gate-fan-in',
+        description: 'test',
+        nodes: [
+          {
+            id: 'refine',
+            loop_group: {
+              until: 'DONE',
+              max_iterations: 3,
+              nodes: [
+                { id: 'notes', prompt: 'notes' },
+                {
+                  id: 'work',
+                  prompt: 'work',
+                  output_format: { type: 'object', properties: { done: { type: 'boolean' } } },
+                },
+                { id: 'ask', depends_on: ['notes', 'work'], approval: { message: 'ok?' } },
+              ],
+            },
+          },
+        ],
+      }),
+      'structured-group-gate-fan-in.yaml'
+    );
+    expect(result.error?.error).toContain("node 'work', which the group's output is read from");
+  });
+
+  it('accepts a terminal node without output_format', () => {
+    expect(parseGroup().error).toBeNull();
+  });
+
+  it('accepts a string terminal schema', () => {
+    expect(parseGroup({ type: 'string' }).error).toBeNull();
+  });
+
+  it('accepts an object terminal schema with until_bash and retains the deprecation warning', () => {
+    const result = parseGroup(
+      { type: 'object', properties: { done: { type: 'boolean' } } },
+      'exit 0'
+    );
+    expect(result.error).toBeNull();
+    expect(
+      result.warnings?.some(w => w.includes("'loop_group.until' completion signal is deprecated"))
+    ).toBe(true);
+  });
+});
+
+it('parsing uses only the supplied registry for provider identity', () => {
+  const claude = providerRegistry.get('claude');
+  if (!claude) throw new Error('test registry must contain Claude');
+  const custom = { ...claude, id: 'custom' };
+  const providers = {
+    get: (id: string) => (id === custom.id ? custom : undefined),
+    list: () => [custom],
+  };
+  const yaml = `name: registry-port
+description: Registry boundary
+provider: custom
+nodes:
+  - id: act
+    prompt: Do something
+`;
+  expect(parseWorkflowWithProviders(yaml, 'registry.yaml', providers).error).toBeNull();
+  const result = parseWorkflowWithProviders(
+    yaml.replace('provider: custom', 'provider: claude'),
+    'registry.yaml',
+    providers
+  );
+  expect(result.error?.error).toBe(
+    "Provider 'claude' is not installed. Add it with: archon provider add claude"
+  );
+});
+
+describe('when syntax validation', () => {
+  function workflowWithWhen(when: string): string {
+    return `name: when-syntax
+description: Condition syntax
+nodes:
+  - id: a
+    bash: echo x
+  - id: b
+    bash: echo y
+  - id: c
+    bash: echo z
+  - id: guarded
+    bash: echo run
+    depends_on: [a, b, c]
+    when: ${JSON.stringify(when)}
+`;
+  }
+
+  it('rejects grouping with a diagnostic naming the node and parentheses', () => {
+    const result = parseWorkflow(
+      workflowWithWhen("$a.output == 'x' && ($b.output == 'y' || $c.output == 'z')"),
+      'when-syntax.yaml'
+    );
+    expect(result.workflow).toBeNull();
+    expect(result.error?.error).toContain("Node 'guarded'");
+    expect(result.error?.error).toContain('parentheses');
+  });
+
+  it('rejects malformed loop-body conditions while accepting scoped prior output', () => {
+    const yaml = `name: prior-condition
+description: Prior iteration syntax
+nodes:
+  - id: refine
+    loop_group:
+      until_bash: exit 0
+      max_iterations: 2
+      nodes:
+        - id: work
+          bash: echo done
+        - id: guarded
+          bash: echo run
+          depends_on: [work]
+          when: "$LOOP_PREV.work.output == 'done' && ($work.output == 'done')"
+`;
+    const result = parseWorkflow(yaml, 'prior-condition.yaml');
+    expect(result.error?.error).toContain("Node 'guarded' field 'when'");
+    expect(result.error?.error).toContain('parentheses');
+    expect(
+      parseWorkflow(
+        yaml.replace("&& ($work.output == 'done')", "&& $work.output == 'done'"),
+        'prior-condition.yaml'
+      ).error
+    ).toBeNull();
+  });
+
+  it.each([
+    'not a condition',
+    "$a.output = 'x'",
+    '$a.output ==',
+    '$a.output == "x"',
+    "$a.output == 'unterminated",
+    "$a.output == 'x' &&",
+    "|| $a.output == 'x'",
+    "$a.output == 'x' || || $b.output == 'y'",
+    "$a.output == 'x' && not-valid",
+    "$a.output == 'x' || not-valid",
+    "$a.output == 'absent' && not-valid",
+    "($a.output == 'x')",
+    "$a.output == 'x' && ($b.output == 'y' || $c.output == 'z')",
+  ])('rejects invalid runtime syntax: %s', when => {
+    const outputs = new Map([
+      ['a', { state: 'completed' as const, output: 'x' }],
+      ['b', { state: 'completed' as const, output: 'y' }],
+      ['c', { state: 'completed' as const, output: 'z' }],
+    ]);
+    expect(evaluateCondition(when, outputs)).toEqual({ result: false, parsed: false });
+    const result = parseWorkflow(workflowWithWhen(when), 'when-syntax.yaml');
+    expect(result.workflow).toBeNull();
+    expect(result.error?.error).toContain("Node 'guarded' field 'when'");
+  });
+
+  it.each([
+    "$a.output > 'high'",
+    "$a.output > ''",
+    '$a.output <= true',
+    "$a.output == 'x' || $b.output >= 'many'",
+  ])('rejects a numeric comparison against a non-numeric literal: %s', when => {
+    // A numeric output on every side still fails closed, so the node could never run.
+    const outputs = new Map(
+      ['a', 'b', 'c'].map(id => [id, { state: 'completed' as const, output: '90' }])
+    );
+    expect(evaluateCondition(when, outputs)).toEqual({ result: false, parsed: false });
+    const result = parseWorkflow(workflowWithWhen(when), 'when-syntax.yaml');
+    expect(result.workflow).toBeNull();
+    expect(result.error?.error).toContain("Node 'guarded' field 'when'");
+  });
+
+  it('names grouping only when the expression has a parenthesis outside quotes', () => {
+    const typo = parseWorkflow(workflowWithWhen("$a.output = '(x)'"), 'when-syntax.yaml');
+    expect(typo.error?.error).toContain('unsupported condition syntax');
+    expect(typo.error?.error).not.toContain('parentheses');
+    const grouped = parseWorkflow(workflowWithWhen("($a.output == 'x')"), 'when-syntax.yaml');
+    expect(grouped.error?.error).toContain('Grouping parentheses are not supported');
+  });
+
+  it('rejects unsupported syntax on an include node', () => {
+    const result = parseWorkflow(
+      `name: include-when
+description: Condition on an include directive
+nodes:
+  - id: a
+    bash: echo x
+  - id: blk
+    include: block
+    depends_on: [a]
+    when: "$a.output > 'high'"
+`,
+      'include-when.yaml'
+    );
+    expect(result.workflow).toBeNull();
+    expect(result.error?.error).toContain(
+      "Node 'blk' field 'when' has unsupported condition syntax"
+    );
+  });
+
+  it.each([
+    "$a.output == 'x' && $b.output == 'y' || $a.output == 'x' && $c.output == 'z'",
+    "$a.output == '(x)'",
+    "$a.output == 'x && y || z'",
+    "$a.output != ''",
+    '$a.output >= 0.9',
+    "$a.output < '-3'",
+    '$a.output == true',
+  ])('loads supported syntax: %s', when => {
+    expect(parseWorkflow(workflowWithWhen(when), 'when-syntax.yaml').error).toBeNull();
+  });
+});
+
+describe('attention wait labels', () => {
+  const parseLabels = (labels: string, dependsOn = '[plan]'): ParseResult =>
+    parseWorkflow(
+      `name: labeled
+description: Labels on an attention wait
+nodes:
+  - id: plan
+    bash: echo '{}'
+  - id: other
+    bash: echo '{}'
+  - id: ask
+    depends_on: ${dependsOn}
+    wait:
+      attention: CI is red. Retry?
+      labels: ${labels}
+`,
+      'labeled.yaml'
+    );
+
+  it('loads literal labels and labels that reference an upstream output', () => {
+    expect(parseLabels('{ ci: "$plan.output.cause", area: delivery }').error).toBeNull();
+  });
+
+  it('rejects a label key a CLI filter could not name', () => {
+    expect(parseLabels('{ "ci=x": other }').error).not.toBeNull();
+  });
+
+  it('rejects a label that references a node the wait does not depend on', () => {
+    expect(parseLabels('{ ci: "$other.output.cause" }').error?.error).toContain(
+      "field 'wait.labels.ci' references '$other.output', which is not an upstream dependency"
+    );
+  });
+});
+
+describe('attention wait options from an upstream output_format (#4038)', () => {
+  function parseWithOptionsItems(items: Record<string, unknown>): ParseResult {
+    const outputFormat = {
+      type: 'object',
+      properties: { options: { type: 'array', items } },
+      required: ['options'],
+    };
+    return parseWorkflow(
+      `name: referenced-options
+description: Options computed upstream
+nodes:
+  - id: plan
+    prompt: Propose options.
+    output_format: ${JSON.stringify(outputFormat)}
+  - id: ask
+    depends_on: [plan]
+    wait:
+      attention: Which one?
+      form: select
+      options: "$plan.output.options"
+`,
+      'referenced-options.yaml'
+    );
+  }
+
+  it('loads a producer whose items declare { id, label? }', () => {
+    const result = parseWithOptionsItems({
+      type: 'object',
+      properties: { id: { type: 'string' }, label: { type: 'string' } },
+      required: ['id'],
+    });
+    expect(result.error).toBeNull();
+  });
+
+  it.each([
+    ['items that are strings', { type: 'string' }],
+    ['an id that is not required', { type: 'object', properties: { id: { type: 'string' } } }],
+    [
+      'an id that is not a string',
+      { type: 'object', properties: { id: { type: 'number' } }, required: ['id'] },
+    ],
+    [
+      'a property attention options do not have',
+      {
+        type: 'object',
+        properties: { id: { type: 'string' }, score: { type: 'number' } },
+        required: ['id'],
+      },
+    ],
+  ])('rejects a producer with %s, naming the field and the producer', (_case, items) => {
+    const result = parseWithOptionsItems(items);
+    expect(result.error?.error).toContain("Node 'ask' field 'wait.options'");
+    expect(result.error?.error).toContain(
+      "must be an array of objects declaring only { id: string; label?: string } in 'plan's output_format"
+    );
+  });
 });

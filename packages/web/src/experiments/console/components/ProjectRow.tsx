@@ -1,13 +1,14 @@
 import { useEffect, useRef, useState, type ReactElement } from 'react';
-import { useDisplayName, setDisplayName } from '../lib/display-name';
 import { formatProjectLocator } from '../lib/format';
+import { HttpError, errorDetail } from '../lib/http';
 import type { Project } from '../primitives/project';
 
 interface ProjectRowProps {
   project: Project;
   selected: boolean;
   onClick: () => void;
-  onRemove?: () => void;
+  onRemove?: () => Promise<void>;
+  onRename?: (name: string) => Promise<void>;
   onEditEnv?: () => void;
 }
 
@@ -39,6 +40,24 @@ function DotsIcon({ size = 17 }: { size?: number }): ReactElement {
   );
 }
 
+function PencilIcon({ size = 15 }: { size?: number }): ReactElement {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.6"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden
+    >
+      <path d="M12 20h9M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4z" />
+    </svg>
+  );
+}
+
 function TrashIcon({ size = 15 }: { size?: number }): ReactElement {
   return (
     <svg
@@ -63,34 +82,42 @@ function TrashIcon({ size = 15 }: { size?: number }): ReactElement {
  * Rail row, design v2: monogram tile + repo-only title (the owner lives in
  * the group header above) + locator path + hover actions. Selection is the
  * gradient strip, gradient monogram, elevated background, and a LIVE pulse.
- * Double-click the title to rename; the path stays as a stable subtitle.
+ * Double-click the title (or use the ⋯ menu) to rename the project on the
+ * server; the path stays as a stable subtitle.
  */
 export function ProjectRow({
   project,
   selected,
   onClick,
   onRemove,
+  onRename,
   onEditEnv,
 }: ProjectRowProps): ReactElement {
-  const displayName = useDisplayName(project.id, project.name);
-  // Group headers already show the owner — strip it from the row label
-  // unless the user renamed the project (then show their name verbatim).
-  const label =
-    displayName === project.name && project.name.includes('/')
-      ? project.name.slice(project.name.indexOf('/') + 1)
-      : displayName;
+  // Group headers already show the owner — strip it from the row label.
+  const label = project.name.includes('/')
+    ? project.name.slice(project.name.indexOf('/') + 1)
+    : project.name;
   const monogram = (label[0] ?? '?').toUpperCase();
+  const hasMenu = onRemove !== undefined || onRename !== undefined;
   const [editing, setEditing] = useState(false);
-  const [draft, setDraft] = useState(displayName);
+  const [draft, setDraft] = useState(project.name);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [removing, setRemoving] = useState(false);
+  const [removeError, setRemoveError] = useState<string | null>(null);
+  const [renaming, setRenaming] = useState(false);
+  const [renameError, setRenameError] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
+  // Escape and Enter both end editing through blur, so the rename has exactly
+  // one commit path; this flag tells that path to discard the draft.
+  const cancelEditRef = useRef(false);
+  const busy = removing || renaming;
 
   useEffect(() => {
     if (editing) {
-      setDraft(displayName);
+      setDraft(project.name);
       inputRef.current?.select();
     }
-  }, [editing, displayName]);
+  }, [editing, project.name]);
 
   // Close the ⋯ menu on outside click.
   useEffect(() => {
@@ -104,35 +131,64 @@ export function ProjectRow({
     };
   }, [menuOpen]);
 
-  const commit = (): void => {
-    if (draft.trim() === project.name) setDisplayName(project.id, '');
-    else setDisplayName(project.id, draft);
+  const finishEditing = async (): Promise<void> => {
+    const cancelled = cancelEditRef.current;
+    cancelEditRef.current = false;
     setEditing(false);
+    const name = draft.trim();
+    if (cancelled || onRename === undefined || name === '' || name === project.name) return;
+    setRenaming(true);
+    setRenameError(null);
+    try {
+      await onRename(name);
+    } catch (renameFailure: unknown) {
+      // serverError carries the full refusal; errorDetail only sees a capped snippet.
+      setRenameError(
+        renameFailure instanceof HttpError && renameFailure.serverError !== undefined
+          ? renameFailure.serverError
+          : errorDetail(renameFailure)
+      );
+    } finally {
+      setRenaming(false);
+    }
   };
-  const cancel = (): void => {
-    setEditing(false);
+
+  const requestRemoval = async (): Promise<void> => {
+    if (onRemove === undefined || removing) return;
+    setRemoving(true);
+    setRemoveError(null);
+    try {
+      await onRemove();
+    } catch (removeFailure: unknown) {
+      setRemoveError(
+        removeFailure instanceof Error ? removeFailure.message : 'Could not remove project.'
+      );
+    } finally {
+      setRemoving(false);
+    }
   };
 
   return (
     <div
       onClick={editing || menuOpen ? undefined : onClick}
       onContextMenu={e => {
-        if (onRemove === undefined || editing) return;
+        if (!hasMenu || editing || busy) return;
         e.preventDefault();
         setMenuOpen(true);
       }}
       role="button"
       tabIndex={editing ? -1 : 0}
       onKeyDown={e => {
-        if (editing) return;
+        if (editing || e.target !== e.currentTarget) return;
         if (e.key === 'Enter' || e.key === ' ') {
           e.preventDefault();
           onClick();
         }
       }}
+      aria-busy={busy}
       aria-pressed={selected}
-      title={`${displayName} · double-click to rename`}
-      className={`group relative flex w-full cursor-pointer items-center gap-[11px] rounded-[10px] border px-2.5 py-2 text-left transition-colors ${
+      title={onRename === undefined ? project.name : `${project.name} · double-click to rename`}
+      className={`group relative flex w-full cursor-pointer flex-wrap items-center gap-x-[11px] gap-y-2 rounded-[10px] border px-2.5 py-2 text-left transition-colors ${
         selected ? 'bg-surface-elevated' : 'bg-transparent hover:bg-surface-hover'
       }`}
       // Inline because the console scope's wildcard `border-color: var(--border)`
@@ -140,7 +196,15 @@ export function ProjectRow({
       style={{ borderColor: selected ? 'var(--border-bright)' : 'transparent' }}
     >
       {/* Brand gradient strip — the unmistakable "this is selected" cue. */}
-      {selected ? (
+      {removing ? (
+        <span className="shrink-0 font-mono text-[10px] font-semibold uppercase tracking-[0.05em] text-text-tertiary">
+          removing…
+        </span>
+      ) : renaming ? (
+        <span className="shrink-0 font-mono text-[10px] font-semibold uppercase tracking-[0.05em] text-text-tertiary">
+          renaming…
+        </span>
+      ) : selected ? (
         <span
           aria-hidden
           className="brand-bar pointer-events-none absolute -left-px bottom-[9px] top-[9px] w-[3px] rounded-r-[3px]"
@@ -171,14 +235,15 @@ export function ProjectRow({
             onKeyDown={e => {
               if (e.key === 'Enter') {
                 e.preventDefault();
-                commit();
+                e.currentTarget.blur();
               } else if (e.key === 'Escape') {
                 e.preventDefault();
-                cancel();
+                cancelEditRef.current = true;
+                e.currentTarget.blur();
               }
               e.stopPropagation();
             }}
-            onBlur={commit}
+            onBlur={() => void finishEditing()}
             onClick={e => {
               e.stopPropagation();
             }}
@@ -190,6 +255,7 @@ export function ProjectRow({
         ) : (
           <span
             onDoubleClick={e => {
+              if (onRename === undefined || busy) return;
               e.stopPropagation();
               setEditing(true);
             }}
@@ -244,10 +310,11 @@ export function ProjectRow({
             <KeyIcon />
           </button>
         ) : null}
-        {onRemove !== undefined ? (
+        {hasMenu ? (
           <div className="relative">
             <button
               type="button"
+              disabled={busy}
               onClick={e => {
                 e.stopPropagation();
                 setMenuOpen(v => !v);
@@ -255,7 +322,7 @@ export function ProjectRow({
               title="More actions"
               aria-label="More actions"
               aria-expanded={menuOpen}
-              className={`flex h-[29px] w-[29px] items-center justify-center rounded-lg transition-colors hover:bg-surface-hover hover:text-text-primary ${
+              className={`flex h-[29px] w-[29px] items-center justify-center rounded-lg transition-colors hover:bg-surface-hover hover:text-text-primary disabled:cursor-wait disabled:opacity-50 ${
                 menuOpen ? 'bg-surface-hover text-text-primary' : 'text-text-tertiary'
               }`}
             >
@@ -272,27 +339,89 @@ export function ProjectRow({
                 // rule repaints Tailwind border utilities (see theme.css).
                 style={{ borderColor: 'var(--border-bright)' }}
               >
-                <button
-                  type="button"
-                  role="menuitem"
-                  onClick={e => {
-                    e.stopPropagation();
-                    setMenuOpen(false);
-                    const confirmed = window.confirm(
-                      `Remove project "${displayName}"?\n\nLocal files and worktrees are not deleted.`
-                    );
-                    if (confirmed) onRemove();
-                  }}
-                  className="flex w-full items-center gap-2.5 rounded-lg px-[11px] py-[9px] text-left text-[13px] font-semibold text-error transition-colors hover:bg-error/10"
-                >
-                  <TrashIcon />
-                  Remove project
-                </button>
+                {onRename !== undefined ? (
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={e => {
+                      e.stopPropagation();
+                      setMenuOpen(false);
+                      setEditing(true);
+                    }}
+                    className="flex w-full items-center gap-2.5 rounded-lg px-[11px] py-[9px] text-left text-[13px] font-semibold text-text-primary transition-colors hover:bg-surface-elevated"
+                  >
+                    <PencilIcon />
+                    Rename project
+                  </button>
+                ) : null}
+                {onRemove !== undefined ? (
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={e => {
+                      e.stopPropagation();
+                      setMenuOpen(false);
+                      const confirmed = window.confirm(
+                        `Remove project "${project.name}"?\n\nLocal files and worktrees are not deleted.`
+                      );
+                      if (confirmed) void requestRemoval();
+                    }}
+                    className="flex w-full items-center gap-2.5 rounded-lg px-[11px] py-[9px] text-left text-[13px] font-semibold text-error transition-colors hover:bg-error/10"
+                  >
+                    <TrashIcon />
+                    Remove project
+                  </button>
+                ) : null}
               </div>
             ) : null}
           </div>
         ) : null}
       </div>
+      {removeError !== null ? (
+        <div
+          role="alert"
+          onClick={event => {
+            event.stopPropagation();
+          }}
+          onKeyDown={event => {
+            event.stopPropagation();
+          }}
+          className="basis-full rounded border border-error/40 bg-error/10 px-2 py-1.5 font-mono text-[10px] text-error [overflow-wrap:anywhere]"
+        >
+          <p>{removeError}</p>
+          <button
+            type="button"
+            onClick={() => void requestRemoval()}
+            disabled={removing}
+            className="mt-1 font-semibold underline underline-offset-2 disabled:cursor-wait disabled:opacity-50"
+          >
+            Retry removal
+          </button>
+        </div>
+      ) : null}
+      {renameError !== null ? (
+        <div
+          role="alert"
+          onClick={event => {
+            event.stopPropagation();
+          }}
+          onKeyDown={event => {
+            event.stopPropagation();
+          }}
+          className="basis-full rounded border border-error/40 bg-error/10 px-2 py-1.5 font-mono text-[10px] text-error [overflow-wrap:anywhere]"
+        >
+          <p>{renameError}</p>
+          <button
+            type="button"
+            onClick={() => {
+              setRenameError(null);
+            }}
+            className="mt-1 font-semibold underline underline-offset-2"
+          >
+            Dismiss
+          </button>
+        </div>
+      ) : null}
     </div>
   );
 }

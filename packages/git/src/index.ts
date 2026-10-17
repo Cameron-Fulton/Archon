@@ -1,3 +1,5 @@
+export { GitFailure } from './errors';
+export type { GitFailureKind } from './errors';
 // Types
 export type {
   RepoPath,
@@ -24,23 +26,42 @@ export {
   findWorktreeByBranch,
   isWorktreePath,
   removeWorktree,
+  unlockWorktree,
+  readWorktreeLock,
+  refreshWorktreeIndex,
   getCanonicalRepoPath,
+  getGitCheckoutIdentity,
+  CanonicalRepoPathUnavailableError,
   verifyWorktreeOwnership,
+  isWorktreeRegistered,
+  readWorktreeRegistration,
+  isSameWorktreePath,
+  toNativeWorktreePath,
 } from './worktree';
-export type { WorktreeLayout, WorktreeBaseOverride } from './worktree';
+export type {
+  WorktreeLayout,
+  WorktreeBaseOverride,
+  GitCheckoutIdentity,
+  WorktreeLock,
+} from './worktree';
 
 // Branch operations
 export {
   getDefaultBranch,
   getUniqueCommitCount,
   getCurrentBranch,
+  getCurrentBranchStrict,
+  localBranchExists,
   countCommitsAhead,
+  countCommitsMissingFromRemotes,
   checkout,
   hasUncommittedChanges,
+  hasUncommittedChangesStrict,
   commitAllChanges,
   isBranchMerged,
   isPatchEquivalent,
   isAncestorOf,
+  isRevCoveredBy,
   getLastCommitDate,
 } from './branch';
 
@@ -55,7 +76,20 @@ export {
   getRemoteUrl,
   listChildRepos,
   syncWorkspace,
+  fetchWithRetry,
   cloneRepository,
+  validateCloneUrl,
   syncRepository,
   addSafeDirectory,
 } from './repo';
+export type { CloneCredentials, CloneRepositoryOptions } from './repo';
+
+export {
+  inspectRemoteBranches,
+  validateBranchName,
+  ConfiguredBaseBranchNotFoundError,
+  InvalidBaseBranchError,
+} from './remote-branches';
+export type { RemoteBranchTarget, RemoteBranches } from './remote-branches';
+
+export { githubTokenCredentials } from './credentials';

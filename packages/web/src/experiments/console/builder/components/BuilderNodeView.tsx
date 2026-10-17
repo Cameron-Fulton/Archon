@@ -2,13 +2,13 @@
  * Custom xyflow node renderer for builder nodes. Follows the production
  * `DagNodeComponent` layout (left color stripe, badge, label, content
  * preview) restyled with console tokens; the stripe and badge colors come
- * from the `--node-<variant>` CSS variables so all seven variants render a
+ * from the `--node-<variant>` CSS variables so all eight variants render a
  * distinct identity without hard-coded hex.
  */
 import { memo, type CSSProperties, type ReactElement, type ReactNode } from 'react';
 import { Handle, Position, type NodeProps } from '@xyflow/react';
-import { VARIANT_REGISTRY } from '../variants';
-import type { BuilderNode } from '../types';
+import { nodeCapabilities } from '../variants';
+import type { BuilderNode, WireDagNode } from '../types';
 import type { BuilderFlowNode } from '../flow/types';
 
 /** First line of the node's main content, for the in-node preview. */
@@ -27,14 +27,35 @@ export function contentPreview(node: BuilderNode): string {
       return node.data.command ?? node.data.prompt?.split('\n')[0] ?? '';
     case 'approval':
       return node.data.message.split('\n')[0] ?? '';
+    case 'wait':
+      return (
+        node.data.attention ??
+        node.data.event ??
+        node.data.until ??
+        `${String(node.data.duration_ms ?? 0)} ms`
+      );
     case 'cancel':
       return node.data.reason.split('\n')[0] ?? '';
+    case 'opaque':
+      return opaquePreview(node.data.fields);
   }
+}
+
+/** Preview line for a read-only node: the sub-workflow / include target, or the group size. */
+function opaquePreview(fields: Partial<WireDagNode>): string {
+  if (fields.workflow !== undefined) {
+    return fields.fan_out !== undefined
+      ? `${fields.workflow} × ${fields.fan_out.items}`
+      : fields.workflow;
+  }
+  if (fields.include !== undefined) return fields.include;
+  const inner = fields.loop_group?.nodes.length ?? 0;
+  return `${String(inner)} nodes, ≤${String(fields.loop_group?.max_iterations ?? 0)} rounds`;
 }
 
 function BuilderNodeRender({ data, selected }: NodeProps<BuilderFlowNode>): ReactElement {
   const node = data.node;
-  const capabilities = VARIANT_REGISTRY[node.variant].capabilities;
+  const capabilities = nodeCapabilities(node);
   const preview = contentPreview(node);
   const stripeStyle: CSSProperties = { background: `var(--node-${node.variant})` };
   const badgeStyle: CSSProperties = {
@@ -76,7 +97,7 @@ function BuilderNodeRender({ data, selected }: NodeProps<BuilderFlowNode>): Reac
           {node.base.trigger_rule !== undefined && node.base.trigger_rule !== 'all_success' ? (
             <Pill>{node.base.trigger_rule}</Pill>
           ) : null}
-          {capabilities.requiresInteractive === true ? <Pill>interactive</Pill> : null}
+          {capabilities.pausesRun === true ? <Pill>pauses</Pill> : null}
           {node.base.output_format !== undefined ? <Pill>{'{}'} JSON</Pill> : null}
         </div>
       </div>

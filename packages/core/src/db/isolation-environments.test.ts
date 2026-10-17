@@ -1,31 +1,40 @@
+// @archon-test-isolated
+import { setPlatformPolicies } from '../platforms/registry';
 import { mock, describe, test, expect, beforeEach } from 'bun:test';
-import { createQueryResult, mockPostgresDialect } from '../test/mocks/database';
+import { createMockQuery, createQueryResult, mockPostgresDialect } from '../test/mocks/database';
 import type { IsolationEnvironmentRow } from '@archon/isolation';
+import { resolve } from 'node:path';
+import { InvalidCodebaseDefaultCwdError } from './codebases';
+import { toBranchName } from '@archon/git';
 
-const mockQuery = mock(() => Promise.resolve(createQueryResult([])));
+const mockQuery = createMockQuery();
 
 mock.module('./connection', () => ({
   pool: {
     query: mockQuery,
   },
   getDialect: () => mockPostgresDialect,
+  getDatabaseType: (): 'postgresql' => 'postgresql',
 }));
 
 import {
   getById,
   findActiveByWorkflow,
   listByCodebase,
+  findLatestByCodebaseAndWorkingPath,
   create,
   updateStatus,
   updateMetadata,
   countActiveByCodebase,
-  getConversationsUsingEnv,
+  getLiveRunOwningEnv,
   findStaleEnvironments,
   listAllActiveWithCodebase,
+  findActiveByBranchName,
 } from './isolation-environments';
 
 describe('isolation-environments', () => {
   beforeEach(() => {
+    setPlatformPolicies([]);
     mockQuery.mockClear();
   });
 
@@ -43,6 +52,47 @@ describe('isolation-environments', () => {
     created_by_user_id: null,
     metadata: {},
   };
+
+  for (const [name, read] of [
+    ['stale', () => findStaleEnvironments()],
+    ['branch', () => findActiveByBranchName('issue-42')],
+    ['active', () => listAllActiveWithCodebase()],
+  ] as const) {
+    test(`${name} joined reader rejects a legacy relative path`, async () => {
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([
+          { ...sampleEnv, codebase_name: 'legacy', codebase_default_cwd: 'projects/repo' },
+        ])
+      );
+      await expect(read()).rejects.toBeInstanceOf(InvalidCodebaseDefaultCwdError);
+    });
+  }
+
+  test('an invalid row rejects the entire joined collection', async () => {
+    mockQuery.mockResolvedValueOnce(
+      createQueryResult([
+        { ...sampleEnv, codebase_name: 'valid', codebase_default_cwd: resolve('valid') },
+        { ...sampleEnv, id: 'invalid', codebase_name: 'legacy', codebase_default_cwd: './repo' },
+      ])
+    );
+    await expect(listAllActiveWithCodebase()).rejects.toThrow('/register-project "legacy"');
+  });
+
+  test('branch lookup preserves null and normalizes valid rows', async () => {
+    mockQuery.mockResolvedValueOnce(createQueryResult([]));
+    expect(await findActiveByBranchName('missing')).toBeNull();
+    mockQuery.mockResolvedValueOnce(
+      createQueryResult([
+        {
+          ...sampleEnv,
+          codebase_name: 'valid',
+          codebase_default_cwd: resolve('valid'),
+          metadata: '{"key":"value"}',
+        },
+      ])
+    );
+    expect((await findActiveByBranchName('issue-42'))?.metadata).toEqual({ key: 'value' });
+  });
 
   describe('getById', () => {
     test('returns environment when found', async () => {
@@ -163,6 +213,39 @@ describe('isolation-environments', () => {
     });
   });
 
+  describe('findLatestByCodebaseAndWorkingPath', () => {
+    test('returns a destroyed row so adoption can recover its branch', async () => {
+      const destroyed = { ...sampleEnv, status: 'destroyed' as const };
+      mockQuery.mockResolvedValueOnce(createQueryResult([destroyed]));
+
+      const result = await findLatestByCodebaseAndWorkingPath(
+        'codebase-456',
+        '/workspace/worktrees/project/issue-42',
+        new Date('2026-08-20T10:00:00.000Z')
+      );
+
+      expect(result).toEqual(destroyed);
+      expect(mockQuery).toHaveBeenCalledWith(
+        expect.stringContaining('codebase_id = $1 AND working_path = $2'),
+        ['codebase-456', '/workspace/worktrees/project/issue-42', '2026-08-20T10:00:00.000Z']
+      );
+      expect((mockQuery.mock.calls[0]?.[0] as string).includes("status = 'active'")).toBe(false);
+      expect(mockQuery.mock.calls[0]?.[0]).toContain('created_at <= $3');
+    });
+
+    test('returns null when the path has no isolation history', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([]));
+
+      const result = await findLatestByCodebaseAndWorkingPath(
+        'codebase-456',
+        '/missing',
+        new Date('2026-08-20T10:00:00.000Z')
+      );
+
+      expect(result).toBeNull();
+    });
+  });
+
   describe('create', () => {
     test('creates new environment with defaults', async () => {
       mockQuery.mockResolvedValueOnce(createQueryResult([sampleEnv]));
@@ -172,7 +255,7 @@ describe('isolation-environments', () => {
         workflow_type: 'issue',
         workflow_id: '42',
         working_path: '/workspace/worktrees/project/issue-42',
-        branch_name: 'issue-42',
+        branch_name: toBranchName('issue-42'),
       });
 
       expect(result).toEqual(sampleEnv);
@@ -192,7 +275,7 @@ describe('isolation-environments', () => {
         workflow_id: '42',
         provider: 'container',
         working_path: '/workspace/worktrees/project/issue-42',
-        branch_name: 'issue-42',
+        branch_name: toBranchName('issue-42'),
         created_by_platform: 'slack',
         metadata: { custom: true },
       });
@@ -223,7 +306,7 @@ describe('isolation-environments', () => {
         workflow_type: 'issue',
         workflow_id: '42',
         working_path: '/workspace/worktrees/project/issue-42',
-        branch_name: 'issue-42',
+        branch_name: toBranchName('issue-42'),
       });
 
       const [query] = mockQuery.mock.calls[0] as [string, unknown[]];
@@ -240,7 +323,7 @@ describe('isolation-environments', () => {
         workflow_type: 'issue',
         workflow_id: '42',
         working_path: '/workspace/worktrees/project/issue-42-v2',
-        branch_name: 'issue-42-v2',
+        branch_name: toBranchName('issue-42-v2'),
       });
 
       const [query] = mockQuery.mock.calls[0] as [string, unknown[]];
@@ -261,7 +344,7 @@ describe('isolation-environments', () => {
         workflow_type: 'issue',
         workflow_id: '42',
         working_path: '/workspace/worktrees/project/issue-42',
-        branch_name: 'issue-42',
+        branch_name: toBranchName('issue-42'),
         created_by_user_id: 'user-bob',
       });
 
@@ -327,25 +410,42 @@ describe('isolation-environments', () => {
     });
   });
 
-  describe('getConversationsUsingEnv', () => {
-    test('returns conversation IDs using the environment', async () => {
-      mockQuery.mockResolvedValueOnce(createQueryResult([{ id: 'conv-1' }, { id: 'conv-2' }]));
+  describe('getLiveRunOwningEnv', () => {
+    // Only the parameters are asserted here. This file hardcodes the Postgres
+    // dialect, so asserting SQL text would pin one branch of a dialect-parallel
+    // query; the real-SQLite and real-Postgres integration tests prove behavior
+    // on both. Without a release 'failed' must NOT appear: it is terminal but
+    // resumable, so a failed run keeps its environment until a sweep settles it.
+    test('excludes only the statuses no run can claim back', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([{ id: 'run-1', status: 'running' }]));
 
-      const result = await getConversationsUsingEnv('env-123');
+      const result = await getLiveRunOwningEnv('env-123');
 
-      expect(result).toEqual(['conv-1', 'conv-2']);
-      expect(mockQuery).toHaveBeenCalledWith(
-        'SELECT id FROM remote_agent_conversations WHERE isolation_env_id = $1',
-        ['env-123']
-      );
+      expect(result).toEqual({ id: 'run-1', status: 'running' });
+      const [, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(params).toEqual(['env-123', 'completed', 'cancelled']);
     });
 
-    test('returns empty array when no conversations use env', async () => {
+    test('a release adds the settleable statuses, and the stale window after them', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([]));
       mockQuery.mockResolvedValueOnce(createQueryResult([]));
 
-      const result = await getConversationsUsingEnv('unused-env');
+      await getLiveRunOwningEnv('env-123', { kind: 'settled' });
+      await getLiveRunOwningEnv('env-123', { kind: 'stale', staleDays: 7 });
 
-      expect(result).toEqual([]);
+      const params = mockQuery.mock.calls.map(call => (call as [string, unknown[]])[1]);
+      expect(params).toEqual([
+        ['env-123', 'completed', 'cancelled', 'failed'],
+        ['env-123', 'completed', 'cancelled', 'failed', 7],
+      ]);
+    });
+
+    test('returns null when the env has no live run', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([]));
+
+      const result = await getLiveRunOwningEnv('unused-env');
+
+      expect(result).toBeNull();
     });
   });
 
@@ -369,18 +469,24 @@ describe('isolation-environments', () => {
       expect(params[0]).toBe(7);
     });
 
-    test('excludes telegram environments in query', async () => {
+    test('only registered age-based platforms enter the stale query', async () => {
+      setPlatformPolicies([
+        { id: 'retain-test', workspaceRetention: 'retain' },
+        { id: 'cli', workspaceRetention: 'age-based' },
+      ]);
       mockQuery.mockResolvedValueOnce(createQueryResult([]));
 
       await findStaleEnvironments();
 
-      const [query] = mockQuery.mock.calls[0] as [string, unknown[]];
-      expect(query).toContain("created_by_platform != 'telegram'");
+      const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(query).toContain('created_by_platform IN ($3)');
+      expect(params).toEqual([14, 14, 'cli']);
     });
 
     test('returns environments with codebase info', async () => {
       const mockEnv = {
         ...sampleEnv,
+        codebase_name: 'myapp',
         codebase_default_cwd: '/workspace/myapp',
       };
       mockQuery.mockResolvedValueOnce(createQueryResult([mockEnv]));
@@ -395,8 +501,18 @@ describe('isolation-environments', () => {
   describe('listAllActiveWithCodebase', () => {
     test('returns all active environments with codebase info', async () => {
       const mockEnvs = [
-        { ...sampleEnv, id: 'env-1', codebase_default_cwd: '/workspace/app1' },
-        { ...sampleEnv, id: 'env-2', codebase_default_cwd: '/workspace/app2' },
+        {
+          ...sampleEnv,
+          id: 'env-1',
+          codebase_name: 'myapp',
+          codebase_default_cwd: '/workspace/app1',
+        },
+        {
+          ...sampleEnv,
+          id: 'env-2',
+          codebase_name: 'myapp',
+          codebase_default_cwd: '/workspace/app2',
+        },
       ];
       mockQuery.mockResolvedValueOnce(createQueryResult(mockEnvs));
 

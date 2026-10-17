@@ -2,22 +2,36 @@
  * Zod schemas for workflow definition types, plus result types for
  * workflow loading and execution (non-schema hand-written discriminated unions).
  */
-import { z } from '@hono/zod-openapi';
+import { z } from 'zod';
+import type { deadlineWaitCursor } from '../store';
 import {
   dagNodeSchema,
   effortLevelSchema,
-  thinkingConfigSchema,
   sandboxSettingsSchema,
   betasSchema,
   KNOWN_DAG_NODE_KEYS,
 } from './dag-node';
-import type { NestedKeySpec } from './dag-node';
+import type { DagNode, NestedKeySpec } from './dag-node';
+import { jsonValueSchema } from '../output-ref';
+import { rejectRetiredThinking, type EffortLevel } from './effort';
 
 // ---------------------------------------------------------------------------
 // Shared enum schemas
 // ---------------------------------------------------------------------------
 
-export const modelReasoningEffortSchema = z.enum(['minimal', 'low', 'medium', 'high', 'xhigh']);
+/**
+ * DEPRECATED (#2556). The Codex-only spelling of reasoning depth.
+ *
+ * This is an ACCEPTED-INPUT alias only: the loader translates
+ * `modelReasoningEffort:` into `effort:` and never emits it, so a
+ * `WorkflowDefinition` produced by `parseWorkflow` never carries the field.
+ * It stays on the schema so `KNOWN_WORKFLOW_KEYS` still recognises it — dropping
+ * it would turn an author's deprecated-but-valid line into an "unknown key"
+ * warning and silently discard the value instead of honouring it.
+ *
+ * It derives from the shared ladder while the deprecated field remains accepted.
+ */
+export const modelReasoningEffortSchema = effortLevelSchema;
 
 export type ModelReasoningEffort = z.infer<typeof modelReasoningEffortSchema>;
 
@@ -59,8 +73,6 @@ export const workflowWorktreePolicySchema = z.object({
   enabled: z.boolean().optional(),
 });
 
-export type WorkflowWorktreePolicy = z.infer<typeof workflowWorktreePolicySchema>;
-
 /**
  * Per-workflow container-backend policy (FOLDER projects only). Mirrors the
  * worktree policy: a narrow per-workflow toggle; the runner image / caps live in
@@ -91,28 +103,52 @@ export const workflowContainerPolicySchema = z.object({
   write_back: z.enum(['approve', 'auto']).optional(),
 });
 
-export type WorkflowContainerPolicy = z.infer<typeof workflowContainerPolicySchema>;
-
 // ---------------------------------------------------------------------------
 // Workflow-level evidence policy (#2230)
 // ---------------------------------------------------------------------------
 
 /**
- * Terminal-success evidence gate. When `required: true`, the DAG executor
+ * Terminal file-presence gate. When `required: true`, the DAG executor
  * refuses to flip the run to `completed` unless `$ARTIFACTS_DIR/evidence.json`
  * exists — a missing file marks the run `failed` with a structured note at
- * `metadata.evidence_validation`. The engine gates ONLY on file presence:
- * producing (and validating the content of) the evidence belongs to the
- * workflow's own bash/script nodes (constitution: code computes, YAML
- * coordinates). Deliberately narrow — no schema validation, no content checks,
- * no configurable path (deferred until the gate sees adoption; see #2230).
+ * `metadata.evidence_validation`. The engine gates only on file presence; any
+ * contents satisfy it, and their presence does not prove that a check ran or
+ * author a workflow outcome. Deterministic checks remain ordinary bash/script
+ * nodes. Deliberately narrow — no schema validation, no content checks, and no
+ * configurable path (see #2230).
  */
 export const workflowEvidencePolicySchema = z.object({
-  /** Refuse terminal `completed` unless `$ARTIFACTS_DIR/evidence.json` exists. */
+  /** Refuse terminal `completed` unless the conventional marker file exists. */
   required: z.boolean(),
 });
 
 export type WorkflowEvidencePolicy = z.infer<typeof workflowEvidencePolicySchema>;
+
+// ---------------------------------------------------------------------------
+// Workflow-level run budget (#2814)
+// ---------------------------------------------------------------------------
+
+/**
+ * Ceilings on a run's total consumption. One work unit is one started attempt
+ * of an AI or deterministic (bash/script) node, retries included; spend is the
+ * provider-reported cost of AI attempts. The engine refuses to start a new
+ * attempt once a ceiling is reached, and fails a spend-limited run whose spend
+ * it cannot measure. Attempts already admitted may finish, so spend can
+ * overshoot by the attempts in flight.
+ *
+ * Strict: a misspelt ceiling is a load error, never a silently absent one.
+ */
+export const workflowRunBudgetSchema = z
+  .object({
+    max_work_units: z.number().int().positive().optional(),
+    max_spend_usd: z.number().positive().optional(),
+  })
+  .strict()
+  .refine(b => b.max_work_units !== undefined || b.max_spend_usd !== undefined, {
+    message: 'budget must declare max_work_units, max_spend_usd, or both',
+  });
+
+export type WorkflowRunBudget = z.infer<typeof workflowRunBudgetSchema>;
 
 // ---------------------------------------------------------------------------
 // Workflow signature — declared inputs (#2470, Signature Phase 2)
@@ -131,11 +167,30 @@ export type WorkflowEvidencePolicy = z.infer<typeof workflowEvidencePolicySchema
  */
 export const workflowInputSpecSchema = z.object({
   required: z.boolean().optional(),
-  default: z.string().optional(),
+  // Any JSON-compatible value (#2637): a boolean/number/array default keeps its
+  // logical type through the input contract instead of arriving as text.
+  default: jsonValueSchema.optional(),
   description: z.string().optional(),
 });
 
 export type WorkflowInputSpec = z.infer<typeof workflowInputSpecSchema>;
+
+/**
+ * Deprecation marker (#2781). A bundle declares this on a workflow that is being
+ * replaced and kept only for a deprecation window; every run-start surface then
+ * composes its standard notice around `message`.
+ *
+ * Declare-and-done: a future deprecation of any bundled workflow (or a replaced
+ * pack revision) needs no engine change — set the field, get the notice. Pure
+ * declarative coordination, so it stays admissible under the Workflow Language
+ * Constitution (code computes, YAML coordinates).
+ */
+export const workflowDeprecationSchema = z.object({
+  /** Per-item sentence carried inside the standard run-start deprecation notice. */
+  message: z.string().min(1),
+});
+
+export type WorkflowDeprecation = z.infer<typeof workflowDeprecationSchema>;
 
 // ---------------------------------------------------------------------------
 // WorkflowBase — common fields shared by all workflow types
@@ -148,15 +203,20 @@ export const workflowBaseSchema = z.object({
   model: z.string().optional(),
   modelReasoningEffort: modelReasoningEffortSchema.optional(),
   webSearchMode: webSearchModeSchema.optional(),
-  interactive: z.boolean().optional(),
   effort: effortLevelSchema.optional(),
-  thinking: thinkingConfigSchema.optional(),
   fallbackModel: z.string().min(1).optional(),
   betas: betasSchema.optional(),
   sandbox: sandboxSettingsSchema.optional(),
   worktree: workflowWorktreePolicySchema.optional(),
   container: workflowContainerPolicySchema.optional(),
   evidence_policy: workflowEvidencePolicySchema.optional(),
+  /**
+   * Run-wide ceiling on total work and spend (#2814). Bounds total consumption,
+   * not concurrency (that is `fan_out.max_parallel`), and applies alongside a
+   * node's own `maxBudgetUsd`. Loops, `workflow:` children and fan-out are
+   * rejected at load time while a budget is declared.
+   */
+  budget: workflowRunBudgetSchema.optional(),
   /**
    * When `false`, the engine skips the path-exclusive lock for this workflow,
    * allowing N concurrent runs on the same live checkout. The author asserts
@@ -167,7 +227,8 @@ export const workflowBaseSchema = z.object({
   /**
    * Default for `persist_session` on every AI node in this workflow.
    * Individual nodes can override with `persist_session: false`.
-   * Requires the resolved provider to declare `sessionResume: true`.
+   * Requires the resolved provider to declare `sessionResume: true`; only a
+   * provider that also declares `sessionFork: true` continues the session.
    */
   persist_sessions: z.boolean().optional(),
   tags: z.array(z.string().min(1)).optional(),
@@ -195,6 +256,20 @@ export const workflowBaseSchema = z.object({
    * including a non-sink node.
    */
   returns: z.string().min(1).optional(),
+  /**
+   * Required boolean property on the declared `returns:` node that records the
+   * workflow author's verdict independently from the run lifecycle (#2618).
+   * The loader validates the selected node's `output_format` contract; the
+   * engine maps exact true/false values to succeeded/failed without inference.
+   */
+  outcome_field: z.string().trim().min(1).optional(),
+  /**
+   * Marks the workflow deprecated (#2781): run-start surfaces announce removal
+   * in an upcoming release with a switch/copy escape hatch, while it keeps
+   * running normally. Metadata-only — never blocks or alters execution.
+   * Bundled defaults carry it during a deprecation window.
+   */
+  deprecated: workflowDeprecationSchema.optional(),
 });
 
 export type WorkflowBase = z.infer<typeof workflowBaseSchema>;
@@ -207,12 +282,35 @@ export type WorkflowBase = z.infer<typeof workflowBaseSchema>;
  * Workflow definition parsed from YAML.
  * All workflows use DAG-based execution with `nodes`.
  */
-export const workflowDefinitionSchema = workflowBaseSchema.extend({
+const workflowDefinitionObjectSchema = workflowBaseSchema.extend({
   nodes: z.array(dagNodeSchema),
 });
+export const workflowDefinitionSchema = z.preprocess(
+  rejectRetiredThinking,
+  workflowDefinitionObjectSchema
+);
 
-/** Workflow definition with fully typed nodes (DagNode[]) derived from the schema. */
+/** Authored workflow definition parsed from YAML, before include expansion. */
 export type WorkflowDefinition = z.infer<typeof workflowDefinitionSchema> & { prompt?: never };
+
+/** Static execution plan attached after include expansion and graph validation. */
+export interface GraphPlan {
+  readonly nodes: readonly DagNode[];
+  readonly layers: readonly (readonly DagNode[])[];
+  readonly sinks: readonly string[];
+}
+
+/** Nominal identity retained only by values produced through `resolveWorkflow`. */
+declare class ResolvedWorkflowIdentity {
+  private readonly identity: never;
+}
+
+/** Include-free workflow accepted by execution and simulation boundaries. */
+export type ResolvedWorkflow = Omit<WorkflowDefinition, 'nodes'> &
+  ResolvedWorkflowIdentity & {
+    readonly nodes: readonly DagNode[];
+    readonly plan: GraphPlan;
+  };
 
 // ---------------------------------------------------------------------------
 // Known workflow keys — used by the loader to detect unknown/misplaced keys
@@ -224,7 +322,7 @@ export type WorkflowDefinition = z.infer<typeof workflowDefinitionSchema> & { pr
  * Used by parseWorkflow to warn on unknown keys (#2213).
  */
 export const KNOWN_WORKFLOW_KEYS: ReadonlySet<string> = new Set(
-  Object.keys(workflowDefinitionSchema.shape)
+  Object.keys(workflowDefinitionObjectSchema.shape)
 );
 
 /**
@@ -242,17 +340,16 @@ export const WORKFLOW_ONLY_KEYS: ReadonlySet<string> = new Set(
  * KNOWN_NODE_NESTED_KEYS — an unknown key one level down is stripped just as
  * silently as one at the top (#2213).
  *
- * `sandbox` (`.passthrough()`) and `thinking` (`z.preprocess`) are omitted for
- * the same reasons they are omitted at node level. `nodes` is handled by the
- * per-node check, not here.
+ * `sandbox` (`.passthrough()`) is omitted because it preserves unknown fields.
+ * `nodes` is handled by the per-node check, not here.
  *
- * Constructed with `keyof typeof workflowDefinitionSchema.shape` as the key type
+ * Constructed with `keyof typeof workflowDefinitionObjectSchema.shape` as the key type
  * so a typo'd registration fails to compile rather than silently disabling the
  * check; the exported type widens back to `string` for lookup (same split as
  * KNOWN_NODE_NESTED_KEYS).
  */
 export const KNOWN_WORKFLOW_NESTED_KEYS: ReadonlyMap<string, NestedKeySpec> = new Map<
-  keyof typeof workflowDefinitionSchema.shape,
+  keyof typeof workflowDefinitionObjectSchema.shape,
   NestedKeySpec
 >([
   ['worktree', { kind: 'object', keys: new Set(Object.keys(workflowWorktreePolicySchema.shape)) }],
@@ -264,9 +361,10 @@ export const KNOWN_WORKFLOW_NESTED_KEYS: ReadonlyMap<string, NestedKeySpec> = ne
     'evidence_policy',
     { kind: 'object', keys: new Set(Object.keys(workflowEvidencePolicySchema.shape)) },
   ],
+  ['deprecated', { kind: 'object', keys: new Set(Object.keys(workflowDeprecationSchema.shape)) }],
   // First `record` entry in this map: `inputs` is a record of input-name → spec,
   // so unknown keys under an individual spec (e.g. `inputs.diff.typo`) warn.
-  // `returns` is a plain string and needs no nested registration.
+  // `returns` and `outcome_field` are plain strings and need no nested registration.
   [
     'inputs',
     {
@@ -291,6 +389,7 @@ export type LoadCommandResult =
       success: false;
       reason: 'invalid_name' | 'empty_file' | 'not_found' | 'permission_denied' | 'read_error';
       message: string;
+      cause?: unknown;
     };
 
 // ---------------------------------------------------------------------------
@@ -303,7 +402,12 @@ export type LoadCommandResult =
 export type WorkflowExecutionResult =
   | { success: true; workflowRunId: string; summary?: string }
   | { success: false; workflowRunId?: string; error: string }
-  | { success: true; paused: true; workflowRunId: string };
+  | {
+      success: true;
+      paused: true;
+      workflowRunId: string;
+      waitCursor?: ReturnType<typeof deadlineWaitCursor>;
+    };
 
 // ---------------------------------------------------------------------------
 // WorkflowLoadError / WorkflowLoadResult — workflow discovery results
@@ -311,35 +415,96 @@ export type WorkflowExecutionResult =
 
 /**
  * Workflow origin:
- * - `bundled` — embedded in the Archon binary / bundled defaults
- * - `global`  — user-level, discovered at `~/.archon/workflows/` (applies to every repo)
- * - `project` — repo-local, discovered at `<repoRoot>/.archon/workflows/`
+ * - `bundled`   — embedded in the Archon binary / bundled defaults
+ * - `global`    — user-level, discovered at `~/.archon/workflows/` (applies to every repo)
+ * - `project`   — repo-local, discovered at `<repoRoot>/.archon/workflows/`
+ * - `installed` — a workflow pack installed with `archon plugin add`, named
+ *                 `owner/plugin:entrypoint`
  *
- * Precedence for same-named files: `bundled` < `global` < `project`.
+ * Precedence for same-named files: `bundled` < `global` < `project`. Installed
+ * workflows take no part in it: their qualified names cannot collide with a file.
  */
-export type WorkflowSource = 'bundled' | 'global' | 'project';
+export const workflowSourceSchema = z.enum(['project', 'bundled', 'global', 'installed']);
+
+export type WorkflowSource = z.infer<typeof workflowSourceSchema>;
+
+/**
+ * The workflow-level configuration an author WROTE, captured before composition
+ * collapsed it onto the workflow's own nodes and removed the workflow-level layer
+ * (#1764). This is not a second representation of a live value — the collapsed
+ * definition no longer holds these fields at all.
+ *
+ * Read it for display and for labelling a run; never for execution. Execution reads
+ * `WorkflowWithSource.workflow`, whose nodes each carry their own resolved values.
+ * Deliberately narrow: the fields a person is shown, not the whole travelling set.
+ */
+export interface DeclaredWorkflowConfig {
+  readonly provider?: string;
+  readonly model?: string;
+  readonly effort?: EffortLevel;
+}
 
 /** A workflow definition paired with its discovery source. */
 export interface WorkflowWithSource {
-  readonly workflow: WorkflowDefinition;
+  readonly workflow: ResolvedWorkflow;
   readonly source: WorkflowSource;
-  /** Warnings from YAML parsing (e.g. unknown keys) — never hard-fails. */
+  /**
+   * Author-facing warnings for this workflow: unknown keys and deprecation notices from
+   * parsing the file, plus the loop_group sink-shape verdicts discovery computes on the
+   * expanded graph (#2756). Never hard-fails.
+   */
   readonly parseWarnings?: readonly string[];
+  /** What the author declared at workflow level, for display. @see DeclaredWorkflowConfig */
+  readonly declared?: DeclaredWorkflowConfig;
 }
 
 /**
  * Error encountered while loading a workflow file
  */
-export interface WorkflowLoadError {
-  readonly filename: string;
-  readonly error: string;
-  readonly errorType: 'read_error' | 'parse_error' | 'validation_error';
+export const workflowLoadErrorSchema = z.object({
+  filename: z.string(),
+  workflowName: z.string().optional(),
+  error: z.string(),
+  errorType: z.enum(['read_error', 'parse_error', 'validation_error']),
+});
+
+export type WorkflowLoadError = Readonly<z.infer<typeof workflowLoadErrorSchema>> & {
+  readonly cause?: unknown;
+};
+
+/** Errors without a known workflow name keep their full path to avoid aliasing a bare target. */
+export function workflowLoadErrorName(error: WorkflowLoadError): string {
+  return error.workflowName ?? error.filename.replace(/\.ya?ml$/, '');
+}
+
+export function findWorkflowLoadError(
+  errors: readonly WorkflowLoadError[],
+  name: string
+): WorkflowLoadError | undefined {
+  return (
+    errors.find(error => error.workflowName === name) ??
+    errors.find(error => error.workflowName?.toLowerCase() === name.toLowerCase()) ??
+    errors.find(error => workflowLoadErrorName(error) === name) ??
+    errors.find(error => workflowLoadErrorName(error).toLowerCase() === name.toLowerCase())
+  );
+}
+
+/** Errors after parsing retain the authored identity even when the filename differs. */
+export interface ParsedWorkflowLoadError extends WorkflowLoadError {
+  readonly workflowName: string;
 }
 
 /**
  * Result of workflow discovery - includes both successful loads and errors
  */
 export interface WorkflowLoadResult {
+  /** Every dispatchable workflow: the only list a run, route, or listing may resolve against. */
   readonly workflows: readonly WorkflowWithSource[];
+  /**
+   * Installed packs' support workflows, named `owner/plugin:<name>`. Not dispatchable:
+   * only composition inside their own pack (a runtime `include:` fan-out) resolves them.
+   * Discovery always sets it; a result built by hand without installed packs may omit it.
+   */
+  readonly support?: readonly WorkflowWithSource[];
   readonly errors: readonly WorkflowLoadError[];
 }

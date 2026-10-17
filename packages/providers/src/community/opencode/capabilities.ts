@@ -23,17 +23,26 @@ import type { ProviderCapabilities } from '../../types';
  * a node's hooks silently — a fail-fast violation (#2116).
  */
 export const OPENCODE_CAPABILITIES: ProviderCapabilities = {
+  backgroundWork: 'unobserved',
   sessionResume: true,
   mcp: false, // top-level nodeConfig.mcp has no OpenCode request translation yet
   hooks: false,
   skills: false, // top-level nodeConfig.skills has no OpenCode request translation yet
+  plugins: false,
   agents: true,
   toolRestrictions: true,
   structuredOutput: 'enforced', // sends format:{json_schema}; reads info.structured_output
-  envInjection: true,
+  requiresAllPropertiesRequired: false, // OpenCode does not enforce the required-coverage rule
+  // One embedded server is shared by every node and starts with no request env, so a codebase's
+  // env vars cannot reach it without leaking into another codebase's node.
+  envInjection: false,
   costControl: false,
+  costReporting: true, // tokens.ts maps SDK info.cost when the SDK reports one
+  tokenReporting: true,
+  stopReasonReporting: true,
+  turnCountReporting: false,
+  resolvedModelReporting: true,
   effortControl: false,
-  thinkingControl: false, // OpenCode handles effort/thinking via opencode.json agent config, not prompt body
   fallbackModel: false,
   sandbox: false,
   settingSources: false, // Claude Agent SDK-only knob (which setting sources the agent loads)

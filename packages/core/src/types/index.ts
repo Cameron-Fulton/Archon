@@ -1,11 +1,14 @@
 /**
  * Core type definitions for the Remote Coding Agent platform
  */
-import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
+import type { ResolvedWorkflow } from '@archon/workflows/schemas/workflow';
 import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
+import type { RunModelOverrides } from '@archon/workflows/model-validation';
+import type { WorkflowRunConfigInput } from '@archon/workflows/schemas/run-config';
 
-// MessageChunk + TokenUsage are used by IPlatformAdapter below.
-import type { MessageChunk, TokenUsage } from '@archon/providers/types';
+// TokenUsage is used by IPlatformAdapter below.
+import type { TokenUsage } from '@archon/providers/types';
+import type { PlatformStructuredEvent } from '@archon/workflows/deps';
 
 // Re-export schema-derived types so existing imports from '@archon/core/types' keep working.
 export type {
@@ -31,6 +34,9 @@ export class ConversationNotFoundError extends Error {
   }
 }
 
+import type { RunActor } from '../operations/run-authorization';
+export type { RunActor } from '../operations/run-authorization';
+
 import type { IsolationHints } from '@archon/isolation';
 
 export interface AttachedFile {
@@ -47,29 +53,54 @@ export interface HandleMessageContext {
   readonly parentConversationId?: string;
   readonly isolationHints?: IsolationHints;
   readonly attachedFiles?: AttachedFile[];
+  readonly actor: RunActor;
   /**
-   * Archon user UUID resolved from the inbound platform user identifier.
-   * Chat/forge adapters resolve this via findOrCreateUserByPlatformIdentity
-   * before calling handleMessage. Undefined for web/CLI surfaces until their
-   * own auth flows are wired.
+   * Set ONLY by the `POST /api/workflows/:name/run` route: start this workflow with the
+   * message, byte for byte, as its `$ARGUMENTS`. The message is never parsed as a command,
+   * so no word in it can change the run (#4159).
    */
-  readonly userId?: string;
+  readonly workflowName?: string;
+  /**
+   * Declared workflow inputs supplied by the caller (#2554), keyed by input name.
+   *
+   * Set ONLY by the `POST /api/workflows/:name/run` route, whose body carries an
+   * `inputs` map. It rides the context rather than the message text so a supplied value
+   * is never confused with `$ARGUMENTS`, and so chat platforms — which have no channel
+   * for it and never populate this field — keep their existing behaviour unchanged
+   * (#2555 tracks giving them one).
+   */
+  readonly workflowInputs?: Readonly<Record<string, string>>;
+  /** Sparse tier/@alias rebindings supplied by the workflow run route (#2481). */
+  readonly workflowModelOverrides?: RunModelOverrides;
+  /** Validated inline config content supplied by the workflow run route. */
+  readonly workflowRunConfig?: WorkflowRunConfigInput;
+  /**
+   * Between-run continuation (#2747): the terminal run this run adopts or
+   * supersedes. Rides the context like `workflowInputs` so it can never be
+   * confused with message text. Provenance is recorded engine-side; lane
+   * resolution is the dispatching surface's job.
+   */
+  readonly workflowAdoptRunId?: string;
+  readonly workflowSupersedesRunId?: string;
 }
+
+export type WorkflowRequest =
+  | {
+      kind: 'start';
+      definition: ResolvedWorkflow;
+      args: string;
+      force?: boolean;
+      /** Keys the engine dropped from this workflow's YAML (#2213). */
+      parseWarnings?: readonly string[];
+    }
+  | { kind: 'resume'; run: WorkflowRun };
 
 export interface CommandResult {
   success: boolean;
   message: string;
   modified?: boolean; // Indicates if conversation state was modified
-  workflow?: {
-    // If set, orchestrator should execute this workflow
-    definition: WorkflowDefinition;
-    args: string;
-    force?: boolean;
-    resumeRunId?: string;
-    resumeRun?: WorkflowRun;
-    /** Keys the engine dropped from this workflow's YAML (#2213). */
-    parseWarnings?: readonly string[];
-  };
+  /** If set, orchestrator should execute this workflow request. */
+  workflow?: WorkflowRequest;
 }
 
 /**
@@ -88,7 +119,22 @@ export interface MessageMetadata {
   workflowResult?: { workflowName: string; runId: string };
 }
 
+export { toPersistedMessageMetadata } from './message-metadata';
+
 export interface IPlatformAdapter {
+  readonly capabilities: {
+    readonly messagePersistence: 'core' | 'adapter';
+    readonly canDetachProject?: true;
+    readonly defaultWorkflowDispatch: 'foreground' | 'background';
+  };
+
+  /** The returned finalizer is awaited when dispatch setup or worker execution ends. */
+  prepareBackgroundConversation?(context: {
+    workerConversationId: string;
+    parentConversationId: string;
+    conversationDbId: string;
+  }): Promise<() => Promise<void>>;
+
   /**
    * Send a message to the platform
    */
@@ -125,14 +171,21 @@ export interface IPlatformAdapter {
   stop(): void;
 
   /**
-   * Optional: Send a structured event (MessageChunk) to the platform.
+   * Optional: Send a structured event (a tool call, a result, a status line or a dispatch) to the platform.
    * Only implemented by adapters that can display rich structured data (e.g., Web UI).
    * Other adapters (Telegram, Slack) continue using sendMessage() for formatted text.
    */
-  sendStructuredEvent?(conversationId: string, event: MessageChunk): Promise<void>;
+  sendStructuredEvent?(conversationId: string, event: PlatformStructuredEvent): Promise<void>;
 
   /** Retract previously streamed text (used when workflow routing intercepts) */
   emitRetract?(conversationId: string): Promise<void>;
+
+  /**
+   * Optional: how an operator types a workflow command on this surface, given the
+   * command after the verb prefix (`cancel <id>`). Absent means the chat grammar the
+   * core command handler parses, `/workflow <command>`.
+   */
+  formatWorkflowCommand?(command: string): string;
 
   /**
    * Optional: Append a small footer summarising cost / token usage / stop reason
@@ -147,33 +200,8 @@ export interface IPlatformAdapter {
   ): Promise<void>;
 }
 
-/**
- * Extended platform adapter for the Web UI.
- * Adds methods for SSE event bridging, message persistence, and lock events
- * that are only meaningful in the web context.
- */
-export interface IWebPlatformAdapter extends IPlatformAdapter {
-  sendStructuredEvent(conversationId: string, event: MessageChunk): Promise<void>;
-  setConversationDbId(platformConversationId: string, dbId: string): void;
-  setupEventBridge(workerConversationId: string, parentConversationId: string): () => void;
-  emitLockEvent(conversationId: string, locked: boolean, queuePosition?: number): Promise<void>;
-  registerOutputCallback(conversationId: string, callback: (text: string) => void): void;
-  removeOutputCallback(conversationId: string): void;
-}
-
-/**
- * Type guard for web platform adapter.
- */
-export function isWebAdapter(adapter: IPlatformAdapter): adapter is IWebPlatformAdapter {
-  return adapter.getPlatformType() === 'web';
-}
-
 // Re-export workflow schema types for config-types.ts compatibility
 import type { ModelReasoningEffort, WebSearchMode } from '@archon/workflows/schemas/workflow';
 export type { ModelReasoningEffort, WebSearchMode };
-import type {
-  EffortLevel,
-  ThinkingConfig,
-  SandboxSettings,
-} from '@archon/workflows/schemas/dag-node';
-export type { EffortLevel, ThinkingConfig, SandboxSettings };
+import type { EffortLevel, SandboxSettings } from '@archon/workflows/schemas/dag-node';
+export type { EffortLevel, SandboxSettings };

@@ -1,0 +1,739 @@
+/**
+ * A resumed run keeps writing to its own conversation (#3328).
+ *
+ * The run row's `conversation_id` is the single record of which thread a run belongs
+ * to, and it is written once at creation. An explicit resume that mints a fresh
+ * conversation therefore does not move the run — it just sends the resumed segment
+ * somewhere the run never references, and the run's own thread stops at the pause.
+ *
+ * Foreground commands execute against real SQLite. Detached handoffs keep the CLI
+ * process boundary so the child's conversation routing stays under test.
+ */
+import { afterEach, describe, expect, spyOn, test } from 'bun:test';
+import { Database, type SQLQueryBindings } from 'bun:sqlite';
+import { randomUUID } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { findRepoRoot } from '@archon/git';
+import { removeTempTree } from '@archon/paths/test-utils';
+import {
+  workflowRunCommand,
+  workflowResumeCommand,
+  workflowApproveCommand,
+  type WorkflowRunOptions,
+} from './workflow';
+import { captureWorkflowCommand } from '../test-support/command';
+import { requestDetachedRunStop } from '@archon/core/services/run-owner-stop';
+
+const CLI_ENTRY = join(import.meta.dir, '..', 'cli.ts');
+const cleanupPaths: string[] = [];
+const detachedRunIds = new Set<string>();
+
+// One hook, in order: a detached owner still holding the fixture has to stop before its
+// tree can go. Two hooks would leave registration order as the only thing keeping that
+// correct.
+afterEach(async () => {
+  for (const runId of detachedRunIds) {
+    try {
+      const target = await requestDetachedRunStop(runId);
+      await target.stop();
+    } catch {
+      // A completed owner has already removed its endpoint.
+    }
+  }
+  detachedRunIds.clear();
+  for (const path of cleanupPaths.splice(0)) await removeTempTree(path);
+});
+
+interface Fixture {
+  repo: string;
+  archonHome: string;
+}
+
+const WORKFLOW_NAME = 'resume-thread';
+const ORIGIN_ANCHOR_ID = '00000000-0000-4000-8000-000000003640';
+
+/**
+ * A repo, a scratch `ARCHON_HOME`, and a workflow where `settle` succeeds and `boom`
+ * fails. A run with no completed node is refused for an unrelated reason, so the pair
+ * is what leaves a run a resume can actually continue.
+ */
+function makeFixture(): Fixture {
+  const root = mkdtempSync(join(tmpdir(), 'archon-resume-conversation-'));
+  cleanupPaths.push(root);
+  const repo = join(root, 'repo');
+  const archonHome = join(root, 'home');
+  const workflowDir = join(repo, '.archon', 'workflows');
+  mkdirSync(workflowDir, { recursive: true });
+  mkdirSync(archonHome, { recursive: true });
+  expect(spawnSync('git', ['init', '-q', '.'], { cwd: repo }).status).toBe(0);
+  writeFileSync(
+    join(workflowDir, `${WORKFLOW_NAME}.yaml`),
+    [
+      `name: ${WORKFLOW_NAME}`,
+      'description: resume conversation threading',
+      'nodes:',
+      '  - id: settle',
+      '    bash: echo settled',
+      '  - id: boom',
+      '    depends_on: [settle]',
+      '    bash: exit 1',
+      '',
+    ].join('\n')
+  );
+  return { repo, archonHome };
+}
+
+function runCli(fixture: Fixture, args: string[]): { status: number | null; output: string } {
+  const result = spawnSync(process.execPath, [CLI_ENTRY, ...args], {
+    encoding: 'utf8',
+    env: { ...process.env, ARCHON_HOME: fixture.archonHome, ARCHON_TELEMETRY_DISABLED: '1' },
+  });
+  return { status: result.status, output: `${result.stdout ?? ''}${result.stderr ?? ''}` };
+}
+
+// The run's working path must be the string the CLI derives from `--cwd`, because
+// `--resume` looks the run up by exact path. The CLI uses git's toplevel, which on
+// Windows differs from realpath (separators, 8.3 short names under %TEMP%).
+async function runForeground(fixture: Fixture, name: string, options: WorkflowRunOptions = {}) {
+  const cwd = (await findRepoRoot(fixture.repo)) ?? fixture.repo;
+  return captureWorkflowCommand(fixture.archonHome, async host =>
+    workflowRunCommand(host, cwd, name, '', {
+      noWorktree: true,
+      ...options,
+    })
+  );
+}
+
+async function resumeForeground(fixture: Fixture, id: string) {
+  return captureWorkflowCommand(fixture.archonHome, async host => {
+    await workflowResumeCommand(host, id, false, fixture.repo);
+  });
+}
+
+interface ThreadState {
+  runId: string;
+  runStatus: string;
+  runConversationId: string;
+  conversationIds: string[];
+  /** `Dispatching workflow` messages inside the run's own thread. */
+  dispatchMessages: number;
+  /** The same messages in ANY thread — what tells a slow child from a misdirected one. */
+  dispatchMessagesAnywhere: number;
+}
+
+/**
+ * Open the fixture database for reading, willing to wait out a writer.
+ *
+ * The detached case reads while its child is still running, so a bare open raced the
+ * child's own writes and failed with `SQLITE_BUSY` on a loaded CI runner. The timeout
+ * is what makes these reads observations of a live database rather than a gamble on
+ * landing between two transactions.
+ */
+function openDatabase(fixture: Fixture): Database {
+  const database = new Database(join(fixture.archonHome, 'archon.db'), { readonly: true });
+  database.exec('PRAGMA busy_timeout = 15000');
+  return database;
+}
+
+/**
+ * The run's thread in one read transaction: a detached child can commit between queries.
+ *
+ * Reads every public conversation row, not just the run's, because the defect is an EXTRA
+ * row: asserting only that the run still points somewhere valid would pass while a
+ * second thread collected the resumed output.
+ */
+function readThreadState(fixture: Fixture): ThreadState {
+  const database = openDatabase(fixture);
+  try {
+    return database.transaction(() => {
+      const run = database
+        .query<{ id: string; status: string; conversation_id: string }, [string]>(
+          'SELECT id, status, conversation_id FROM remote_agent_workflow_runs WHERE workflow_name = ? ORDER BY started_at DESC LIMIT 1'
+        )
+        .get(WORKFLOW_NAME);
+      if (!run) throw new Error('no run row was recorded');
+      const conversationIds = database
+        .query<{ id: string }, []>(
+          'SELECT id FROM remote_agent_conversations WHERE hidden = 0 ORDER BY created_at'
+        )
+        .all()
+        .map(row => row.id);
+      const countDispatches = database.query<{ total: number }, [string]>(
+        "SELECT COUNT(*) AS total FROM remote_agent_messages WHERE conversation_id = ? AND content LIKE 'Dispatching workflow%'"
+      );
+      return {
+        runId: run.id,
+        runStatus: run.status,
+        runConversationId: run.conversation_id,
+        conversationIds,
+        dispatchMessages: countDispatches.get(run.conversation_id)?.total ?? 0,
+        dispatchMessagesAnywhere: conversationIds.reduce(
+          (total, id) => total + (countDispatches.get(id)?.total ?? 0),
+          0
+        ),
+      };
+    })();
+  } finally {
+    database.close();
+  }
+}
+
+/**
+ * The platform id of a conversation row.
+ *
+ * The run row holds a database id while the CLI's `--conversation-id` and its detached
+ * ack both speak the platform id, so comparing the two needs this hop.
+ */
+function readPlatformConversationId(fixture: Fixture, conversationId: string): string {
+  const database = openDatabase(fixture);
+  try {
+    const row = database
+      .query<{ platform_conversation_id: string }, [string]>(
+        'SELECT platform_conversation_id FROM remote_agent_conversations WHERE id = ?'
+      )
+      .get(conversationId);
+    if (!row) throw new Error(`no conversation row for ${conversationId}`);
+    return row.platform_conversation_id;
+  } finally {
+    database.close();
+  }
+}
+
+function removeRecordedConversation(fixture: Fixture, conversationId: string): void {
+  const database = new Database(join(fixture.archonHome, 'archon.db'));
+  try {
+    database.exec('PRAGMA foreign_keys = OFF');
+    database.query('DELETE FROM remote_agent_conversations WHERE id = ?').run(conversationId);
+  } finally {
+    database.close();
+  }
+}
+
+function countMessages(fixture: Fixture): number {
+  const database = openDatabase(fixture);
+  try {
+    return (
+      database
+        .query<{ total: number }, []>('SELECT COUNT(*) AS total FROM remote_agent_messages')
+        .get()?.total ?? 0
+    );
+  } finally {
+    database.close();
+  }
+}
+
+/** Parsed metadata of every message the run's conversation recorded with metadata. */
+function readMessageMetadata(fixture: Fixture, conversationId: string): Record<string, unknown>[] {
+  const database = openDatabase(fixture);
+  try {
+    return database
+      .query<{ metadata: string | null }, [string]>(
+        'SELECT metadata FROM remote_agent_messages WHERE conversation_id = ? AND metadata IS NOT NULL'
+      )
+      .all(conversationId)
+      .map(row => JSON.parse(row.metadata ?? '{}') as Record<string, unknown>)
+      .filter(metadata => Object.keys(metadata).length > 0);
+  } finally {
+    database.close();
+  }
+}
+
+function countConversations(fixture: Fixture): number {
+  const database = openDatabase(fixture);
+  try {
+    return (
+      database
+        .query<{ total: number }, []>('SELECT COUNT(*) AS total FROM remote_agent_conversations')
+        .get()?.total ?? 0
+    );
+  } finally {
+    database.close();
+  }
+}
+
+/** Seed a failed run, optionally attaching chat provenance for same-thread checks. */
+async function seedFailedRun(fixture: Fixture, chatOrigin = true): Promise<ThreadState> {
+  const first = await runForeground(fixture, WORKFLOW_NAME);
+  // The node must genuinely execute and fail here. A non-zero status alone would also
+  // accept the workflow never loading, which leaves nothing for a resume to continue.
+  expect(first.output).toContain('boom');
+  expect(first.status).not.toBe(0);
+  if (chatOrigin) {
+    const database = new Database(join(fixture.archonHome, 'archon.db'));
+    try {
+      const run = readThreadState(fixture);
+      const conversationId = randomUUID();
+      database
+        .query(
+          "INSERT INTO remote_agent_conversations (id, platform_type, platform_conversation_id, cwd) VALUES (?, 'cli', ?, ?)"
+        )
+        .run(conversationId, `cli-seeded-${conversationId}`, fixture.repo);
+      database
+        .query('UPDATE remote_agent_workflow_runs SET origin = ?, conversation_id = ? WHERE id = ?')
+        .run(JSON.stringify({ conversationId }), conversationId, run.runId);
+      database
+        .query(
+          "INSERT INTO remote_agent_messages (conversation_id, role, content) VALUES (?, 'assistant', 'Dispatching workflow: resume-thread')"
+        )
+        .run(conversationId);
+    } finally {
+      database.close();
+    }
+  }
+  const before = readThreadState(fixture);
+  expect(before.conversationIds).toEqual(chatOrigin ? [before.runConversationId] : []);
+  expect(before.dispatchMessages).toBe(chatOrigin ? 1 : 0);
+  return before;
+}
+
+/**
+ * Block until a detached child has announced its resumed segment.
+ *
+ * That announcement is the last thing the thread decision can affect: the child opens
+ * its conversation and then dispatches into it, so once a second `Dispatching workflow`
+ * message exists anywhere, the conversation rows are already final and the assertions
+ * below are reading a settled picture rather than racing the run to its end.
+ *
+ * The wait counts messages in ANY thread on purpose. A child that opened a second
+ * conversation still announces, so this returns and lets the assertions name the split;
+ * waiting on the run's own thread would turn the defect into a timeout, which reads as
+ * a flaky test rather than as a wrong thread.
+ */
+async function waitForDetachedDispatch(fixture: Fixture): Promise<ThreadState> {
+  const deadline = Date.now() + 60_000;
+  let lastError: unknown;
+  for (;;) {
+    let state: ThreadState | undefined;
+    try {
+      state = readThreadState(fixture);
+      if (state.dispatchMessagesAnywhere >= 2) return state;
+    } catch (error) {
+      // The child owns the database while it runs. `busy_timeout` waits out a held
+      // lock, but this loop is already a retry, so a read that still gives up is a
+      // reason to look again rather than to fail the test.
+      lastError = error;
+    }
+    if (Date.now() > deadline) {
+      throw new Error(
+        state
+          ? `the detached child never announced its resume: run status ${state.runStatus}, ` +
+              `${String(state.dispatchMessagesAnywhere)} dispatch message(s) across ` +
+              `${String(state.conversationIds.length)} conversation(s)`
+          : `the fixture database stayed unreadable: ${String(lastError)}`
+      );
+    }
+    await Bun.sleep(100);
+  }
+}
+
+/**
+ * Assert the resume stayed in the run's thread.
+ *
+ * `dispatchMessages` is the resumed segment itself: the continuation announces
+ * `Dispatching workflow` to whichever conversation it opened, so a second one inside
+ * the run's own thread is the positive evidence that the output landed there rather
+ * than merely that no extra row appeared.
+ */
+function expectResumedInPlace(after: ThreadState, before: ThreadState): void {
+  expect(after.runId).toBe(before.runId);
+  expect(after.runConversationId).toBe(before.runConversationId);
+  expect(after.conversationIds).toEqual(before.conversationIds);
+  expect(after.dispatchMessages).toBe(2);
+}
+
+describe('thread state snapshots', () => {
+  test('a dispatch committed between count reads appears in the next snapshot', async () => {
+    const fixture = makeFixture();
+    const before = await seedFailedRun(fixture);
+    const writer = new Database(join(fixture.archonHome, 'archon.db'));
+    const query = Database.prototype.query;
+    let wroteDispatch = false;
+    const read = spyOn(Database.prototype, 'query').mockImplementation(function <
+      ReturnType,
+      ParamsType extends SQLQueryBindings | SQLQueryBindings[],
+    >(this: Database, sql: string) {
+      const statement = query.bind(this)<ReturnType, ParamsType>(sql);
+      if (sql.startsWith('SELECT COUNT(*) AS total')) {
+        const get = statement.get.bind(statement);
+        statement.get = (...params) => {
+          const result = get(...params);
+          if (!wroteDispatch) {
+            writer
+              .query(
+                "INSERT INTO remote_agent_messages (conversation_id, role, content) VALUES (?, 'assistant', 'Dispatching workflow: resume-thread')"
+              )
+              .run(before.runConversationId);
+            wroteDispatch = true;
+          }
+          return result;
+        };
+      }
+      return statement;
+    });
+    let snapshot: ThreadState;
+    try {
+      snapshot = readThreadState(fixture);
+    } finally {
+      read.mockRestore();
+      writer.close();
+    }
+    expect(wroteDispatch).toBe(true);
+    expect(snapshot.dispatchMessages).toBe(1);
+    expect(snapshot.dispatchMessagesAnywhere).toBe(1);
+    expectResumedInPlace(readThreadState(fixture), before);
+  });
+
+  test('a dispatch into another conversation fails the same-thread assertion', async () => {
+    const fixture = makeFixture();
+    let before = await seedFailedRun(fixture);
+    const writer = new Database(join(fixture.archonHome, 'archon.db'));
+    const wrongConversationId = randomUUID();
+    try {
+      writer
+        .query(
+          "INSERT INTO remote_agent_conversations (id, platform_type, platform_conversation_id, cwd) VALUES (?, 'cli', ?, ?)"
+        )
+        .run(wrongConversationId, `cli-wrong-${wrongConversationId}`, fixture.repo);
+      before = readThreadState(fixture);
+      writer
+        .query(
+          "INSERT INTO remote_agent_messages (conversation_id, role, content) VALUES (?, 'assistant', 'Dispatching workflow: resume-thread')"
+        )
+        .run(wrongConversationId);
+    } finally {
+      writer.close();
+    }
+    const after = readThreadState(fixture);
+    expect(after.conversationIds).toEqual(before.conversationIds);
+    expect(after.dispatchMessagesAnywhere).toBe(2);
+    expect(after.dispatchMessages).toBe(1);
+    expect(() => expectResumedInPlace(after, before)).toThrow();
+  });
+});
+
+describe('resumed runs keep one conversation', () => {
+  test('a continuation stops when its recorded conversation is missing', async () => {
+    const fixture = makeFixture();
+    const before = await seedFailedRun(fixture);
+    removeRecordedConversation(fixture, before.runConversationId);
+
+    const resumed = await resumeForeground(fixture, before.runId);
+    expect(resumed.status).not.toBe(0);
+    expect(resumed.output).toContain(
+      `Conversation '${before.runConversationId}' for workflow run '${before.runId}' no longer exists.`
+    );
+    expect(countConversations(fixture)).toBe(1);
+  }, 120_000);
+
+  // A run created without provenance has no thread to continue. The resume stays
+  // headless instead of inventing a CLI conversation and writing history into it.
+  test('workflow resume <run-id> of an origin-free run creates no conversation', async () => {
+    const fixture = makeFixture();
+    await seedFailedRun(fixture, false);
+
+    const resumed = await resumeForeground(fixture, readThreadState(fixture).runId);
+    expect(resumed.output).toContain("Bash node 'boom' failed");
+
+    const after = readThreadState(fixture);
+    expect(after.runConversationId).toBe(ORIGIN_ANCHOR_ID);
+    expect(after.conversationIds).toEqual([]);
+    expect(countMessages(fixture)).toBe(0);
+  }, 120_000);
+
+  test('workflow resume <run-id> continues the run existing thread', async () => {
+    const fixture = makeFixture();
+    const before = await seedFailedRun(fixture);
+
+    const resumed = await resumeForeground(fixture, before.runId);
+    // The resume re-executes the failed node, so it fails again — the run stays in the
+    // same state it started in and the only thing under test is where the output went.
+    expect(resumed.output).toContain("Bash node 'boom' failed");
+
+    expectResumedInPlace(readThreadState(fixture), before);
+    // The executor marks its startup message with the transient `segment` layout hint.
+    // History keeps the durable fields and drops that hint.
+    const metadata = readMessageMetadata(fixture, before.runConversationId);
+    expect(metadata).toContainEqual(expect.objectContaining({ category: 'workflow_status' }));
+    expect(metadata.filter(entry => 'segment' in entry)).toEqual([]);
+  }, 120_000);
+
+  test('workflow run <name> --resume continues the run existing thread', async () => {
+    const fixture = makeFixture();
+    const before = await seedFailedRun(fixture);
+
+    const resumed = await runForeground(fixture, WORKFLOW_NAME, { resume: true });
+    expect(resumed.output).toContain("Bash node 'boom' failed");
+
+    expectResumedInPlace(readThreadState(fixture), before);
+  }, 120_000);
+
+  // The detached launch is the one form where the id is not used in this process: the
+  // parent resolves it and pins it onto the child's argv, and the child is what opens
+  // the conversation. Nothing else here would catch that pin carrying a fresh id.
+  test('workflow run <name> --resume --detach hands the child the run existing thread', async () => {
+    const fixture = makeFixture();
+    const before = await seedFailedRun(fixture);
+    // Read before the launch: nothing is writing yet, and the thread the ack must name
+    // is already decided.
+    const platformConversationId = readPlatformConversationId(fixture, before.runConversationId);
+
+    const launched = runCli(fixture, [
+      'workflow',
+      'run',
+      WORKFLOW_NAME,
+      '--cwd',
+      fixture.repo,
+      '--no-worktree',
+      '--resume',
+      '--detach',
+      '--json',
+    ]);
+    if (launched.status !== 0) throw new Error(`detached launch failed: ${launched.output}`);
+    const ack = JSON.parse(launched.output.trim()) as { runId: string; conversationId: string };
+    detachedRunIds.add(ack.runId);
+    // The ack is the launch's public contract: it tells an automation which run and which
+    // thread the background work belongs to, so both must name what already exists.
+    expect(ack.runId).toBe(before.runId);
+    expect(ack.conversationId).toBe(platformConversationId);
+
+    // The snapshot the wait already took: at that point the conversation rows are final,
+    // so asserting on it beats a second read that would race the child to its exit.
+    expectResumedInPlace(await waitForDetachedDispatch(fixture), before);
+  }, 120_000);
+
+  test('workflow resume <run-id> --detach keeps the child in the run existing thread', async () => {
+    const fixture = makeFixture();
+    const before = await seedFailedRun(fixture);
+
+    const launched = runCli(fixture, [
+      'workflow',
+      'resume',
+      before.runId,
+      '--cwd',
+      fixture.repo,
+      '--detach',
+      '--json',
+    ]);
+    if (launched.status !== 0) throw new Error(`detached resume failed: ${launched.output}`);
+    const ack = JSON.parse(launched.output.trim()) as {
+      ok: boolean;
+      runId: string;
+      action: string;
+      detached: boolean;
+    };
+    detachedRunIds.add(ack.runId);
+    expect(ack).toMatchObject({
+      ok: true,
+      runId: before.runId,
+      action: 'resume',
+      detached: true,
+    });
+
+    expectResumedInPlace(await waitForDetachedDispatch(fixture), before);
+  }, 120_000);
+});
+
+interface RunRow {
+  id: string;
+  status: string;
+  conversation_id: string;
+  completed_at: string | null;
+}
+
+/** Add a workflow to the fixture repo and run it once in the foreground. */
+async function seedRun(fixture: Fixture, name: string, nodes: string[]): Promise<RunRow> {
+  writeFileSync(
+    join(fixture.repo, '.archon', 'workflows', `${name}.yaml`),
+    [`name: ${name}`, 'description: origin-free continuation', 'nodes:', ...nodes, ''].join('\n')
+  );
+  await runForeground(fixture, name);
+  return readRun(fixture, name);
+}
+
+function readRun(fixture: Fixture, name: string): RunRow {
+  const database = openDatabase(fixture);
+  try {
+    const run = database
+      .query<RunRow, [string]>(
+        'SELECT id, status, conversation_id, completed_at FROM remote_agent_workflow_runs WHERE workflow_name = ? ORDER BY started_at DESC LIMIT 1'
+      )
+      .get(name);
+    if (!run) throw new Error(`no run row was recorded for ${name}`);
+    return run;
+  } finally {
+    database.close();
+  }
+}
+
+function listConversationIds(fixture: Fixture): string[] {
+  const database = openDatabase(fixture);
+  try {
+    return database
+      .query<{ id: string }, []>('SELECT id FROM remote_agent_conversations')
+      .all()
+      .map(row => row.id);
+  } finally {
+    database.close();
+  }
+}
+
+/** The origin-free outcome: only the hidden anchor exists, and no history was written. */
+function expectNoConversation(fixture: Fixture): void {
+  expect(listConversationIds(fixture)).toEqual([ORIGIN_ANCHOR_ID]);
+  expect(countMessages(fixture)).toBe(0);
+}
+
+// Every CLI continuation entry point resolves the same destination, so each must stay
+// headless for a run created without provenance.
+describe('origin-free continuations stay headless', () => {
+  test('workflow approve continues an origin-free run without a conversation', async () => {
+    const fixture = makeFixture();
+    const seeded = await seedRun(fixture, 'approve-origin-free', [
+      '  - id: review',
+      '    approval:',
+      '      message: Approve?',
+      '  - id: after',
+      '    depends_on: [review]',
+      '    bash: echo after',
+    ]);
+    expect(seeded.status).toBe('paused');
+
+    const approved = await captureWorkflowCommand(fixture.archonHome, async host => {
+      expect(await workflowApproveCommand(host, seeded.id, undefined, false, fixture.repo)).toBe(0);
+    });
+    expect(approved.status).toBe(0);
+    expect(readRun(fixture, 'approve-origin-free').status).toBe('completed');
+    expectNoConversation(fixture);
+  }, 120_000);
+
+  // The owner resumes its own durable wait under the destination it already resolved.
+  test('a durable wait resumed by its owner keeps an origin-free run headless', async () => {
+    const fixture = makeFixture();
+    const marker = join(fixture.repo, 'gate-open');
+    // A resume needs a completed node to skip, so `warmup` precedes the failing gate.
+    const seeded = await seedRun(fixture, 'wait-origin-free', [
+      '  - id: warmup',
+      '    bash: echo warm',
+      '  - id: gate',
+      '    depends_on: [warmup]',
+      `    bash: test -f ${JSON.stringify(marker)}`,
+      '  - id: cooldown',
+      '    depends_on: [gate]',
+      '    wait:',
+      '      duration_ms: 500',
+      '  - id: after',
+      '    depends_on: [cooldown]',
+      '    bash: echo after',
+    ]);
+    expect(seeded.status).toBe('failed');
+    writeFileSync(marker, '');
+
+    const resumed = await resumeForeground(fixture, seeded.id);
+    expect(resumed.output).toContain('this process resumes the run at its deadline');
+    expect(resumed.status).toBe(0);
+    expect(readRun(fixture, 'wait-origin-free').status).toBe('completed');
+    expectNoConversation(fixture);
+  }, 120_000);
+
+  test('workflow resume --detach hands an origin-free run to the child without a conversation', async () => {
+    const fixture = makeFixture();
+    const before = await seedFailedRun(fixture, false);
+
+    const launched = runCli(fixture, [
+      'workflow',
+      'resume',
+      before.runId,
+      '--cwd',
+      fixture.repo,
+      '--detach',
+      '--json',
+    ]);
+    if (launched.status !== 0) throw new Error(`detached resume failed: ${launched.output}`);
+    const ack = JSON.parse(launched.output.trim()) as { runId: string; conversationId?: unknown };
+    detachedRunIds.add(ack.runId);
+    expect(ack.runId).toBe(before.runId);
+
+    // The child re-fails `boom`; its new completion time marks the resumed segment done.
+    const firstCompletion = readRun(fixture, WORKFLOW_NAME).completed_at;
+    const deadline = Date.now() + 60_000;
+    for (;;) {
+      const run = readRun(fixture, WORKFLOW_NAME);
+      if (run.status === 'failed' && run.completed_at !== firstCompletion) break;
+      if (Date.now() > deadline) throw new Error(`the detached child never settled: ${run.status}`);
+      await Bun.sleep(100);
+    }
+    expectNoConversation(fixture);
+  }, 120_000);
+});
+
+test('resume reuses a registered worktree with one warning and durable adoption', async () => {
+  const fixture = makeFixture();
+  const git = (...args: string[]) => {
+    const result = spawnSync('git', ['-C', fixture.repo, ...args], { encoding: 'utf8' });
+    if (result.status !== 0) throw new Error(result.stderr);
+  };
+  git('config', 'user.name', 'Test');
+  git('config', 'user.email', 'test@example.com');
+  git('config', 'commit.gpgsign', 'false');
+  git('add', '.archon');
+  git('commit', '-qm', 'seed workflow');
+  git('branch', '-M', 'dev');
+  const remote = join(fixture.archonHome, 'remote.git');
+  git('init', '--bare', '-q', remote);
+  git('remote', 'add', 'origin', remote);
+  git('push', '-q', 'origin', 'dev');
+  writeFileSync(join(fixture.repo, '.archon', 'config.yaml'), 'worktree:\n  baseBranch: dev\n');
+  const first = await runForeground(fixture, WORKFLOW_NAME, {
+    noWorktree: false,
+    branchName: 'resume-adoption',
+  });
+  expect(first.output).toContain('boom');
+  const before = readThreadState(fixture);
+  expect(before.runStatus).toBe('failed');
+  const readCheckout = () => {
+    const database = openDatabase(fixture);
+    try {
+      return database
+        .query<{ working_path: string; metadata: string }, []>(
+          'SELECT working_path, metadata FROM remote_agent_isolation_environments'
+        )
+        .all();
+    } finally {
+      database.close();
+    }
+  };
+  const [created] = readCheckout();
+  expect(JSON.parse(created.metadata).adopted).toBe(false);
+  expect(created.working_path).not.toBe(fixture.repo);
+  const resumed = await resumeForeground(fixture, before.runId);
+  expect(resumed.output).toContain('boom');
+  expect(resumed.output).toContain(`Working path: ${created.working_path}`);
+  const warnings = resumed.stderr
+    .split('\n')
+    .filter(Boolean)
+    .flatMap(line => {
+      try {
+        return [JSON.parse(line) as Record<string, unknown>];
+      } catch {
+        return [];
+      }
+    })
+    .filter(event => event.msg === 'worktree_adopted');
+  expect(warnings).toEqual([
+    expect.objectContaining({ level: 40, worktreePath: created.working_path }),
+  ]);
+  const rows = readCheckout();
+  expect(rows).toHaveLength(1);
+  expect(rows[0].working_path).toBe(created.working_path);
+  expect(JSON.parse(rows[0].metadata)).toMatchObject({
+    ...JSON.parse(created.metadata),
+    adopted: true,
+    worktree_registration_id: expect.any(String),
+  });
+  expect(JSON.parse(rows[0].metadata).worktree_registration_id).not.toBe(
+    JSON.parse(created.metadata).worktree_registration_id
+  );
+});

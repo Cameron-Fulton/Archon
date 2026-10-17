@@ -17,14 +17,15 @@ Workflows are YAML files discovered from `.archon/workflows/` (recursively) plus
 ### `name` (required)
 - **Type**: non-empty string
 - **Used by**: Router for exact-match lookup; displayed in workflow list
-- **Example**: `name: archon-fix-github-issue-dag`
+- **Example**: `name: archon-ship`
 
 ### `description` (required)
 - **Type**: non-empty string (multiline supported)
 - **Used by**: Router prompt — this is the primary signal the AI uses to select a workflow. Include `Use when:` and `NOT for:` sections.
 
 ### `provider` (optional)
-- **Type**: `'claude'` | `'codex'`
+- **Type**: any registered provider id — `'claude'` | `'codex'` | `'pi'` | `'copilot'` | `'opencode'`
+  (validated at load against the registry, so the list follows what is registered)
 - **Default**: falls back to `.archon/config.yaml` assistants default (Claude)
 
 ### `model` (optional)
@@ -33,9 +34,21 @@ Workflows are YAML files discovered from `.archon/workflows/` (recursively) plus
 - **Codex models**: anything that does NOT match Claude patterns
 - **Validation**: incompatible provider/model fails loading
 
-### `modelReasoningEffort` (optional, Codex only)
+### `effort` (optional)
+- **Type**: `'minimal'` | `'low'` | `'medium'` | `'high'` | `'xhigh'` | `'max'`
+- **Applies to**: every provider with a reasoning control (Claude, Codex, Pi, Copilot).
+  Pi takes all six; the others clamp a rung their SDK lacks to the nearest one
+  they have (`max` → `xhigh` on Codex/Copilot; `minimal` → `low` on
+  Claude/Copilot). OpenCode has none.
+- **Also valid per-node**, where it overrides the workflow-level value.
+
+### `modelReasoningEffort` (was Codex-only) — DEPRECATED
 - **Type**: `'minimal'` | `'low'` | `'medium'` | `'high'` | `'xhigh'`
+- **Use `effort:` instead.** Still accepted: the loader translates it into
+  `effort:` and warns. If both are declared, `effort:` wins and this one is
+  dropped. Will be removed.
 - **Default**: from `.archon/config.yaml` `assistants.codex.modelReasoningEffort`
+  (that config key is NOT deprecated)
 
 ### `webSearchMode` (optional, Codex only)
 - **Type**: `'disabled'` | `'cached'` | `'live'`
@@ -105,7 +118,7 @@ prompt: |
 
 **Signal detection** supports two formats:
 - `<promise>SIGNAL</promise>` (recommended, case-insensitive)
-- Plain signal at end-of-output or on its own line
+- Plain signal only as the trimmed final line of the output, with nothing else on it
 
 ---
 
@@ -152,7 +165,7 @@ Nodes are sorted topologically (Kahn's algorithm). Nodes in the same layer run c
 **`command:`** — Named command file, AI-executed
 ```yaml
 - id: plan
-  command: archon-create-plan
+  command: create-plan
 ```
 
 **`prompt:`** — Inline prompt string, AI-executed
@@ -181,7 +194,7 @@ Nodes are sorted topologically (Kahn's algorithm). Nodes in the same layer run c
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `timeout` | number (ms) | 120000 (2 min) | Total execution timeout for the subprocess |
+| `timeout` | number (ms) | none | Total execution timeout for the subprocess. Omitted: the node runs until it exits |
 
 ---
 
@@ -283,12 +296,9 @@ Four rules enforced at `loader.ts:370-439`:
 
 | File | Mode | Key Features |
 |------|------|-------------|
-| `archon-feature-development.yaml` | `steps:` | Simple two-step sequential |
-| `archon-plan-to-pr.yaml` | `steps:` | 11 steps with parallel review block |
-| `archon-ralph-fresh.yaml` | `loop:` | `fresh_context: true`, `<promise>COMPLETE</promise>` |
-| `archon-smart-pr-review.yaml` | `nodes:` | `output_format`, `when:`, `trigger_rule: one_success` |
-| `archon-validate-pr.yaml` | `nodes:` | `idle_timeout: 1800000`, bash nodes, `trigger_rule: all_done` |
-| `archon-fix-github-issue-dag.yaml` | `nodes:` | Full lifecycle with all DAG features |
+| `sdlc/ship/archon-ship-block.yaml` | `nodes:` | `include:` composition, `when:` routing on structured output, `trigger_rule: none_failed_min_one_success` |
+| `sdlc/review/archon-review-block.yaml` | `nodes:` | Parallel `command:` fan-out with `context: fresh`, conditional lenses, `script:` publish |
+| `sdlc/deliver/archon-deliver-block.yaml` | `nodes:` | Composed delivery tail, bounded correction loop, `script:` gates |
 
 ---
 

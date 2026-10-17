@@ -70,8 +70,38 @@ mock.module('discord.js', () => ({
 import { DiscordAdapter } from './adapter';
 import type { DiscordMessageContext } from './types';
 
+interface HistoryMessage {
+  author: { bot: boolean; displayName?: string; username: string };
+  content: string;
+}
+
+interface StartThreadOptions {
+  name: string;
+  autoArchiveDuration: number;
+  reason: string;
+}
+
+type StartThread = (options: StartThreadOptions) => Promise<{ id: string }>;
+
+function makeStartThread(id: string): Mock<StartThread> {
+  return mock(async () => ({ id }));
+}
+
+function startThreadOptions(startThread: Mock<StartThread>): StartThreadOptions {
+  const options = startThread.mock.calls[0]?.[0];
+  if (!options) throw new Error('startThread was not called');
+  return options;
+}
+
 describe('DiscordAdapter', () => {
+  test('supports durable conversation project detachment', () => {
+    expect(new DiscordAdapter('fake-token-for-testing').capabilities.canDetachProject).toBe(true);
+  });
+
   beforeEach(() => {
+    mockLogger.info.mockClear();
+    mockLogger.debug.mockClear();
+    mockLogger.warn.mockClear();
     mockChannelSend.mockClear();
     mockChannelsFetch.mockClear();
     mockClientOn.mockClear();
@@ -101,14 +131,6 @@ describe('DiscordAdapter', () => {
     test('should return discord as platform type', () => {
       const adapter = new DiscordAdapter('fake-token-for-testing');
       expect(adapter.getPlatformType()).toBe('discord');
-    });
-  });
-
-  describe('client instance', () => {
-    test('should provide access to client instance', () => {
-      const adapter = new DiscordAdapter('fake-token-for-testing');
-      const client = adapter.getClient();
-      expect(client).toBeDefined();
     });
   });
 
@@ -208,6 +230,31 @@ describe('DiscordAdapter', () => {
       expect(calls.length).toBe(1);
       return calls[0][1] as (msg: import('discord.js').Message) => void;
     }
+
+    test('unauthorized and ready events log no platform identities', async () => {
+      const original = process.env.DISCORD_ALLOWED_USER_IDS;
+      process.env.DISCORD_ALLOWED_USER_IDS = '111';
+      try {
+        const adapter = new DiscordAdapter('fake-token-for-testing');
+        await adapter.start();
+        getMessageCreateHandler()({
+          author: { id: '987654321', username: 'alice', bot: false },
+          content: '@alice',
+        } as unknown as import('discord.js').Message);
+        const ready = (
+          mockClientOnce as unknown as Mock<
+            (event: string, callback: (client: unknown) => void) => void
+          >
+        ).mock.calls.find(call => call[0] === 'ready')?.[1];
+        if (!ready) throw new Error('Missing ready callback');
+        ready({ user: { id: '111', tag: 'alice#1234' } });
+        expect(mockLogger.info).toHaveBeenCalledWith('discord.unauthorized_message');
+        expect(mockLogger.info).toHaveBeenCalledWith('discord.bot_logged_in');
+      } finally {
+        if (original === undefined) delete process.env.DISCORD_ALLOWED_USER_IDS;
+        else process.env.DISCORD_ALLOWED_USER_IDS = original;
+      }
+    });
 
     test('passes platformUserId and displayName from message.author', async () => {
       const adapter = new DiscordAdapter('fake-token-for-testing');
@@ -379,7 +426,7 @@ describe('DiscordAdapter', () => {
       };
 
       // Mock a Map-like iterable (Discord returns Collection)
-      const mockMessagesMap = new Map([
+      const mockMessagesMap = new Map<string, HistoryMessage>([
         ['id3', msg3], // newest - first in Collection
         ['id2', msg2],
         ['id1', msg1], // oldest - last in Collection
@@ -476,7 +523,7 @@ describe('DiscordAdapter', () => {
     test('should use exact content when at or under 100 chars', async () => {
       const adapter = new DiscordAdapter('fake-token-for-testing');
       const content = 'a'.repeat(100);
-      const mockStartThread = mock(() => Promise.resolve({ id: 'thread-exact' }));
+      const mockStartThread = makeStartThread('thread-exact');
       const mockMessage = {
         id: 'msg-gen-1',
         channelId: 'chan-gen',
@@ -489,7 +536,7 @@ describe('DiscordAdapter', () => {
 
       await adapter.ensureThread('chan-gen', mockMessage);
 
-      const callArgs = mockStartThread.mock.calls[0][0] as { name: string };
+      const callArgs = startThreadOptions(mockStartThread);
       expect(callArgs.name).toBe(content);
       expect(callArgs.name.endsWith('...')).toBe(false);
     });
@@ -497,7 +544,7 @@ describe('DiscordAdapter', () => {
     test('should truncate to 97 chars + ellipsis when content exceeds 100 chars', async () => {
       const adapter = new DiscordAdapter('fake-token-for-testing');
       const content = 'x'.repeat(150);
-      const mockStartThread = mock(() => Promise.resolve({ id: 'thread-trunc' }));
+      const mockStartThread = makeStartThread('thread-trunc');
       const mockMessage = {
         id: 'msg-gen-2',
         channelId: 'chan-gen',
@@ -510,14 +557,14 @@ describe('DiscordAdapter', () => {
 
       await adapter.ensureThread('chan-gen', mockMessage);
 
-      const callArgs = mockStartThread.mock.calls[0][0] as { name: string };
+      const callArgs = startThreadOptions(mockStartThread);
       expect(callArgs.name).toBe('x'.repeat(97) + '...');
       expect(callArgs.name.length).toBe(100);
     });
 
     test('should normalize whitespace in thread name', async () => {
       const adapter = new DiscordAdapter('fake-token-for-testing');
-      const mockStartThread = mock(() => Promise.resolve({ id: 'thread-ws' }));
+      const mockStartThread = makeStartThread('thread-ws');
       const mockMessage = {
         id: 'msg-gen-3',
         channelId: 'chan-gen',
@@ -530,7 +577,7 @@ describe('DiscordAdapter', () => {
 
       await adapter.ensureThread('chan-gen', mockMessage);
 
-      const callArgs = mockStartThread.mock.calls[0][0] as { name: string };
+      const callArgs = startThreadOptions(mockStartThread);
       expect(callArgs.name).toBe('hello world foo');
     });
   });
@@ -538,7 +585,7 @@ describe('DiscordAdapter', () => {
   describe('createThreadFromMessage (via ensureThread)', () => {
     test('should pass autoArchiveDuration of 1440 (OneDay)', async () => {
       const adapter = new DiscordAdapter('fake-token-for-testing');
-      const mockStartThread = mock(() => Promise.resolve({ id: 'thread-archive' }));
+      const mockStartThread = makeStartThread('thread-archive');
       const mockMessage = {
         id: 'msg-arc-1',
         channelId: 'chan-arc',
@@ -551,10 +598,7 @@ describe('DiscordAdapter', () => {
 
       await adapter.ensureThread('chan-arc', mockMessage);
 
-      const callArgs = mockStartThread.mock.calls[0][0] as {
-        autoArchiveDuration: number;
-        reason: string;
-      };
+      const callArgs = startThreadOptions(mockStartThread);
       // ThreadAutoArchiveDuration.OneDay = 1440 minutes
       expect(callArgs.autoArchiveDuration).toBe(1440);
       expect(callArgs.reason).toBe('Bot response thread');
@@ -562,7 +606,7 @@ describe('DiscordAdapter', () => {
 
     test('should strip bot mention before generating thread name', async () => {
       const adapter = new DiscordAdapter('fake-token-for-testing');
-      const mockStartThread = mock(() => Promise.resolve({ id: 'thread-strip' }));
+      const mockStartThread = makeStartThread('thread-strip');
       const mockMessage = {
         id: 'msg-strip-1',
         channelId: 'chan-strip',
@@ -575,7 +619,7 @@ describe('DiscordAdapter', () => {
 
       await adapter.ensureThread('chan-strip', mockMessage);
 
-      const callArgs = mockStartThread.mock.calls[0][0] as { name: string };
+      const callArgs = startThreadOptions(mockStartThread);
       expect(callArgs.name).toBe('please help me');
     });
   });
@@ -692,11 +736,11 @@ describe('DiscordAdapter', () => {
     });
 
     test('should create thread for channel message', async () => {
-      const mockStartThread = mock(() => Promise.resolve({ id: 'newthread123' }));
+      const mockStartThread = makeStartThread('newthread123');
       const mockMessage = {
         id: 'msg123',
         channelId: 'channel456',
-        content: 'Test message for thread',
+        content: 'Help <@987654321> @alice',
         channel: {
           isThread: () => false,
         },
@@ -710,16 +754,20 @@ describe('DiscordAdapter', () => {
       const result = await adapter.ensureThread('channel456', mockMessage);
 
       expect(mockStartThread).toHaveBeenCalledWith({
-        name: 'Test message for thread',
+        name: 'Help <@987654321> @alice',
         autoArchiveDuration: 1440,
         reason: 'Bot response thread',
       });
+      expect(mockLogger.info).toHaveBeenCalledWith(
+        { messageId: 'msg123' },
+        'discord.thread_creating'
+      );
       expect(result).toBe('newthread123');
     });
 
     test('should truncate long thread names', async () => {
       const longContent = 'a'.repeat(150);
-      const mockStartThread = mock(() => Promise.resolve({ id: 'newthread123' }));
+      const mockStartThread = makeStartThread('newthread123');
       const mockMessage = {
         id: 'msg123',
         channelId: 'channel456',
@@ -736,13 +784,15 @@ describe('DiscordAdapter', () => {
 
       await adapter.ensureThread('channel456', mockMessage);
 
-      const callArgs = mockStartThread.mock.calls[0][0] as { name: string };
+      const callArgs = startThreadOptions(mockStartThread);
       expect(callArgs.name.length).toBeLessThanOrEqual(100);
       expect(callArgs.name.endsWith('...')).toBe(true);
     });
 
     test('should fall back to channel ID on thread creation error', async () => {
-      const mockStartThread = mock(() => Promise.reject(new Error('Permission denied')));
+      const mockStartThread = mock<StartThread>(async () => {
+        throw new Error('Permission denied');
+      });
       const mockMessage = {
         id: 'msg123',
         channelId: 'channel456',
@@ -762,13 +812,42 @@ describe('DiscordAdapter', () => {
       expect(result).toBe('channel456'); // Falls back to channel
     });
 
+    test('logs the Discord error when thread creation fails', async () => {
+      // The logger's err serializer drops requestBody (the thread name); the
+      // message, such as "Missing Permissions", stays for diagnosis.
+      const apiError = Object.assign(new Error('Missing Permissions'), {
+        name: 'DiscordAPIError[50013]',
+        code: 50013,
+      });
+      const mockStartThread = mock<StartThread>(async () => {
+        throw apiError;
+      });
+      const mockMessage = {
+        id: 'msg123',
+        channelId: 'channel456',
+        content: 'Help @alice 987654321',
+        channel: { isThread: () => false },
+        guild: { id: 'guild123' },
+        startThread: mockStartThread,
+        mentions: { has: () => false },
+      } as unknown as import('discord.js').Message;
+      mockLogger.error.mockClear();
+
+      await adapter.ensureThread('channel456', mockMessage);
+
+      expect(mockLogger.error).toHaveBeenCalledWith(
+        { err: apiError, messageId: 'msg123' },
+        'discord.thread_creation_failed'
+      );
+    });
+
     test('should deduplicate concurrent thread creation calls', async () => {
       let resolveThread: (value: { id: string }) => void;
       const threadPromise = new Promise<{ id: string }>(resolve => {
         resolveThread = resolve;
       });
 
-      const mockStartThread = mock(() => threadPromise);
+      const mockStartThread = mock<StartThread>(() => threadPromise);
       const mockMessage = {
         id: 'msg123',
         channelId: 'channel456',
@@ -801,7 +880,7 @@ describe('DiscordAdapter', () => {
     });
 
     test('should use Bot Response as thread name for empty content', async () => {
-      const mockStartThread = mock(() => Promise.resolve({ id: 'newthread123' }));
+      const mockStartThread = makeStartThread('newthread123');
       const mockMessage = {
         id: 'msg123',
         channelId: 'channel456',
@@ -818,7 +897,7 @@ describe('DiscordAdapter', () => {
 
       await adapter.ensureThread('channel456', mockMessage);
 
-      const callArgs = mockStartThread.mock.calls[0][0] as { name: string };
+      const callArgs = startThreadOptions(mockStartThread);
       expect(callArgs.name).toBe('Bot Response');
     });
   });

@@ -1,7 +1,14 @@
 import { describe, expect, test } from 'bun:test';
-import type { AgentSession, AgentSessionEvent } from '@earendil-works/pi-coding-agent';
+import type {
+  AgentSession,
+  AgentSessionEvent,
+  SessionEntry,
+} from '@earendil-works/pi-coding-agent';
+import type { StopReason, Usage } from '@earendil-works/pi-ai';
 
-import type { MessageChunk } from '../../types';
+import type { ProviderStopReason } from '@archon/provider-contract';
+
+import type { MessageChunk, ResultChunk } from '../../types';
 import {
   AsyncQueue,
   bridgeSession,
@@ -11,6 +18,8 @@ import {
   tryParseStructuredOutput,
   usageToTokens,
 } from './event-bridge';
+import { beginPiExtensionTurn } from './extension-error-broker';
+import { createArchonUIBridge, createArchonUIContext } from './ui-context-stub';
 
 // ─── AsyncQueue ────────────────────────────────────────────────────────────
 
@@ -126,15 +135,17 @@ describe('usageToTokens', () => {
     const usage = {
       input: 100,
       output: 50,
-      cacheRead: 0,
-      cacheWrite: 0,
-      totalTokens: 150,
+      cacheRead: 20,
+      cacheWrite: 5,
+      totalTokens: 175,
       cost: { input: 0.001, output: 0.002, cacheRead: 0, cacheWrite: 0, total: 0.003 },
     };
     expect(usageToTokens(usage)).toEqual({
-      input: 100,
+      input: 125,
       output: 50,
-      total: 150,
+      cacheRead: 20,
+      cacheWrite: 5,
+      total: 175,
       cost: 0.003,
     });
   });
@@ -156,10 +167,13 @@ describe('buildResultChunk', () => {
     // agent_end with no assistant message in the transcript is anomalous —
     // must surface as an error so the orchestrator doesn't treat a broken
     // session as a clean success.
-    const expected = {
+    const evidence = 'Pi ended the turn without an assistant message';
+    const expected: ResultChunk = {
       type: 'result',
       isError: true,
       errorSubtype: 'missing_assistant_message',
+      errors: [evidence],
+      failure: { class: 'unknown', evidence },
     };
     expect(buildResultChunk([])).toEqual(expected);
     expect(buildResultChunk([{ role: 'user', content: [] }])).toEqual(expected);
@@ -172,8 +186,15 @@ describe('buildResultChunk', () => {
     ]);
     expect(chunk.type).toBe('result');
     if (chunk.type === 'result') {
-      expect(chunk.tokens).toEqual({ input: 10, output: 5, total: 15, cost: 0.01 });
-      expect(chunk.stopReason).toBe('stop');
+      expect(chunk.tokens).toEqual({
+        input: 10,
+        output: 5,
+        cacheRead: 0,
+        cacheWrite: 0,
+        total: 15,
+        cost: 0.01,
+      });
+      expect(chunk.stopReason).toBe('end_turn');
       expect(chunk.isError).toBeUndefined();
       expect(chunk.cost).toBe(0.01);
     }
@@ -211,23 +232,40 @@ describe('buildResultChunk', () => {
     }
   });
 
-  test('does not populate errors when errorMessage is absent or empty', () => {
-    // undefined errorMessage
-    const chunk1 = buildResultChunk([
-      { role: 'assistant', usage, stopReason: 'error', content: [] },
-    ]);
-    if (chunk1.type === 'result') {
-      expect(chunk1.isError).toBe(true);
-      expect(chunk1.errors).toBeUndefined();
+  test('falls back to the stop reason as evidence when errorMessage is absent or empty', () => {
+    for (const errorMessage of [undefined, '']) {
+      const chunk = buildResultChunk([
+        { role: 'assistant', usage, stopReason: 'error', errorMessage, content: [] },
+      ]);
+      expect(chunk.isError).toBe(true);
+      expect(chunk.failure).toEqual({ class: 'unknown', evidence: 'error' });
+      expect(chunk.errors).toEqual(['error']);
     }
-    // empty string — also falsy, also excluded from errors[]
-    const chunk2 = buildResultChunk([
-      { role: 'assistant', usage, stopReason: 'error', errorMessage: '', content: [] },
+  });
+
+  // Pi has no typed error taxonomy: a failure is `unknown` whatever its words say,
+  // and the words are kept as evidence.
+  test.each([
+    ['429 Too Many Requests: rate limit exceeded'],
+    ['Selected model is at capacity'],
+    ['401 Unauthorized: invalid x-api-key'],
+    ["400 invalid_request_error: You're out of extra usage"],
+  ])('an errored turn "%s" reports an unknown failure with the vendor text', errorMessage => {
+    const chunk = buildResultChunk([
+      { role: 'assistant', usage, stopReason: 'error', errorMessage, content: [] },
     ]);
-    if (chunk2.type === 'result') {
-      expect(chunk2.isError).toBe(true);
-      expect(chunk2.errors).toBeUndefined();
-    }
+    expect(chunk.failure).toEqual({ class: 'unknown', evidence: errorMessage });
+  });
+
+  // Pi's stop reasons in ACP's names; one ACP has no name for is left off.
+  test.each<[StopReason, ProviderStopReason | undefined]>([
+    ['stop', 'end_turn'],
+    ['length', 'max_tokens'],
+    ['aborted', 'cancelled'],
+    ['toolUse', undefined],
+  ])('stop reason %s maps to %p', (stopReason, expected) => {
+    const chunk = buildResultChunk([{ role: 'assistant', usage, stopReason, content: [] }]);
+    expect(chunk.stopReason).toBe(expected);
   });
 
   test('flags isError for stopReason=aborted', () => {
@@ -239,23 +277,21 @@ describe('buildResultChunk', () => {
     }
   });
 
-  test('prefers last assistant message when multiple present', () => {
-    const olderUsage = { ...usage, input: 1, totalTokens: 1 };
+  test('outcome comes from the last assistant message, usage from all of them', () => {
     const chunk = buildResultChunk([
-      { role: 'assistant', usage: olderUsage, stopReason: 'stop', content: [] },
+      { role: 'assistant', usage, stopReason: 'error', errorMessage: 'overloaded', content: [] },
       { role: 'user', content: [] },
       { role: 'assistant', usage, stopReason: 'stop', content: [] },
     ]);
-    if (chunk.type === 'result') {
-      expect(chunk.tokens?.input).toBe(10);
-    }
+    expect(chunk).toMatchObject({ type: 'result', stopReason: 'end_turn', tokens: { input: 20 } });
+    expect(chunk).not.toHaveProperty('isError');
   });
 });
 
 // ─── mapPiEvent ────────────────────────────────────────────────────────────
 
 describe('mapPiEvent', () => {
-  test('text_delta → assistant chunk', () => {
+  test('text_delta → agent_message_chunk', () => {
     const chunks = mapPiEvent({
       type: 'message_update',
       message: { role: 'assistant' } as never,
@@ -266,10 +302,10 @@ describe('mapPiEvent', () => {
         partial: { role: 'assistant' } as never,
       },
     });
-    expect(chunks).toEqual([{ type: 'assistant', content: 'hi' }]);
+    expect(chunks).toEqual([{ type: 'agent_message_chunk', text: 'hi' }]);
   });
 
-  test('thinking_delta → thinking chunk', () => {
+  test('thinking_delta → agent_thought_chunk', () => {
     const chunks = mapPiEvent({
       type: 'message_update',
       message: { role: 'assistant' } as never,
@@ -280,7 +316,7 @@ describe('mapPiEvent', () => {
         partial: { role: 'assistant' } as never,
       },
     });
-    expect(chunks).toEqual([{ type: 'thinking', content: 'hmm' }]);
+    expect(chunks).toEqual([{ type: 'agent_thought_chunk', text: 'hmm' }]);
   });
 
   test('text_start/end and boundaries are skipped', () => {
@@ -296,7 +332,26 @@ describe('mapPiEvent', () => {
     expect(chunks).toEqual([]);
   });
 
-  test('tool_execution_start → tool chunk with toolCallId', () => {
+  test('bash commands supply provider display titles', () => {
+    expect(
+      mapPiEvent({
+        type: 'tool_execution_start',
+        toolCallId: 'shell',
+        toolName: 'bash',
+        args: { command: 'bun test' },
+      })
+    ).toEqual([
+      {
+        type: 'tool_call',
+        toolCallId: 'shell',
+        name: 'bash',
+        title: 'bun test',
+        rawInput: { command: 'bun test' },
+      },
+    ]);
+  });
+
+  test('tool_execution_start → tool_call with its args as rawInput', () => {
     const chunks = mapPiEvent({
       type: 'tool_execution_start',
       toolCallId: 'call-123',
@@ -304,26 +359,36 @@ describe('mapPiEvent', () => {
       args: { path: '/foo' },
     });
     expect(chunks).toEqual([
-      {
-        type: 'tool',
-        toolName: 'read',
-        toolInput: { path: '/foo' },
-        toolCallId: 'call-123',
-      },
+      { type: 'tool_call', toolCallId: 'call-123', name: 'read', rawInput: { path: '/foo' } },
     ]);
   });
 
-  test('tool_execution_start coerces non-object args to empty record', () => {
-    const chunks = mapPiEvent({
-      type: 'tool_execution_start',
-      toolCallId: 'call-1',
-      toolName: 'bash',
-      args: 'just-a-string',
-    });
-    expect(chunks[0]).toMatchObject({ type: 'tool', toolInput: {} });
+  test.each(['just-a-string', 0, false, null, ['a', 1]].map(value => [value] as const))(
+    'tool_execution_start preserves JSON args %j',
+    args => {
+      expect(
+        mapPiEvent({
+          type: 'tool_execution_start',
+          toolCallId: 'call-1',
+          toolName: 'bash',
+          args,
+        })
+      ).toEqual([{ type: 'tool_call', toolCallId: 'call-1', name: 'bash', rawInput: args }]);
+    }
+  );
+
+  test('tool_execution_start omits undefined args', () => {
+    expect(
+      mapPiEvent({
+        type: 'tool_execution_start',
+        toolCallId: 'call-1',
+        toolName: 'bash',
+        args: undefined,
+      })
+    ).toEqual([{ type: 'tool_call', toolCallId: 'call-1', name: 'bash' }]);
   });
 
-  test('tool_execution_end → tool_result chunk with matching id', () => {
+  test('tool_execution_end → completed tool_call_update with matching id', () => {
     const chunks = mapPiEvent({
       type: 'tool_execution_end',
       toolCallId: 'call-123',
@@ -333,16 +398,15 @@ describe('mapPiEvent', () => {
     });
     expect(chunks).toEqual([
       {
-        type: 'tool_result',
-        toolName: 'read',
-        toolOutput: 'file contents',
+        type: 'tool_call_update',
         toolCallId: 'call-123',
-        toolOutcome: 'success',
+        status: 'completed',
+        output: 'file contents',
       },
     ]);
   });
 
-  test('tool_execution_end with isError emits system warning first', () => {
+  test('tool_execution_end with isError → failed tool_call_update', () => {
     const chunks = mapPiEvent({
       type: 'tool_execution_end',
       toolCallId: 'call-99',
@@ -350,12 +414,12 @@ describe('mapPiEvent', () => {
       result: 'exit 1',
       isError: true,
     });
-    expect(chunks).toHaveLength(2);
-    expect(chunks[0].type).toBe('system');
-    expect(chunks[1]).toMatchObject({ type: 'tool_result', toolOutcome: 'error' });
+    expect(chunks).toEqual([
+      { type: 'tool_call_update', toolCallId: 'call-99', status: 'failed', output: 'exit 1' },
+    ]);
   });
 
-  test('auto_retry_start → system chunk', () => {
+  test('auto_retry_start → pi.auto_retry warning', () => {
     const chunks = mapPiEvent({
       type: 'auto_retry_start',
       attempt: 1,
@@ -363,29 +427,9 @@ describe('mapPiEvent', () => {
       delayMs: 1000,
       errorMessage: 'rate limit',
     });
-    expect(chunks).toHaveLength(1);
-    expect(chunks[0].type).toBe('system');
-    if (chunks[0].type === 'system') {
-      expect(chunks[0].content).toContain('retry 1/3');
-      expect(chunks[0].content).toContain('rate limit');
-    }
-  });
-
-  test('agent_end → result chunk', () => {
-    const usage = {
-      input: 5,
-      output: 10,
-      cacheRead: 0,
-      cacheWrite: 0,
-      totalTokens: 15,
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.001 },
-    };
-    const chunks = mapPiEvent({
-      type: 'agent_end',
-      messages: [{ role: 'assistant', usage, stopReason: 'stop', content: [] } as never],
-    });
-    expect(chunks).toHaveLength(1);
-    expect(chunks[0].type).toBe('result');
+    expect(chunks).toEqual([
+      { type: 'warning', code: 'pi.auto_retry', message: 'retry 1/3: rate limit' },
+    ]);
   });
 
   test('skipped event types yield no chunks', () => {
@@ -405,10 +449,38 @@ describe('mapPiEvent', () => {
         followUp: [] as readonly string[],
       })
     ).toEqual([]);
+  });
+
+  test.each([
+    ['manual', 'manual'],
+    ['threshold', 'auto'],
+    ['overflow', 'auto'],
+  ] as const)('compaction_start (%s) → compaction started, trigger %s', (reason, trigger) => {
+    expect(mapPiEvent({ type: 'compaction_start', reason })).toEqual([
+      { type: 'compaction', phase: 'started', trigger },
+    ]);
+  });
+
+  test('compaction_end with a result → compaction completed with tokensBefore', () => {
     expect(
       mapPiEvent({
-        type: 'compaction_start',
+        type: 'compaction_end',
+        reason: 'threshold',
+        result: { summary: 's', firstKeptEntryId: 'e1', tokensBefore: 120_000, details: {} },
+        aborted: false,
+        willRetry: false,
+      })
+    ).toEqual([{ type: 'compaction', phase: 'completed', trigger: 'auto', tokensBefore: 120_000 }]);
+  });
+
+  test('an aborted compaction_end (no result) yields nothing', () => {
+    expect(
+      mapPiEvent({
+        type: 'compaction_end',
         reason: 'manual',
+        result: undefined,
+        aborted: true,
+        willRetry: false,
       })
     ).toEqual([]);
   });
@@ -536,6 +608,49 @@ describe('tryParseStructuredOutput', () => {
 // ─── bridgeSession cleanup ─────────────────────────────────────────────────
 
 describe('bridgeSession cleanup', () => {
+  test('throws an externally reported extension error unchanged', async () => {
+    const turn = beginPiExtensionTurn(['/extensions/fake-extension.ts']);
+    let abortCount = 0;
+    let disposeCount = 0;
+    const session = {
+      sessionId: 'test-session-id',
+      prompt: () => new Promise<void>(() => {}),
+      dispose: () => {
+        disposeCount++;
+      },
+      subscribe: () => () => {},
+      abort: async () => {
+        abortCount++;
+      },
+    } as unknown as AgentSession;
+    const failure = new Error('extension timer failed');
+    failure.stack =
+      'Error: extension timer failed\n    at callback (/extensions/fake-extension.ts:4:2)';
+
+    queueMicrotask(() => turn.report(failure, '/extensions/fake-extension.ts'));
+    let caught: Error | undefined;
+    try {
+      for await (const _chunk of bridgeSession(
+        session,
+        'prompt',
+        undefined,
+        undefined,
+        undefined,
+        turn
+      )) {
+        // The external failure arrives before the session emits a chunk.
+      }
+    } catch (error) {
+      caught = error as Error;
+    } finally {
+      turn.close();
+    }
+
+    expect(caught).toBe(failure);
+    expect(abortCount).toBe(1);
+    expect(disposeCount).toBe(1);
+  });
+
   // Regression for #1561: when the consumer throws mid-iteration, bridgeSession's
   // finally block calls session.dispose() and used to await the prompt promise
   // for a "settle so callers see no dangling work" guarantee. That guarantee
@@ -604,7 +719,7 @@ describe('bridgeSession cleanup', () => {
     // 200ms is generous for scheduling overhead while still catching any
     // future regression that re-introduces an await on promptPromise.
     expect(elapsed).toBeLessThan(200);
-  }, 5_000);
+  });
 
   test('a late prompt() rejection does not become an unhandled rejection', async () => {
     // The .then() handlers in bridgeSession should preclude promptPromise
@@ -657,7 +772,93 @@ describe('bridgeSession cleanup', () => {
     rejectPrompt(new Error('late pi error'));
     // Yield to let the microtask queue drain so the .catch() runs.
     await new Promise(resolve => setTimeout(resolve, 10));
-  }, 5_000);
+  });
+
+  // The engine's idle watchdog aborts and walks away with one next() still pending.
+  // A chunk that resolves that next() parks the bridge at a yield nobody consumes,
+  // so its finally (session dispose, extension-turn close) never runs.
+  test('an aborted caller gets no further chunk and the session is disposed', async () => {
+    let listenerRef: ((e: AgentSessionEvent) => void) | undefined;
+    let resolvePrompt!: () => void;
+    let disposeCount = 0;
+    const session = {
+      sessionId: 'test-session-id',
+      prompt: () =>
+        new Promise<void>(resolve => {
+          resolvePrompt = resolve;
+        }),
+      dispose: () => {
+        disposeCount++;
+      },
+      subscribe: (l: (e: AgentSessionEvent) => void) => {
+        listenerRef = l;
+        return () => {
+          listenerRef = undefined;
+        };
+      },
+      abort: async () => {},
+    } as unknown as AgentSession;
+    const controller = new AbortController();
+
+    const pending = bridgeSession(session, 'prompt', controller.signal).next();
+    controller.abort();
+    listenerRef?.({
+      type: 'tool_execution_start',
+      toolName: 'echo',
+      toolCallId: 'tc1',
+      args: {},
+    } as unknown as AgentSessionEvent);
+    resolvePrompt();
+
+    await expect(pending).rejects.toThrow('Query aborted');
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(disposeCount).toBe(1);
+  });
+
+  // A wedged session answers abort() with nothing: prompt() never settles, no event arrives.
+  test('an aborted caller on a session that ignores abort still ends and disposes it', async () => {
+    let disposeCount = 0;
+    const session = {
+      sessionId: 'test-session-id',
+      prompt: () => new Promise<void>(() => undefined),
+      dispose: () => {
+        disposeCount++;
+      },
+      subscribe: () => () => {},
+      abort: async () => {},
+    } as unknown as AgentSession;
+    const controller = new AbortController();
+
+    const pending = bridgeSession(session, 'prompt', controller.signal).next();
+    controller.abort();
+    const stuck = new Promise<'stuck'>(resolve => setTimeout(() => resolve('stuck'), 1000));
+
+    await expect(Promise.race([pending, stuck])).rejects.toThrow('Query aborted');
+    expect(disposeCount).toBe(1);
+  });
+
+  test('a caller aborted before the bridge starts never sends the prompt', async () => {
+    let promptCount = 0;
+    let disposeCount = 0;
+    const session = {
+      sessionId: 'test-session-id',
+      prompt: async () => {
+        promptCount++;
+      },
+      dispose: () => {
+        disposeCount++;
+      },
+      subscribe: () => () => {},
+      abort: async () => {},
+    } as unknown as AgentSession;
+
+    const gen = bridgeSession(session, 'prompt', AbortSignal.abort());
+
+    await expect(gen.next()).rejects.toThrow('Query aborted');
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(promptCount).toBe(0);
+    expect(disposeCount).toBe(1);
+  });
 });
 
 // ─── streaming tail completion ────────────────────────────────────────────────────────────────────
@@ -692,7 +893,40 @@ describe('streaming tail completion', () => {
     } as unknown as AgentSessionEvent;
   }
 
-  test('emits corrective assistant chunk when streaming truncated', async () => {
+  test('completes a truncated tail from an earlier loop run in the same prompt', async () => {
+    // One prompt() can run Pi's loop twice (e.g. compact-and-continue). The first
+    // run's final turn lost its tail; the second run streamed cleanly. The first
+    // run's tail must still be recovered, in its own block, before the second run's text.
+    let listener: ((event: AgentSessionEvent) => void) | undefined;
+    const mockSession = {
+      sessionId: 'session-1',
+      subscribe: (fn: (event: AgentSessionEvent) => void) => {
+        listener = fn;
+        return () => {};
+      },
+      prompt: async () => {
+        listener?.({ type: 'turn_start' } as AgentSessionEvent);
+        listener?.(makeTextDeltaEvent('first run lost its '));
+        listener?.(makeAgentEndEvent('first run lost its tail'));
+        listener?.({ type: 'turn_start' } as AgentSessionEvent);
+        listener?.(makeTextDeltaEvent('second run is clean'));
+        listener?.(makeAgentEndEvent('second run is clean'));
+      },
+      abort: async () => {},
+      dispose: () => {},
+    } as unknown as AgentSession;
+
+    const chunks: MessageChunk[] = [];
+    for await (const chunk of bridgeSession(mockSession, 'prompt')) chunks.push(chunk);
+
+    expect(chunks.filter(c => c.type === 'agent_message_chunk').map(c => c.text)).toEqual([
+      'first run lost its tail',
+      'second run is clean',
+    ]);
+    expect(chunks.filter(c => c.type === 'result')).toHaveLength(1);
+  });
+
+  test('emits corrective text chunk when streaming truncated', async () => {
     const streamed = 'The repo is cloned. Let me register it.\n\n/register-project';
     const full =
       'The repo is cloned. Let me register it.\n\n/register-project SaberEngine "/path/to/repo"';
@@ -719,10 +953,10 @@ describe('streaming tail completion', () => {
       chunks.push(chunk);
     }
 
-    const assistantChunks = chunks.filter(c => c.type === 'assistant');
-    expect(assistantChunks).toHaveLength(2);
-    expect(assistantChunks[0].content).toBe(streamed);
-    expect(assistantChunks[1].content).toBe(tail);
+    // The recovered tail joins the streamed prefix in one block: the executor
+    // joins separate assistant chunks with a blank line.
+    const assistantChunks = chunks.filter(c => c.type === 'agent_message_chunk');
+    expect(assistantChunks.map(c => c.text)).toEqual([streamed + tail]);
     expect(chunks[chunks.length - 1].type).toBe('result');
   });
 
@@ -750,9 +984,9 @@ describe('streaming tail completion', () => {
       chunks.push(chunk);
     }
 
-    const assistantChunks = chunks.filter(c => c.type === 'assistant');
+    const assistantChunks = chunks.filter(c => c.type === 'agent_message_chunk');
     expect(assistantChunks).toHaveLength(1);
-    expect(assistantChunks[0].content).toBe(full);
+    expect(assistantChunks[0].text).toBe(full);
   });
 
   test('does not emit corrective chunk when assembled text does not start with streamed (mismatch)', async () => {
@@ -777,9 +1011,9 @@ describe('streaming tail completion', () => {
       chunks.push(chunk);
     }
 
-    const assistantChunks = chunks.filter(c => c.type === 'assistant');
+    const assistantChunks = chunks.filter(c => c.type === 'agent_message_chunk');
     expect(assistantChunks).toHaveLength(1);
-    expect(assistantChunks[0].content).toBe('different content');
+    expect(assistantChunks[0].text).toBe('different content');
   });
 
   test('resets per-turn text on turn_start so only final turn is checked', async () => {
@@ -806,10 +1040,10 @@ describe('streaming tail completion', () => {
       chunks.push(chunk);
     }
 
-    const assistantChunks = chunks.filter(c => c.type === 'assistant');
+    const assistantChunks = chunks.filter(c => c.type === 'agent_message_chunk');
     expect(assistantChunks).toHaveLength(2);
-    expect(assistantChunks[0].content).toBe('turn one text');
-    expect(assistantChunks[1].content).toBe('turn two');
+    expect(assistantChunks[0].text).toBe('turn one text');
+    expect(assistantChunks[1].text).toBe('turn two');
   });
 
   test('corrective chunk is added to assistantBuffer when wantsStructured', async () => {
@@ -917,7 +1151,7 @@ describe('assistant chunk coalescing', () => {
     return chunks;
   }
 
-  test('coalesces char-level deltas into a single assistant chunk', async () => {
+  test('coalesces char-level deltas into a single agent_message_chunk', async () => {
     // Regression for #1814: Pi streams token/char deltas. Before the fix each
     // became its own chunk and the DAG executor joined them with "\n\n",
     // yielding "Се\n\nгод\n\nня …". They must arrive as one block-level chunk.
@@ -931,9 +1165,9 @@ describe('assistant chunk coalescing', () => {
       ])
     );
 
-    const assistantChunks = chunks.filter(c => c.type === 'assistant');
+    const assistantChunks = chunks.filter(c => c.type === 'agent_message_chunk');
     expect(assistantChunks).toHaveLength(1);
-    expect(assistantChunks[0].content).toBe(full);
+    expect(assistantChunks[0].text).toBe(full);
     expect(chunks[chunks.length - 1].type).toBe('result');
   });
 
@@ -952,10 +1186,16 @@ describe('assistant chunk coalescing', () => {
     );
 
     const types = chunks.map(c => c.type);
-    expect(types).toEqual(['assistant', 'tool', 'tool_result', 'assistant', 'result']);
-    const assistantChunks = chunks.filter(c => c.type === 'assistant');
-    expect(assistantChunks[0].content).toBe('Let me read the file.');
-    expect(assistantChunks[1].content).toBe('Done.');
+    expect(types).toEqual([
+      'agent_message_chunk',
+      'tool_call',
+      'tool_call_update',
+      'agent_message_chunk',
+      'result',
+    ]);
+    const assistantChunks = chunks.filter(c => c.type === 'agent_message_chunk');
+    expect(assistantChunks[0].text).toBe('Let me read the file.');
+    expect(assistantChunks[1].text).toBe('Done.');
   });
 
   test('flushes each completed text block at text_end', async () => {
@@ -971,10 +1211,10 @@ describe('assistant chunk coalescing', () => {
       ])
     );
 
-    const assistantChunks = chunks.filter(c => c.type === 'assistant');
+    const assistantChunks = chunks.filter(c => c.type === 'agent_message_chunk');
     expect(assistantChunks).toHaveLength(2);
-    expect(assistantChunks[0].content).toBe('block one ');
-    expect(assistantChunks[1].content).toBe('block two');
+    expect(assistantChunks[0].text).toBe('block one ');
+    expect(assistantChunks[1].text).toBe('block two');
   });
 
   test('preserves partial buffered output when the stream errors', async () => {
@@ -992,8 +1232,348 @@ describe('assistant chunk coalescing', () => {
     }
 
     expect(thrown?.message).toBe('stream exploded');
-    const assistantChunks = chunks.filter(c => c.type === 'assistant');
+    const assistantChunks = chunks.filter(c => c.type === 'agent_message_chunk');
     expect(assistantChunks).toHaveLength(1);
-    expect(assistantChunks[0].content).toBe('partial answer before crash');
+    expect(assistantChunks[0].text).toBe('partial answer before crash');
+  });
+
+  function thinkingDelta(delta: string): AgentSessionEvent {
+    return {
+      type: 'message_update',
+      message: { role: 'assistant' },
+      assistantMessageEvent: { type: 'thinking_delta', contentIndex: 0, delta, partial: {} },
+    } as unknown as AgentSessionEvent;
+  }
+
+  test('coalesces thinking deltas into one agent_thought_chunk, apart from the text block', async () => {
+    const chunks = await collect(
+      makeSession([
+        { type: 'turn_start' } as AgentSessionEvent,
+        thinkingDelta('Let me '),
+        thinkingDelta('think.'),
+        textDelta('The '),
+        textDelta('answer.'),
+        agentEnd('The answer.'),
+      ])
+    );
+
+    expect(chunks.filter(c => c.type !== 'result')).toEqual([
+      { type: 'agent_thought_chunk', text: 'Let me think.' },
+      { type: 'agent_message_chunk', text: 'The answer.' },
+    ]);
+  });
+
+  test('an extension notify() reaches the consumer, after the buffered text, while the prompt still blocks', async () => {
+    // Extensions such as plannotator notify the operator of a URL and then block the
+    // turn until the operator acts, so the warning cannot wait for the prompt to end.
+    const uiBridge = createArchonUIBridge();
+    const ui = createArchonUIContext(uiBridge);
+    let unblock: () => void = () => {};
+    const blocked = new Promise<void>(resolve => {
+      unblock = resolve;
+    });
+    let listener: ((event: AgentSessionEvent) => void) | undefined;
+    const session = {
+      sessionId: 'session-notify',
+      subscribe: (fn: (event: AgentSessionEvent) => void) => {
+        listener = fn;
+        return () => {};
+      },
+      prompt: async () => {
+        listener?.({ type: 'turn_start' } as AgentSessionEvent);
+        listener?.(textDelta('Opening the review.'));
+        ui.notify('Open http://host:8080/', 'info');
+        await blocked;
+        listener?.(agentEnd('Opening the review.'));
+      },
+      abort: async () => {},
+      dispose: () => {},
+    } as unknown as AgentSession;
+
+    const chunks: MessageChunk[] = [];
+    for await (const chunk of bridgeSession(session, 'prompt', undefined, undefined, uiBridge)) {
+      chunks.push(chunk);
+      if (chunk.type === 'warning') unblock();
+    }
+
+    expect(chunks.map(c => c.type)).toEqual(['agent_message_chunk', 'warning', 'result']);
+    expect(chunks[1]).toEqual({
+      type: 'warning',
+      code: 'pi.extension_notify',
+      message: 'pi extension info: Open http://host:8080/',
+    });
+  });
+});
+
+// ─── node usage across the agentic loop (#2800) ────────────────────────────
+
+describe('bridgeSession usage covers every model call of the prompt', () => {
+  /** Pi reports usage per assistant message: one message per model call. */
+  function assistant(
+    usage: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number },
+    stopReason: StopReason,
+    responseModel?: string
+  ): Record<string, unknown> {
+    return {
+      role: 'assistant',
+      content: [],
+      stopReason,
+      ...(responseModel ? { responseModel } : {}),
+      usage: {
+        input: usage.input,
+        output: usage.output,
+        cacheRead: usage.cacheRead,
+        cacheWrite: usage.cacheWrite,
+        totalTokens: usage.input + usage.output + usage.cacheRead + usage.cacheWrite,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: usage.cost },
+      },
+    };
+  }
+
+  const toolResult = { role: 'toolResult', toolCallId: 't', content: [] };
+
+  function agentEnd(messages: Record<string, unknown>[]): AgentSessionEvent {
+    return { type: 'agent_end', willRetry: false, messages } as unknown as AgentSessionEvent;
+  }
+
+  function makeSession(events: AgentSessionEvent[]): AgentSession {
+    let listener: ((event: AgentSessionEvent) => void) | undefined;
+    return {
+      sessionId: 'session-usage',
+      subscribe: (fn: (event: AgentSessionEvent) => void) => {
+        listener = fn;
+        return () => {};
+      },
+      prompt: async () => {
+        for (const event of events) listener?.(event);
+      },
+      abort: async () => {},
+      dispose: () => {},
+    } as unknown as AgentSession;
+  }
+
+  /**
+   * A prompt yields exactly one result chunk, the turn's one report of its outcome, so it
+   * carries the whole prompt's usage.
+   */
+  async function lastResult(
+    events: AgentSessionEvent[]
+  ): Promise<Extract<MessageChunk, { type: 'result' }>> {
+    const results: Extract<MessageChunk, { type: 'result' }>[] = [];
+    for await (const chunk of bridgeSession(makeSession(events), 'prompt')) {
+      if (chunk.type === 'result') results.push(chunk);
+    }
+    expect(results).toHaveLength(1);
+    return results[0];
+  }
+
+  test('sums tokens and cost over every turn of a multi-turn loop', async () => {
+    // Shape of a real implement node: tool-use turns, then a short final answer.
+    // Before #2800 the node recorded only the final turn (input 1200, output 40).
+    const result = await lastResult([
+      agentEnd([
+        { role: 'user', content: [] },
+        assistant(
+          { input: 900, output: 700, cacheRead: 0, cacheWrite: 100, cost: 0.01 },
+          'toolUse'
+        ),
+        toolResult,
+        assistant(
+          { input: 150, output: 1500, cacheRead: 850, cacheWrite: 0, cost: 0.02 },
+          'toolUse'
+        ),
+        toolResult,
+        assistant(
+          { input: 200, output: 40, cacheRead: 1000, cacheWrite: 0, cost: 0.004 },
+          'stop',
+          'deepseek-v4'
+        ),
+      ]),
+    ]);
+
+    expect(result.tokens).toEqual({
+      input: 900 + 100 + (150 + 850) + (200 + 1000),
+      output: 700 + 1500 + 40,
+      cacheRead: 850 + 1000,
+      cacheWrite: 100,
+      total: 1700 + 2500 + 1240,
+      cost: expect.closeTo(0.034, 10),
+    });
+    expect(result.cost).toBeCloseTo(0.034, 10);
+    // Outcome fields still describe the final call.
+    expect(result.stopReason).toBe('end_turn');
+    expect(result.resolvedModel).toEqual({ id: 'deepseek-v4' });
+    expect(result.isError).toBeUndefined();
+  });
+
+  test('a prompt that runs the loop again after a recoverable length stop yields one result over both runs', async () => {
+    // Pi compacts and continues after a recoverable `length` stop. `length` is not an
+    // error, so a result per agent_end would end the node on the truncated first run
+    // and drop the continuation. Each run's agent_end carries only its own messages.
+    const result = await lastResult([
+      agentEnd([
+        assistant({ input: 100, output: 10, cacheRead: 0, cacheWrite: 0, cost: 0.1 }, 'toolUse'),
+        toolResult,
+        assistant({ input: 150, output: 4000, cacheRead: 0, cacheWrite: 0, cost: 0.15 }, 'length'),
+      ]),
+      agentEnd([
+        assistant({ input: 300, output: 30, cacheRead: 0, cacheWrite: 0, cost: 0.3 }, 'stop'),
+      ]),
+    ]);
+
+    expect(result.tokens?.input).toBe(550);
+    expect(result.tokens?.output).toBe(4040);
+    expect(result.cost).toBeCloseTo(0.55, 10);
+    expect(result.stopReason).toBe('end_turn');
+  });
+
+  test('a retryable error that Pi retries yields one successful result, counting the failed call', async () => {
+    const result = await lastResult([
+      {
+        type: 'agent_end',
+        willRetry: true,
+        messages: [
+          assistant({ input: 80, output: 5, cacheRead: 0, cacheWrite: 0, cost: 0.01 }, 'error'),
+        ],
+      } as unknown as AgentSessionEvent,
+      {
+        type: 'auto_retry_start',
+        attempt: 1,
+        maxAttempts: 3,
+        delayMs: 0,
+        errorMessage: '529',
+      } as AgentSessionEvent,
+      agentEnd([
+        assistant({ input: 200, output: 20, cacheRead: 0, cacheWrite: 0, cost: 0.02 }, 'stop'),
+      ]),
+    ]);
+
+    expect(result.isError).toBeUndefined();
+    expect(result.stopReason).toBe('end_turn');
+    expect(result.tokens?.input).toBe(280);
+    expect(result.tokens?.output).toBe(25);
+  });
+
+  test('a completed call that reported no usage leaves node usage unreported', async () => {
+    // Providers configured without streamed usage leave every field 0. A completed
+    // model call always consumes input, so all-zero means "not reported"; writing the
+    // other calls' sum would be a silent floor.
+    const result = await lastResult([
+      agentEnd([
+        assistant({ input: 500, output: 50, cacheRead: 0, cacheWrite: 0, cost: 0.05 }, 'toolUse'),
+        toolResult,
+        assistant({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }, 'stop'),
+      ]),
+    ]);
+
+    expect(result).not.toHaveProperty('tokens');
+    expect(result).not.toHaveProperty('cost');
+    expect(result.stopReason).toBe('end_turn');
+  });
+
+  test('a failed call with no usage adds nothing and does not erase the rest', async () => {
+    // A request rejected before streaming (e.g. a 429) reports zero usage and bills nothing.
+    const result = await lastResult([
+      agentEnd([
+        assistant({ input: 500, output: 50, cacheRead: 0, cacheWrite: 0, cost: 0.05 }, 'toolUse'),
+        toolResult,
+        assistant({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }, 'error'),
+      ]),
+    ]);
+
+    expect(result.tokens?.input).toBe(500);
+    expect(result.tokens?.output).toBe(50);
+    expect(result.isError).toBe(true);
+  });
+
+  test('a cache-warming refresh during the prompt counts toward its usage', async () => {
+    // Pi keeps the prompt cache warm during a long tool run by calling the model
+    // itself. The call adds no assistant message; Pi records its usage as a session
+    // entry, announced through entry_appended.
+    const entryAppended = (entry: SessionEntry): AgentSessionEvent => ({
+      type: 'entry_appended',
+      entry,
+    });
+    const base = { parentId: null, timestamp: '2026-09-25T00:00:00.000Z' };
+    const warm: Usage = {
+      input: 5,
+      output: 1,
+      cacheRead: 9000,
+      cacheWrite: 0,
+      totalTokens: 9006,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.003 },
+    };
+    const result = await lastResult([
+      entryAppended({
+        ...base,
+        type: 'usage',
+        id: 'warm',
+        kind: 'cache_warm',
+        provider: 'anthropic',
+        model: 'claude-opus-5-5',
+        usage: warm,
+      }),
+      entryAppended({ ...base, type: 'session_info', id: 'info', name: 'not usage' }),
+      agentEnd([
+        assistant({ input: 500, output: 50, cacheRead: 0, cacheWrite: 0, cost: 0.05 }, 'stop'),
+      ]),
+    ]);
+
+    expect(result.tokens?.input).toBe(500 + 5 + 9000);
+    expect(result.tokens?.output).toBe(51);
+    expect(result.tokens?.cacheRead).toBe(9000);
+    expect(result.cost).toBeCloseTo(0.053, 10);
+  });
+
+  test('compaction summary calls count toward the prompt usage, each once', async () => {
+    // Pi summarizes the context with a model call. Its own auto-compaction announces
+    // the usage on compaction_end; a hook-driven compaction appends an entry instead.
+    const summaryUsage = (input: number, cost: number): Usage => ({
+      input,
+      output: 400,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: input + 400,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: cost },
+    });
+    const result = await lastResult([
+      agentEnd([
+        assistant({ input: 150, output: 4000, cacheRead: 0, cacheWrite: 0, cost: 0.15 }, 'length'),
+      ]),
+      { type: 'compaction_start', reason: 'overflow' } as AgentSessionEvent,
+      {
+        type: 'compaction_end',
+        reason: 'overflow',
+        result: {
+          summary: 's',
+          firstKeptEntryId: 'e1',
+          tokensBefore: 90000,
+          usage: summaryUsage(90000, 0.09),
+        },
+        aborted: false,
+        willRetry: true,
+      } as AgentSessionEvent,
+      {
+        type: 'entry_appended',
+        entry: {
+          type: 'compaction',
+          id: 'hook-compaction',
+          parentId: null,
+          timestamp: '2026-09-25T00:00:00.000Z',
+          summary: 's',
+          firstKeptEntryId: 'e1',
+          tokensBefore: 20000,
+          fromHook: true,
+          usage: summaryUsage(20000, 0.02),
+        },
+      },
+      agentEnd([
+        assistant({ input: 300, output: 30, cacheRead: 0, cacheWrite: 0, cost: 0.3 }, 'stop'),
+      ]),
+    ]);
+
+    expect(result.tokens?.input).toBe(150 + 90000 + 20000 + 300);
+    expect(result.tokens?.output).toBe(4000 + 400 + 400 + 30);
+    expect(result.cost).toBeCloseTo(0.15 + 0.09 + 0.02 + 0.3, 10);
   });
 });

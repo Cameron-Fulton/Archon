@@ -1,5 +1,4 @@
 -- Remote Coding Agent - Combined Schema
--- Version: Combined (final state after migrations 001-020)
 -- Description: Complete database schema (idempotent - safe to run multiple times)
 --
 -- Layout (load-bearing, not cosmetic — see the final section for why):
@@ -8,29 +7,8 @@
 --     COMMENT ON COLUMN — goes in the final "Indexes and column comments"
 --     section, below every ADD COLUMN.
 --
--- 14 Tables (+ the remote_agent_auth_* Better Auth tables, listed inline below):
---   1. remote_agent_codebases
---   1b. remote_agent_codebase_env_vars
---   1c. remote_agent_users
---   1d. remote_agent_user_identities
---   2. remote_agent_conversations
---   3. remote_agent_sessions
---   4. remote_agent_isolation_environments
---   5. remote_agent_workflow_runs
---   6. remote_agent_workflow_events
---   6b. remote_agent_workflow_node_sessions
---   7. remote_agent_messages
---   8. remote_agent_user_github_tokens
---   9. remote_agent_user_provider_keys
---   10. remote_agent_user_ai_prefs
---
--- Dropped tables (via migrations):
---   - remote_agent_command_templates (017)
---
--- Dropped columns (via migrations):
---   - conversations.worktree_path (007)
---   - conversations.isolation_env_id_legacy (007)
---   - conversations.isolation_provider (007)
+-- Table sections below define the schema; additive ALTER sections upgrade older installs.
+-- See the final "Indexes and column comments" section after all column definitions.
 
 -- ============================================================================
 -- Table 1: Codebases
@@ -181,21 +159,25 @@ COMMENT ON TABLE remote_agent_isolation_environments IS
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS remote_agent_workflow_runs (
+  origin JSONB,
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   workflow_name VARCHAR(255) NOT NULL,
   conversation_id UUID REFERENCES remote_agent_conversations(id) ON DELETE CASCADE,
   codebase_id UUID REFERENCES remote_agent_codebases(id) ON DELETE SET NULL,
   current_step_index INTEGER,
   status VARCHAR(20) NOT NULL DEFAULT 'pending',  -- pending, running, completed, failed, cancelled, paused
+  outcome VARCHAR(20) CHECK (outcome IN ('succeeded', 'failed')),
   user_message TEXT NOT NULL,
   metadata JSONB DEFAULT '{}',
   parent_conversation_id UUID REFERENCES remote_agent_conversations(id) ON DELETE SET NULL,
   parent_run_id UUID REFERENCES remote_agent_workflow_runs(id) ON DELETE SET NULL,
+  adopted_from_run_id UUID REFERENCES remote_agent_workflow_runs(id) ON DELETE SET NULL,
   started_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   completed_at TIMESTAMP WITH TIME ZONE,
   last_activity_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   working_path TEXT,
-  output_root TEXT
+  output_root TEXT,
+  checkout_baseline JSONB
 );
 
 COMMENT ON TABLE remote_agent_workflow_runs IS
@@ -218,6 +200,23 @@ CREATE TABLE IF NOT EXISTS remote_agent_workflow_events (
 
 COMMENT ON TABLE remote_agent_workflow_events IS
   'Lean UI-relevant workflow events for observability (step transitions, artifacts, errors)';
+
+-- ============================================================================
+-- Workflow run node sessions (private same-run session lineage)
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS remote_agent_workflow_run_node_sessions (
+  workflow_run_id UUID NOT NULL REFERENCES remote_agent_workflow_runs(id) ON DELETE CASCADE,
+  node_id VARCHAR(255) NOT NULL,
+  provider VARCHAR(50) NOT NULL,
+  provider_session_id TEXT NOT NULL,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  PRIMARY KEY (workflow_run_id, node_id)
+);
+
+COMMENT ON TABLE remote_agent_workflow_run_node_sessions IS
+  'Private provider session handles produced by top-level nodes within one workflow run. Cascades with the owning run and is never exposed through run or event APIs.';
 
 -- ============================================================================
 -- Workflow node sessions (persist_session opt-in across re-runs)
@@ -353,6 +352,29 @@ ALTER TABLE remote_agent_workflow_runs
 ALTER TABLE remote_agent_workflow_runs
   ADD COLUMN IF NOT EXISTS output_root TEXT;
 
+-- Run checkout baseline (#3305): the checkout observation taken once when the run
+-- won its execution claim, before its first node. Write-once; NULL means not
+-- recorded (runs from before the column, or runs that never started). Declared
+-- identically on SQLite (sqlite.ts) as TEXT holding the same JSON.
+ALTER TABLE remote_agent_workflow_runs
+  ADD COLUMN IF NOT EXISTS checkout_baseline JSONB;
+
+-- Between-run continuation (#2747): the terminal run whose estate (worktree/
+-- branch + artifacts-by-reference) this run explicitly adopted. Mirrors
+-- `parent_run_id` exactly — nullable, self-referential, SET NULL — and like it
+-- is written once at run creation, never on resume. Reverse lookup (`adopted_by`)
+-- reads the same column; no second column. Declared identically on SQLite.
+ALTER TABLE remote_agent_workflow_runs
+  ADD COLUMN IF NOT EXISTS adopted_from_run_id UUID
+    REFERENCES remote_agent_workflow_runs(id) ON DELETE SET NULL;
+
+-- Authored workflow verdict (#2618), independent from lifecycle status. Nullable
+-- means undeclared or not yet authored; no default/backfill so historical rows
+-- remain unknown rather than being reinterpreted from current workflow YAML.
+ALTER TABLE remote_agent_workflow_runs
+  ADD COLUMN IF NOT EXISTS outcome VARCHAR(20)
+    CHECK (outcome IN ('succeeded', 'failed'));
+
 -- From PR-C: per-user GitHub user-to-server tokens (device flow), encrypted at rest.
 -- One row per Archon user; cascades on user deletion. github_user_id is the
 -- numeric anchor for the commit no-reply email (survives username changes).
@@ -440,8 +462,8 @@ ALTER TABLE remote_agent_user_ai_prefs
 -- Web auth (opt-in): role on the canonical user + Better Auth tables
 -- ============================================================================
 --
--- `role` is the durable identity seam: everyone defaults to 'admin' for now;
--- 'member' is reserved for future per-resource scoping. Visibility stays open.
+-- Keep 'admin' for older writers and existing rows. New writers explicitly
+-- insert 'member'; SQLite cannot change a column default without a table rebuild.
 ALTER TABLE remote_agent_users
   ADD COLUMN IF NOT EXISTS role VARCHAR(16) NOT NULL DEFAULT 'admin';
 
@@ -468,6 +490,62 @@ CREATE SEQUENCE IF NOT EXISTS remote_agent_workflow_events_event_order_seq
 ALTER TABLE remote_agent_workflow_events
   ALTER COLUMN event_order SET DEFAULT nextval('remote_agent_workflow_events_event_order_seq');
 
+-- Both dialects retain the committed head after event deletion. PostgreSQL
+-- draws final positions from its sequence, beyond values reserved by defaults;
+-- SQLite allocates from this row under its single writer.
+CREATE TABLE IF NOT EXISTS remote_agent_workflow_event_sequence (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  value BIGINT NOT NULL DEFAULT 0
+);
+INSERT INTO remote_agent_workflow_event_sequence (id, value)
+  SELECT 1, COALESCE(MAX(event_order), 0) FROM remote_agent_workflow_events
+  ON CONFLICT (id) DO UPDATE
+    SET value = GREATEST(remote_agent_workflow_event_sequence.value, EXCLUDED.value);
+
+-- Retain removed payloads independently of current-state recovery and run cleanup.
+-- Derive the row shape from its owner; no foreign key may cascade into the feed.
+CREATE TABLE IF NOT EXISTS remote_agent_workflow_event_archive AS
+  SELECT * FROM remote_agent_workflow_events WHERE false;
+CREATE OR REPLACE FUNCTION archon_archive_workflow_event() RETURNS trigger AS $$
+BEGIN
+  INSERT INTO remote_agent_workflow_event_archive SELECT (OLD).*;
+  RETURN OLD;
+END;
+$$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS archon_workflow_event_archive ON remote_agent_workflow_events;
+CREATE TRIGGER archon_workflow_event_archive
+  BEFORE DELETE ON remote_agent_workflow_events
+  FOR EACH ROW EXECUTE FUNCTION archon_archive_workflow_event();
+
+-- Deferred on purpose: the global ordering lock is taken only after the writer
+-- has acquired its other locks, avoiding deadlocks with other event writers.
+-- Allocation and the high-water update commit atomically with the event rows.
+CREATE OR REPLACE FUNCTION archon_assign_workflow_event_order() RETURNS trigger AS $$
+DECLARE
+  assigned_order BIGINT;
+BEGIN
+  -- 3334 is arbitrary; it only has to differ from the schema lock (1796).
+  PERFORM pg_advisory_xact_lock(3334);
+  UPDATE remote_agent_workflow_event_sequence
+    SET value = nextval('remote_agent_workflow_events_event_order_seq')
+    WHERE id = 1 RETURNING value INTO assigned_order;
+  UPDATE remote_agent_workflow_events
+     SET event_order = assigned_order
+   WHERE id = NEW.id;
+  IF NOT FOUND THEN
+    UPDATE remote_agent_workflow_event_archive
+       SET event_order = assigned_order
+     WHERE event_order = NEW.event_order AND id = NEW.id;
+  END IF;
+  RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS archon_workflow_event_order ON remote_agent_workflow_events;
+CREATE CONSTRAINT TRIGGER archon_workflow_event_order
+  AFTER INSERT ON remote_agent_workflow_events
+  DEFERRABLE INITIALLY DEFERRED
+  FOR EACH ROW EXECUTE FUNCTION archon_assign_workflow_event_order();
+
 -- ============================================================================
 -- Schema vintage (#2316)
 -- ============================================================================
@@ -485,6 +563,101 @@ CREATE TABLE IF NOT EXISTS remote_agent_schema_version (
   created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
   applied_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
 );
+
+CREATE TABLE IF NOT EXISTS remote_agent_state_revisions (
+  project_key TEXT NOT NULL,
+  name TEXT NOT NULL,
+  revision INTEGER NOT NULL CHECK (revision >= 1),
+  value TEXT,
+  operation TEXT NOT NULL,
+  writer_kind TEXT NOT NULL CHECK (writer_kind IN ('run', 'operator')),
+  writer_run_id TEXT,
+  writer_node_path TEXT,
+  writer_identity TEXT,
+  writer_via TEXT,
+  created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (project_key, name, revision)
+);
+
+CREATE TABLE IF NOT EXISTS remote_agent_start_receipts (
+  id UUID PRIMARY KEY,
+  source_instance_id TEXT NOT NULL,
+  delivery_id TEXT,
+  content_digest TEXT NOT NULL,
+  received_at TIMESTAMP WITH TIME ZONE NOT NULL,
+  occurred_at TIMESTAMP WITH TIME ZONE,
+  source_actor TEXT,
+  outcome VARCHAR(20) NOT NULL CHECK (outcome IN ('matched', 'unmatched', 'unsupported', 'malformed')),
+  reason TEXT,
+  created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+  UNIQUE(source_instance_id, delivery_id)
+);
+
+CREATE TABLE IF NOT EXISTS remote_agent_start_receipt_bindings (
+  receipt_id UUID NOT NULL REFERENCES remote_agent_start_receipts(id) ON DELETE CASCADE,
+  binding_id TEXT NOT NULL,
+  binding_revision TEXT,
+  host_id TEXT,
+  intent TEXT,
+  event_input_names TEXT,
+  preparation_status VARCHAR(20) NOT NULL CHECK (preparation_status IN ('pending', 'preparing', 'failed', 'rejected', 'unmatched', 'complete')),
+  preparation_owner TEXT,
+  preparation_error TEXT,
+  created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (receipt_id, binding_id)
+);
+
+CREATE TABLE IF NOT EXISTS remote_agent_resource_slots (
+  resource_key TEXT PRIMARY KEY,
+  capacity INTEGER NOT NULL DEFAULT 1 CHECK (capacity >= 1),
+  updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS remote_agent_resource_slot_holders (
+  resource_key TEXT NOT NULL REFERENCES remote_agent_resource_slots(resource_key),
+  holder_kind VARCHAR(10) NOT NULL CHECK (holder_kind IN ('run', 'attempt')),
+  holder_id TEXT NOT NULL,
+  acquired_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+  -- The owner process of an 'attempt' holder; NULL for 'run' holders.
+  owner_host TEXT,
+  owner_pid INTEGER,
+  owner_instance TEXT,
+  PRIMARY KEY (resource_key, holder_kind, holder_id)
+);
+
+CREATE TABLE IF NOT EXISTS remote_agent_resource_start_requests (
+  id UUID PRIMARY KEY,
+  queue_position BIGSERIAL NOT NULL UNIQUE,
+  resource_key TEXT NOT NULL REFERENCES remote_agent_resource_slots(resource_key),
+  host_id TEXT NOT NULL,
+  overlap_policy VARCHAR(10) NOT NULL CHECK (overlap_policy IN ('skip', 'queue')),
+  status VARCHAR(12) NOT NULL CHECK (status IN ('queued', 'admitted', 'skipped', 'withdrawn')),
+  blocker_run_id UUID,
+  blocker_kind VARCHAR(10) CHECK (blocker_kind IN ('run', 'request')),
+  launch TEXT NOT NULL,
+  receipt_id UUID,
+  binding_id TEXT,
+  created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+  admitted_at TIMESTAMP WITH TIME ZONE,
+  FOREIGN KEY (receipt_id, binding_id) REFERENCES remote_agent_start_receipt_bindings(receipt_id, binding_id) ON DELETE SET NULL
+);
+
+-- Provider-attempt holders on the shared resource slot (#2816): owner process
+-- columns, and the holder-kind CHECK widened from ('run'). Unreleased dev databases
+-- created the narrow CHECK; re-adding the named constraint converges them. Every
+-- existing row is a 'run' holder, so the new constraint always validates.
+ALTER TABLE remote_agent_resource_slot_holders
+  ADD COLUMN IF NOT EXISTS owner_host TEXT;
+ALTER TABLE remote_agent_resource_slot_holders
+  ADD COLUMN IF NOT EXISTS owner_pid INTEGER;
+ALTER TABLE remote_agent_resource_slot_holders
+  ADD COLUMN IF NOT EXISTS owner_instance TEXT;
+ALTER TABLE remote_agent_resource_slot_holders
+  DROP CONSTRAINT IF EXISTS remote_agent_resource_slot_holders_holder_kind_check;
+ALTER TABLE remote_agent_resource_slot_holders
+  ADD CONSTRAINT remote_agent_resource_slot_holders_holder_kind_check
+    CHECK (holder_kind IN ('run', 'attempt'));
 
 COMMENT ON TABLE remote_agent_schema_version IS
   'Diagnostic schema vintage: the Archon build that created this database and the one that last applied schema to it.';
@@ -544,6 +717,17 @@ CREATE TABLE IF NOT EXISTS remote_agent_auth_verification (
   "updatedAt" timestamptz DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
 
+-- Optional provenance leaves shipped conversation columns valid for older writers.
+ALTER TABLE remote_agent_workflow_runs ADD COLUMN IF NOT EXISTS origin JSONB;
+
+-- Names of a binding's event-derived inputs, kept beside the intent: older binaries
+-- parse `intent` strictly and would refuse an extra key.
+ALTER TABLE remote_agent_start_receipt_bindings ADD COLUMN IF NOT EXISTS event_input_names TEXT;
+
+-- The surface a state write outside a run came through (cli, api, ...). Nullable:
+-- rows written before it existed came through the CLI.
+ALTER TABLE remote_agent_state_revisions ADD COLUMN IF NOT EXISTS writer_via TEXT;
+
 -- ============================================================================
 -- Indexes and column comments
 -- ============================================================================
@@ -577,6 +761,14 @@ CREATE INDEX IF NOT EXISTS idx_codebase_env_vars_codebase_id
 -- User identities
 CREATE INDEX IF NOT EXISTS idx_user_identities_user_id
   ON remote_agent_user_identities(user_id);
+
+-- Better Auth core models (generated by auth@1.6.30)
+CREATE INDEX IF NOT EXISTS "remote_agent_auth_session_userId_idx"
+  ON remote_agent_auth_session("userId");
+CREATE INDEX IF NOT EXISTS "remote_agent_auth_account_userId_idx"
+  ON remote_agent_auth_account("userId");
+CREATE INDEX IF NOT EXISTS "remote_agent_auth_verification_identifier_idx"
+  ON remote_agent_auth_verification("identifier");
 
 -- Conversations
 CREATE INDEX IF NOT EXISTS idx_remote_agent_conversations_codebase
@@ -628,6 +820,8 @@ COMMENT ON COLUMN remote_agent_isolation_environments.workflow_id IS
   'Identifier for the work (issue number, PR number, thread hash, etc.)';
 
 -- Workflow runs
+COMMENT ON COLUMN remote_agent_workflow_runs.conversation_id IS
+  'Owning conversation. ON DELETE CASCADE erases the run rows on a hard conversation delete, silently dropping the live-run cleanup pin for its isolation environments (#2868); soft delete is the only supported path. A future hard-delete must resolve live runs first.';
 CREATE INDEX IF NOT EXISTS idx_workflow_runs_conversation
   ON remote_agent_workflow_runs(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_workflow_runs_status
@@ -638,18 +832,30 @@ CREATE INDEX IF NOT EXISTS idx_workflow_runs_user_id
   ON remote_agent_workflow_runs(user_id) WHERE user_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_workflow_runs_parent_run
   ON remote_agent_workflow_runs(parent_run_id) WHERE parent_run_id IS NOT NULL;
+-- Open-work inbox (#2747): adopter lookup by adopted run.
+CREATE INDEX IF NOT EXISTS idx_workflow_runs_adopted_from
+  ON remote_agent_workflow_runs(adopted_from_run_id) WHERE adopted_from_run_id IS NOT NULL;
 -- Partial index for efficient staleness queries on running workflows
 CREATE INDEX IF NOT EXISTS idx_workflow_runs_last_activity
   ON remote_agent_workflow_runs(last_activity_at)
   WHERE status = 'running';
+
+CREATE INDEX IF NOT EXISTS idx_state_revisions_created_at ON remote_agent_state_revisions(created_at);
+
+CREATE INDEX IF NOT EXISTS idx_resource_start_queue
+  ON remote_agent_resource_start_requests(resource_key, status, queue_position);
+CREATE INDEX IF NOT EXISTS idx_resource_start_host_queue
+  ON remote_agent_resource_start_requests(host_id, status, resource_key, queue_position);
+CREATE INDEX IF NOT EXISTS idx_start_binding_preparation
+  ON remote_agent_start_receipt_bindings(host_id, preparation_status, created_at);
 
 -- Workflow events
 CREATE INDEX IF NOT EXISTS idx_workflow_events_run_id
   ON remote_agent_workflow_events(workflow_run_id);
 CREATE INDEX IF NOT EXISTS idx_workflow_events_type
   ON remote_agent_workflow_events(event_type);
--- Global created_at index for the dashboard event poller's cross-run tail
--- (WHERE created_at >= $1 ORDER BY created_at ASC).
+-- Global created_at index. No cross-run created_at reader remains; it stays
+-- because shipped schema is additive-only.
 CREATE INDEX IF NOT EXISTS idx_workflow_events_created_at
   ON remote_agent_workflow_events(created_at);
 -- Tie-breaker order within a run; NULL for rows written before event_order
@@ -667,3 +873,41 @@ CREATE INDEX IF NOT EXISTS idx_workflow_node_sessions_workflow
 -- Messages
 CREATE INDEX IF NOT EXISTS idx_messages_conversation_id
   ON remote_agent_messages(conversation_id, created_at ASC);
+
+CREATE TABLE IF NOT EXISTS remote_agent_web_push_subscriptions (
+  id UUID PRIMARY KEY,
+  user_id UUID NOT NULL REFERENCES remote_agent_users(id) ON DELETE CASCADE,
+  endpoint TEXT NOT NULL UNIQUE,
+  p256dh TEXT NOT NULL,
+  auth TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- The global feed pages by commit order independently of run membership.
+CREATE INDEX IF NOT EXISTS idx_workflow_events_order
+  ON remote_agent_workflow_events(event_order);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_event_archive_order
+  ON remote_agent_workflow_event_archive(event_order);
+
+-- The archive trigger copies an event row by position, and CREATE TABLE AS ran
+-- only once. Give the archive every column a later ADD COLUMN gave the events
+-- table, in the same order, so deleting an event never fails on a shape mismatch.
+DO $$
+DECLARE
+  missing record;
+BEGIN
+  FOR missing IN
+    SELECT a.attname, format_type(a.atttypid, a.atttypmod) AS type
+      FROM pg_attribute a
+     WHERE a.attrelid = 'remote_agent_workflow_events'::regclass
+       AND a.attnum > 0 AND NOT a.attisdropped
+       AND NOT EXISTS (
+         SELECT 1 FROM pg_attribute b
+          WHERE b.attrelid = 'remote_agent_workflow_event_archive'::regclass
+            AND b.attname = a.attname AND NOT b.attisdropped)
+     ORDER BY a.attnum
+  LOOP
+    EXECUTE format('ALTER TABLE remote_agent_workflow_event_archive ADD COLUMN %I %s',
+      missing.attname, missing.type);
+  END LOOP;
+END $$;

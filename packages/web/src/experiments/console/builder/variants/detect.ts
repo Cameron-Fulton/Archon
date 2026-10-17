@@ -5,10 +5,22 @@
  * input any presence order resolves identically. For malformed/ambiguous nodes
  * the priority order below is a builder-specific choice so resolution stays
  * deterministic (the engine has no fallback — it rejects nodes whose mode-field
- * count is not exactly one): `loop → approval → cancel → bash → script →
+ * count is not exactly one): `loop → approval → wait → cancel → bash → script →
  * command → prompt`.
  */
-import type { VariantId, WireDagNode } from '../types';
+import type { OpaqueKind, VariantId, WireDagNode } from '../types';
+
+/**
+ * Resolve a valid authored mode the builder has no editor for, or `null`.
+ * Checked before {@link detectVariantOrNull}: such a node carries none of the
+ * eight editable mode fields, so it would otherwise read as "no mode field".
+ */
+export function detectOpaqueKind(node: WireDagNode): OpaqueKind | null {
+  if (node.loop_group !== undefined) return 'loop_group';
+  if (node.workflow !== undefined) return 'workflow';
+  if (node.include !== undefined) return 'include';
+  return null;
+}
 
 /**
  * Resolve the variant of a wire node by mode-field presence, or `null` when no
@@ -19,6 +31,7 @@ import type { VariantId, WireDagNode } from '../types';
 export function detectVariantOrNull(node: WireDagNode): VariantId | null {
   if (node.loop !== undefined) return 'loop';
   if (node.approval !== undefined) return 'approval';
+  if (node.wait !== undefined) return 'wait';
   if (node.cancel !== undefined) return 'cancel';
   if (node.bash !== undefined) return 'bash';
   if (node.script !== undefined) return 'script';

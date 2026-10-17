@@ -1,73 +1,372 @@
 name: Test Suite
 
 on:
+  workflow_dispatch:
+    inputs:
+      pack-tests:
+        description: 'Also run the pack script tests under .archon/scripts/'
+        type: boolean
+        default: false
   push:
     branches: [main, dev]
+  # Draft pull requests skip the suite: their branches are pushed many times while the
+  # work is in progress. Marking one ready for review runs it, and so does every push after.
   pull_request:
     branches: [main, dev]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+env:
+  BUN_VERSION: '1.4.2'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  # Every gated job needs `changes`, so skipping it on a draft skips them too.
+  # `github.event.pull_request` is null on push and dispatch, which therefore always run.
+  changes:
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    outputs:
+      run-tests: ${{ steps.decision.outputs.run-tests }}
+      run-workspace-tests: ${{ steps.decision.outputs.run-workspace-tests }}
+      run-fixtures: ${{ steps.decision.outputs.run-fixtures }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      # The script reads the event from GITHUB_EVENT_NAME and GITHUB_EVENT_PATH. A pull
+      # request is judged on its whole diff. A push skips only when a pull request run
+      # already passed every job on the same tree (proofFromPullRequestRun in the script),
+      # and otherwise runs the suite.
+      # Assign before echoing. A failing command substituted into another command's arguments
+      # does not trip `set -e`, so `echo "run-tests=$(...)"` would report success and write an
+      # empty decision that every downstream `== 'true'` gate reads as "skip".
+      - name: Decide whether tests are needed
+        id: decision
+        env:
+          # A push asks the API whether a pull request run already passed this tree.
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          run_tests=$(bun scripts/should-run-test-suite.ts)
+          echo "run-tests=$run_tests" >> "$GITHUB_OUTPUT"
+          run_workspace_tests=$(bun scripts/should-run-test-suite.ts --workspace-tests)
+          echo "run-workspace-tests=$run_workspace_tests" >> "$GITHUB_OUTPUT"
+          run_fixtures=$(bun scripts/should-run-test-suite.ts --workflow-fixtures)
+          echo "run-fixtures=$run_fixtures" >> "$GITHUB_OUTPUT"
+
+  # Step skipping keeps both fixture jobs successful when their paths did not change.
+  workflow-fixtures:
+    needs: changes
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        if: needs.changes.outputs.run-fixtures == 'true'
+
+      - name: Setup Bun
+        if: needs.changes.outputs.run-fixtures == 'true'
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Setup uv
+        if: needs.changes.outputs.run-fixtures == 'true'
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install dependencies
+        if: needs.changes.outputs.run-fixtures == 'true'
+        run: bun install --frozen-lockfile
+
+      - name: Run workflow fixtures
+        if: needs.changes.outputs.run-fixtures == 'true'
+        run: bun run validate --only workflow-fixtures
+
+      - name: Report fixture selection
+        shell: bash
+        env:
+          RUN_FIXTURES: ${{ needs.changes.outputs.run-fixtures }}
+        run: |
+          case "$RUN_FIXTURES" in
+            true) echo "Workflow fixtures selected." ;;
+            false) echo "Workflow fixtures skipped: the changes job decided they are not needed." ;;
+            *) echo "Invalid fixture decision: $RUN_FIXTURES" >&2; exit 1 ;;
+          esac
+
+  # CI splits `bun run validate` across jobs by check id so the slow checks run side by side
+  # instead of one after another. A check whose result cannot depend on the OS (type-check,
+  # lint, format) runs once, in `static` on Linux; Windows runs only what can differ there.
+  #
+  # The test shards are the `shard` names in `ROOT_TEST_PLAN` (scripts/repo-tests.ts). The
+  # workspace shards run here; the root scripts shard runs in `test-scripts`, and so does the
+  # pack shard, only on a dispatch that sets `pack-tests`. They are two jobs
+  # because each has its own gate, and a job-level `if` cannot read the matrix. A skipped job,
+  # unlike a skipped step, keeps a pull request run from proving its merge, so the dev push
+  # then runs every shard.
   test:
+    needs: changes
+    if: needs.changes.outputs.run-workspace-tests == 'true'
     strategy:
-      # Both legs must always report. With the default fail-fast, an ubuntu
+      # Every leg must always report. With the default fail-fast, an ubuntu
       # failure cancels windows, so a windows-only break stays invisible until
       # the next round — and a cancelled leg blocks a merge once it is a
       # required check.
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
+        # @archon/cli runs on its own runner: with every package on one 4-vCPU Windows
+        # runner the packages step took about 19 minutes, and cli finished last (#4430).
+        shard: [cli, packages]
     runs-on: ${{ matrix.os }}
+    # A hung test otherwise holds the runner for GitHub's 6-hour default while
+    # every other PR queues behind it.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.3.11
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v4
+
+      # No Bun download cache on Windows either. Restoring the ~600MB cache took as long
+      # as a plain install (52s + 10s against 53s, measured side by side on PR #3438), and
+      # it took Actions cache space that the Docker layer cache needs.
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      # No Windows Defender exclusion step here on purpose. It was the named
+      # remaining suspect behind the downloadWebDist stalls (#2924), so one was
+      # added and run on windows-latest — and its own readback disproved the
+      # hypothesis: the runner image already excludes `C:\` and `D:\` at the
+      # drive root, recursively, so nothing under either was being scanned to
+      # begin with. `Add-MpPreference` also cost 5s per run to change nothing.
+      # Evidence: https://github.com/coleam00/Archon/pull/2943
+      # The first `uv run` on a fresh windows-latest VM costs 1.2 to 5.0 s (interpreter
+      # discovery and cache creation), measured on green legs. Paying it inside the first
+      # uv-backed test's own budget made that test a budget-edge case by itself, so it is
+      # paid here instead. Evidence on coleam00/Archon#3294.
+      - name: Warm uv
+        if: runner.os == 'Windows'
+        run: uv run python -c "print('uv warm')"
+
+      - name: Validate (Linux, cli)
+        if: runner.os == 'Linux' && matrix.shard == 'cli'
+        run: bun run validate --only cli-tests
+
+      - name: Validate (Linux, packages)
+        if: runner.os == 'Linux' && matrix.shard == 'packages'
+        run: bun run validate --only package-tests
+
+      # The test checks use the shared 20 s per-test budget in scripts/bun-test-command.ts;
+      # see coleam00/Archon#3294. The temp-disk and git-launcher settings below apply to
+      # every Windows test step, here and in `test-scripts`.
+      #
+      # Temp goes to the runner's local disk (`runner.temp`, D:). C: is the remote-backed
+      # OS disk that Windows background maintenance also reads from: measured on this
+      # runner, an fsync there took 2.5 ms idle and 8-25 ms after the suite against
+      # 0.3 ms on D:, a fresh Archon database 220-870 ms against 30 ms. Tests put every
+      # scratch repository, worktree and database under temp, and children that stalled
+      # on C: were the timeouts. Evidence on the PR that added this.
+      #
+      # `Git\bin\git.exe` on the runner's PATH is a launcher that starts
+      # `mingw64\bin\git.exe` as a second process, so every git call cost two processes
+      # (about 4,700 extra per leg). Putting the real binary first removes the launcher.
+      - name: Validate (Windows, cli)
+        if: runner.os == 'Windows' && matrix.shard == 'cli'
+        env:
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+        run: |
+          $env:PATH = "C:\Program Files\Git\mingw64\bin;$env:PATH"
+          bun run validate --only cli-tests
+
+      - name: Validate (Windows, packages)
+        if: runner.os == 'Windows' && matrix.shard == 'packages'
+        env:
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+        run: |
+          $env:PATH = "C:\Program Files\Git\mingw64\bin;$env:PATH"
+          bun run validate --only package-tests
+
+  # The root scripts shard. Root tests read the packages, so it runs whenever the suite does.
+  test-scripts:
+    needs: changes
+    if: needs.changes.outputs.run-tests == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v4
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      - name: Check bundled defaults
-        run: bun run check:bundled
+      - name: Compile Slack chat conformance fixture
+        if: runner.os == 'Linux'
+        run: bun packages/chat-slack/src/test/build-conformance.ts "$RUNNER_TEMP/archon-chat-slack-conformance"
 
-      - name: Check bundled skill
-        run: bun run check:bundled-skill
+      - name: Run compiled Slack chat conformance
+        if: runner.os == 'Linux'
+        run: bun packages/chat-slack/src/test/conformance-cli.ts "$RUNNER_TEMP/archon-chat-slack-conformance"
 
-      - name: Check bundled schema
-        run: bun run check:bundled-schema
+      - name: Build and smoke-test Slack chat release binary
+        if: runner.os == 'Linux'
+        run: |
+          bun build --compile --no-compile-autoload-dotenv --no-compile-autoload-bunfig packages/chat-slack/src/main.ts --outfile "$RUNNER_TEMP/archon-chat-slack"
+          bun packages/chat-slack/src/test/smoke.ts "$RUNNER_TEMP/archon-chat-slack"
 
-      - name: Check Pi vendor map
-        run: bun run check:pi-vendor-map
+      - name: Warm uv
+        if: runner.os == 'Windows'
+        run: uv run python -c "print('uv warm')"
 
-      - name: Check provider capability matrix
-        run: bun run check:capability-matrix
+      - name: Install Caddy for deployment recipe tests
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p "$RUNNER_TEMP/caddy"
+          curl --fail --location --retry 3 https://github.com/caddyserver/caddy/releases/download/v2.11.7/caddy_2.11.7_linux_amd64.tar.gz -o "$RUNNER_TEMP/caddy.tar.gz"
+          tar -xzf "$RUNNER_TEMP/caddy.tar.gz" -C "$RUNNER_TEMP/caddy" caddy
+          echo "$RUNNER_TEMP/caddy" >> "$GITHUB_PATH"
+          docker compose version
 
-      - name: Type check
-        run: bun run type-check
+      - name: Validate (Linux, scripts)
+        if: runner.os == 'Linux'
+        run: bun run validate --only installer,script-tests
 
-      - name: Lint
-        run: bun run lint --max-warnings 0
+      # The generated-file and import-boundary checks ride the Windows scripts shard as
+      # well as `static` because their scripts normalize Windows path separators, and only
+      # a Windows run proves that; they cost seconds. The installer check is POSIX-only
+      # (validate skips it on Windows). Temp and git settings: see the Windows steps in `test`.
+      - name: Validate (Windows, scripts)
+        if: runner.os == 'Windows'
+        env:
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+        run: |
+          $env:PATH = "C:\Program Files\Git\mingw64\bin;$env:PATH"
+          bun run validate --only cli-import-boundary,package-edges,generated-files,script-tests
 
-      - name: Check formatting
-        run: bun run format:check
+      # The pack shard runs only on a dispatch that sets `pack-tests`. These are steps, not a
+      # job: a job skipped on every pull request would keep that run from proving its merge.
+      - name: Pack script tests (Linux)
+        if: inputs.pack-tests && runner.os == 'Linux'
+        run: bun run validate --only pack-tests
 
-      - name: Run installer tests
-        # POSIX-shell installer only. scripts/install.sh refuses MINGW/MSYS by design
-        # (Windows users are directed to WSL2), and test-install.sh runs the real
-        # installer with only curl mocked — so on windows-latest `uname -s` reports
-        # MINGW64_NT, the installer exits, and `set -euo pipefail` fails the job.
-        if: runner.os != 'Windows'
-        run: bun run test:install
+      - name: Pack script tests (Windows)
+        if: inputs.pack-tests && runner.os == 'Windows'
+        env:
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+        run: |
+          $env:PATH = "C:\Program Files\Git\mingw64\bin;$env:PATH"
+          bun run validate --only pack-tests
 
-      - name: Run tests
-        run: bun run test
+  # Windows fixtures run beside the Windows tests rather than after them: they are the
+  # second-slowest Windows check, and serial they made that leg the critical path.
+  workflow-fixtures-windows:
+    name: workflow-fixtures (windows-latest)
+    needs: changes
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        if: needs.changes.outputs.run-fixtures == 'true'
+
+      - name: Setup Bun
+        if: needs.changes.outputs.run-fixtures == 'true'
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Setup uv
+        if: needs.changes.outputs.run-fixtures == 'true'
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install dependencies
+        if: needs.changes.outputs.run-fixtures == 'true'
+        run: bun install --frozen-lockfile
+
+      - name: Run workflow fixtures
+        if: needs.changes.outputs.run-fixtures == 'true'
+        run: bun run validate --only workflow-fixtures
+
+      - name: Report fixture selection
+        shell: bash
+        env:
+          RUN_FIXTURES: ${{ needs.changes.outputs.run-fixtures }}
+        run: |
+          case "$RUN_FIXTURES" in
+            true) echo "Workflow fixtures selected." ;;
+            false) echo "Workflow fixtures skipped: the changes job decided they are not needed." ;;
+            *) echo "Invalid fixture decision: $RUN_FIXTURES" >&2; exit 1 ;;
+          esac
+
+  file-store-primitives-macos:
+    needs: changes
+    if: needs.changes.outputs.run-tests == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      # The compiled probe never skips under GitHub Actions, so it runs, and must pass, here.
+      - name: Prove file store lifecycle and primitives, including a compiled binary
+        run: bun run --cwd packages/workflows test src/file-store
+      - name: Prove database-free CLI lifecycle
+        run: bun run --cwd packages/cli test src/commands/workflow-file-store.integration.spec.ts
+
+  static:
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Validate
+        run: bun run validate --only cli-import-boundary,package-edges,generated-files,type-check,lint,format
 
   schema-upgrade:
+    needs: changes
+    if: needs.changes.outputs.run-tests == 'true'
     # Nothing else in CI applies migrations/000_combined.sql to a real database,
     # and every test that touches a schema starts from an empty one. That blind
     # spot is exactly how #2508 shipped green and then crash-looped every
@@ -109,7 +408,7 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.3.11
+          bun-version: ${{ env.BUN_VERSION }}
 
       # No `bun install`: the checker shells out to psql and uses only builtins.
       - name: Ensure psql is available
@@ -118,7 +417,106 @@ jobs:
       - name: Upgrade from released schemas
         run: bun run check:schema-upgrades
 
+      - name: Check SQLite vintage fixtures
+        # Regenerates packages/core/src/db/fixtures/sqlite-vintages/ in memory
+        # from release tags and fails on any drift, so new release tags carrying
+        # a new distinct SQLite schema land with their fixture.
+        run: bun run check:sqlite-vintages
+
+  postgres-parity:
+    needs: changes
+    if: needs.changes.outputs.run-tests == 'true'
+    # The unit suite mocks the pg driver, so the Postgres dialect branch of
+    # getLiveRunOwningEnv (cleanup's lock query) only executes here, against a
+    # real server: an untyped parameter compared against text and UUID columns
+    # in one OR parses fine on SQLite and would reach every Postgres install.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      # Each test creates and drops its own scratch database; the 'postgres'
+      # database named in the URL is only used to reach the server. Each file
+      # replaces the connection module, so each runs in its own process.
+      - name: Run Postgres parity test
+        env:
+          ARCHON_TEST_PG_URL: postgres://postgres:postgres@localhost:5432/postgres
+        run: bun test packages/core/src/db/isolation-environments.live-run.postgres.integration.test.ts
+
+      - name: Run Postgres resource-slot test
+        env:
+          ARCHON_TEST_PG_URL: postgres://postgres:postgres@localhost:5432/postgres
+        run: bun test packages/core/src/db/resource-slots.postgres.integration.test.ts
+
+      - name: Run Postgres provider-attempt test
+        env:
+          ARCHON_TEST_PG_URL: postgres://postgres:postgres@localhost:5432/postgres
+        run: bun test packages/core/src/db/provider-attempts.postgres.integration.test.ts
+
+      - name: Run Postgres user identity-link test
+        env:
+          ARCHON_TEST_PG_URL: postgres://postgres:postgres@localhost:5432/postgres
+        run: bun run --cwd packages/core test src/db/users.postgres.integration.test.ts
+
+      - name: Run Postgres workflows test
+        env:
+          ARCHON_TEST_PG_URL: postgres://postgres:postgres@localhost:5432/postgres
+        run: bun test packages/core/src/db/workflows.postgres.integration.test.ts
+
+      - name: Run Postgres provider-event reader test
+        env:
+          ARCHON_TEST_PG_URL: postgres://postgres:postgres@localhost:5432/postgres
+        run: bun test packages/core/src/db/workflow-events.provider-events.postgres.integration.test.ts
+
+      - name: Run Postgres event commit-order test
+        env:
+          ARCHON_TEST_PG_URL: postgres://postgres:postgres@localhost:5432/postgres
+        run: bun test packages/core/src/db/workflow-events.commit-order.postgres.integration.test.ts
+
+      - name: Run Postgres workflow-store conformance
+        env:
+          ARCHON_TEST_PG_URL: postgres://postgres:postgres@localhost:5432/postgres
+        run: bun test packages/core/src/db/workflow-store.conformance.postgres.integration.test.ts
+
+      - name: Run Postgres state-document conformance
+        env:
+          ARCHON_TEST_PG_URL: postgres://postgres:postgres@localhost:5432/postgres
+        run: bun test packages/core/src/db/state-documents.postgres.integration.test.ts
+
+      - name: Run Postgres codebase rename test
+        env:
+          ARCHON_TEST_PG_URL: postgres://postgres:postgres@localhost:5432/postgres
+        run: bun test packages/core/src/db/codebase-rename.postgres.integration.test.ts
+
+      - name: Run Postgres codebase deletion test
+        env:
+          ARCHON_TEST_PG_URL: postgres://postgres:postgres@localhost:5432/postgres
+        run: bun run --cwd packages/core test src/db/codebase-delete.postgres.integration.test.ts
+
   docker-build:
+    needs: changes
+    if: needs.changes.outputs.run-tests == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -126,20 +524,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The image build needs ~14GB more scratch space than a stock runner has
-      # free once the provider SDKs' multi-platform vendor binaries are in
-      # node_modules. Cached-layer builds squeak by; any PR that invalidates an
-      # early Dockerfile layer (apt block, base image) rebuilds everything and
-      # hits "no space left on device". Reclaim the big unused toolchains first.
-      - name: Free runner disk space
+      # A full image rebuild (any change to an early Dockerfile layer) once hit
+      # "no space left on device" on runners with ~20GB free, because the provider
+      # SDKs' multi-platform vendor binaries land in node_modules. Deleting the big
+      # unused toolchains fixes that but costs 45-97s, so it runs only when the
+      # runner is short on space; current ubuntu-latest images have far more free.
+      - name: Free runner disk space if needed
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force
           df -h /
+          free_gb=$(df --output=avail -BG / | tail -1 | tr -dc '0-9')
+          if [ "$free_gb" -lt 40 ]; then
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+            sudo docker image prune --all --force
+            df -h /
+          fi
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      # Only pushes to main and dev write the layer cache; pull requests read it.
+      # The repository's Actions cache is capped at 10GB, and when every PR wrote a
+      # mode=max copy of the image, PR copies evicted dev's layers ("blob ... not
+      # found", then a rebuild) and the export alone took ~3.5 minutes of each run.
       - name: Build Docker image
         uses: docker/build-push-action@v6
         with:
@@ -148,7 +554,7 @@ jobs:
           load: true
           tags: archon-ci:test
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-to: ${{ github.event_name != 'pull_request' && 'type=gha,mode=max' || '' }}
 
       - name: Smoke test — container starts and serves /api/health
         run: |
@@ -163,3 +569,86 @@ jobs:
       - name: Cleanup smoke test container
         if: always()
         run: docker rm -f archon-smoke || true
+
+  serve-binary:
+    needs: changes
+    if: needs.changes.outputs.run-tests == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            target: bun-linux-x64
+            binary: archon-linux-x64
+            server: archon-server-linux-x64
+          - os: windows-latest
+            target: bun-windows-x64
+            binary: archon-windows-x64.exe
+            server: archon-server-windows-x64.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Build web UI
+        run: bun run build:web
+      - name: Build matching server and CLI
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          OUTFILE: dist/${{ matrix.binary }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/serve-web/web"
+          cp -R packages/web/dist/. "$RUNNER_TEMP/serve-web/web/"
+          tar czf archon-web.tar.gz -C "$RUNNER_TEMP/serve-web" web
+          mkdir -p dist
+          bash scripts/build-binaries.sh
+      - name: Smoke-test archon serve
+        shell: bash
+        run: |
+          bun scripts/smoke-serve.ts dist/${{ matrix.binary }} dist/${{ matrix.server }} archon-web.tar.gz
+      - name: Smoke-test provider plugins initialize
+        shell: bash
+        run: |
+          VERSION=$(bun -e 'console.log((await Bun.file("package.json").json()).version)')
+          bun packages/core/src/test/provider-plugin-smoke.ts initialize "$VERSION" dist/archon-provider-*
+
+  test-suite:
+    name: Test Suite
+    needs:
+      [
+        changes,
+        static,
+        test,
+        test-scripts,
+        workflow-fixtures,
+        workflow-fixtures-windows,
+        file-store-primitives-macos,
+        schema-upgrade,
+        postgres-parity,
+        docker-build,
+        serve-binary,
+      ]
+    # On a draft the aggregate is skipped with everything else, so the check reads
+    # "skipped" rather than a green that claims tests passed. A draft cannot merge, and
+    # marking it ready starts a run that judges every job.
+    if: ${{ always() && !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      # The script judges every needed job, including when the decision skips the gated
+      # jobs, and reads which jobs may skip from this file.
+      - name: Report test-suite outcome
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: bun scripts/test-suite-outcome.ts

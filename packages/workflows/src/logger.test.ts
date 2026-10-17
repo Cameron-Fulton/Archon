@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeEach, afterEach, mock } from 'bun:test';
-import { mkdir, rm, readFile, chmod } from 'fs/promises';
+import { describe, it, expect, beforeEach, afterEach, mock, jest } from 'bun:test';
+import { mkdir, rm, readFile, readdir, chmod } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
@@ -25,13 +25,15 @@ mock.module('@archon/paths', () => ({
 import {
   logWorkflowEvent,
   logWorkflowStart,
-  logAssistant,
-  logTool,
-  logValidation,
+  logProviderEvent,
   logWorkflowError,
   logWorkflowComplete,
+  logNodeComplete,
+  createWatchdogResetRecorder,
+  WATCHDOG_RESET_BURST_GAP_MS,
   type WorkflowEvent,
 } from './logger';
+import { providerEventLineSchema } from './schemas/provider-event';
 
 describe('Workflow Logger', () => {
   let testDir: string;
@@ -116,6 +118,87 @@ describe('Workflow Logger', () => {
     });
   });
 
+  describe('createWatchdogResetRecorder', () => {
+    const t0 = Date.parse('2026-08-31T20:31:53.123Z');
+    const iso = (ms: number): string => new Date(ms).toISOString();
+
+    it('records each burst by its ends and keeps every renewal counted', async () => {
+      const recorder = createWatchdogResetRecorder(testDir, 'watchdog-burst', 'review');
+      // 500 thought renewals 5ms apart, then a tool call still inside the burst.
+      for (let i = 0; i < 500; i++) recorder.observe('agent_thought_chunk', t0 + i * 5);
+      recorder.observe('tool_call', t0 + 2_600);
+      // A quiet gap exactly at the threshold starts a new burst of one renewal.
+      const quietEnd = t0 + 2_600 + WATCHDOG_RESET_BURST_GAP_MS;
+      recorder.observe('agent_message_chunk', quietEnd);
+      await recorder.flush();
+
+      const events = await readLogFile('watchdog-burst');
+      expect(
+        events.map(e => ({
+          step: e.step,
+          chunk_type: e.chunk_type,
+          chunk_count: e.chunk_count,
+          ts: e.ts,
+        }))
+      ).toEqual([
+        { step: 'review', chunk_type: 'agent_thought_chunk', chunk_count: 1, ts: iso(t0) },
+        { step: 'review', chunk_type: 'tool_call', chunk_count: 500, ts: iso(t0 + 2_600) },
+        { step: 'review', chunk_type: 'agent_message_chunk', chunk_count: 1, ts: iso(quietEnd) },
+      ]);
+      expect(events.every(e => e.type === 'watchdog_reset' && e.content === undefined)).toBe(true);
+    });
+
+    it('a gap just under the threshold stays inside the burst', async () => {
+      const recorder = createWatchdogResetRecorder(testDir, 'watchdog-under', 'review');
+      recorder.observe('agent_thought_chunk', t0);
+      recorder.observe('agent_thought_chunk', t0 + WATCHDOG_RESET_BURST_GAP_MS - 1);
+      await recorder.flush();
+
+      const events = await readLogFile('watchdog-under');
+      expect(events.map(e => [e.chunk_count, e.ts])).toEqual([
+        [1, iso(t0)],
+        [1, iso(t0 + WATCHDOG_RESET_BURST_GAP_MS - 1)],
+      ]);
+    });
+
+    it('writes the burst end once the stream goes quiet, without waiting for flush', async () => {
+      // A killed process never reaches flush; the quiet gap alone must persist the burst end.
+      // Queued writes settle through file I/O, which fake timers leave alone: poll the file
+      // until it holds `count` records (bounded), then give a stray extra write time to land.
+      const readAfterWrites = async (count: number): Promise<WorkflowEvent[]> => {
+        const path = join(testDir, 'watchdog-quiet.jsonl');
+        for (let i = 0; i < 1_000; i++) {
+          const lines = await readFile(path, 'utf-8').catch(() => '');
+          if (lines.trim().split('\n').filter(Boolean).length >= count) break;
+        }
+        for (let i = 0; i < 20; i++) await readdir(testDir);
+        return readLogFile('watchdog-quiet');
+      };
+      jest.useFakeTimers();
+      try {
+        const recorder = createWatchdogResetRecorder(testDir, 'watchdog-quiet', 'review');
+        recorder.observe('agent_thought_chunk', t0);
+        recorder.observe('agent_thought_chunk', t0 + 5);
+        recorder.observe('tool_call', t0 + 10);
+
+        jest.advanceTimersByTime(WATCHDOG_RESET_BURST_GAP_MS - 1);
+        expect((await readAfterWrites(1)).map(e => e.chunk_count)).toEqual([1]);
+
+        jest.advanceTimersByTime(1);
+        expect((await readAfterWrites(2)).map(e => [e.chunk_type, e.chunk_count, e.ts])).toEqual([
+          ['agent_thought_chunk', 1, iso(t0)],
+          ['tool_call', 2, iso(t0 + 10)],
+        ]);
+
+        // Flush after the timer wrote the burst end adds nothing.
+        await recorder.flush();
+        expect(await readLogFile('watchdog-quiet')).toHaveLength(2);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+  });
+
   describe('logWorkflowStart', () => {
     it('should log workflow start with name and user message', async () => {
       await logWorkflowStart(testDir, 'start-test', 'my-workflow', 'User wants to build feature X');
@@ -128,63 +211,73 @@ describe('Workflow Logger', () => {
     });
   });
 
-  describe('logAssistant', () => {
-    it('should log assistant message content', async () => {
-      await logAssistant(testDir, 'assistant-test', 'Here is my response to your request.');
-
-      const events = await readLogFile('assistant-test');
-      expect(events).toHaveLength(1);
-      expect(events[0].type).toBe('assistant');
-      expect(events[0].content).toBe('Here is my response to your request.');
-    });
-
-    it('should handle multi-line content', async () => {
-      const multiLineContent = `Line 1
-Line 2
-Line 3`;
-      await logAssistant(testDir, 'multiline-test', multiLineContent);
-
-      const events = await readLogFile('multiline-test');
-      expect(events[0].content).toBe(multiLineContent);
-    });
-  });
-
-  describe('logTool', () => {
-    it('should log tool call with name and input', async () => {
-      await logTool(testDir, 'tool-test', 'Read', { file_path: '/src/index.ts' });
-
-      const events = await readLogFile('tool-test');
-      expect(events).toHaveLength(1);
-      expect(events[0].type).toBe('tool');
-      expect(events[0].tool_name).toBe('Read');
-      expect(events[0].tool_input).toEqual({ file_path: '/src/index.ts' });
-    });
-
-    it('should handle complex tool input', async () => {
-      const complexInput = {
-        command: 'npm test',
-        timeout: 30000,
-        env: { NODE_ENV: 'test' },
-      };
-      await logTool(testDir, 'complex-tool-test', 'Bash', complexInput);
-
-      const events = await readLogFile('complex-tool-test');
-      expect(events[0].tool_input).toEqual(complexInput);
-    });
-  });
-
-  describe('logValidation', () => {
-    it('should log validation event with check/result', async () => {
-      await logValidation(testDir, 'validation-test', {
-        check: 'type-check',
-        result: 'fail',
-        error: 'tsc not found',
+  describe('logNodeComplete', () => {
+    it('preserves gross input and reported cache counters', async () => {
+      await logNodeComplete(testDir, 'cache-test', 'step1', 'implement', {
+        tokens: { input: 120, output: 10, cacheRead: 80, cacheWrite: 0 },
       });
 
-      const events = await readLogFile('validation-test');
-      expect(events[0].type).toBe('validation');
-      expect(events[0].check).toBe('type-check');
-      expect(events[0].result).toBe('fail');
+      const events = await readLogFile('cache-test');
+      expect(events[0].tokens).toEqual({
+        input: 120,
+        output: 10,
+        cacheRead: 80,
+        cacheWrite: 0,
+      });
+    });
+
+    it('records the reported cost alongside the tokens', async () => {
+      await logNodeComplete(testDir, 'cost-test', 'step1', 'implement', {
+        durationMs: 1200,
+        tokens: { input: 120, output: 10 },
+        cost_usd: 0.0042,
+      });
+
+      const events = await readLogFile('cost-test');
+      expect(events[0].cost_usd).toBe(0.0042);
+      expect(events[0].duration_ms).toBe(1200);
+      expect(events[0].tokens).toEqual({ input: 120, output: 10 });
+    });
+
+    it('keeps a reported zero cost distinct from an unreported one', async () => {
+      // Codex reports no cost at all (#2334), so the absent key has to mean exactly
+      // that. A provider that reports 0 spent nothing, and must still say so.
+      await logNodeComplete(testDir, 'zero-cost', 'step1', 'implement', { cost_usd: 0 });
+      await logNodeComplete(testDir, 'no-cost', 'step1', 'implement', {
+        tokens: { input: 5, output: 1 },
+      });
+
+      const [zero] = await readLogFile('zero-cost');
+      const [absent] = await readLogFile('no-cost');
+      expect(zero.cost_usd).toBe(0);
+      expect('cost_usd' in absent).toBe(false);
+    });
+  });
+
+  describe('logProviderEvent', () => {
+    it('writes the envelope inside the line frame, parseable as a provider_event line', async () => {
+      const envelope = {
+        attemptId: 'attempt-1',
+        seq: 3,
+        observedAt: '2026-01-01T00:00:00.123Z',
+        event: {
+          type: 'tool_call' as const,
+          toolCallId: 'call-1',
+          name: 'Read',
+          rawInput: { p: 1 },
+        },
+      };
+      await logProviderEvent(testDir, 'provider-event-test', 'loop.build', envelope);
+
+      const events = await readLogFile('provider-event-test');
+      expect(events).toHaveLength(1);
+      expect(providerEventLineSchema.parse(events[0])).toEqual({
+        type: 'provider_event',
+        workflow_id: 'provider-event-test',
+        ts: expect.any(String),
+        step: 'loop.build',
+        ...envelope,
+      });
     });
   });
 
@@ -197,6 +290,25 @@ Line 3`;
       expect(events[0].type).toBe('workflow_error');
       expect(events[0].error).toBe('Step prompt not found: missing-step.md');
     });
+
+    it('records aggregate run usage when supplied', async () => {
+      await logWorkflowError(testDir, 'error-usage', 'Node failed', {
+        cost_usd: 0.08,
+        tokens: { input: 1200, output: 80, cacheRead: 900, cacheWrite: 0 },
+      });
+
+      const [event] = await readLogFile('error-usage');
+      expect(event.cost_usd).toBe(0.08);
+      expect(event.tokens).toEqual({ input: 1200, output: 80, cacheRead: 900, cacheWrite: 0 });
+    });
+
+    it('omits aggregate usage axes when they were not reported', async () => {
+      await logWorkflowError(testDir, 'error-no-usage', 'Node failed');
+
+      const [event] = await readLogFile('error-no-usage');
+      expect('cost_usd' in event).toBe(false);
+      expect('tokens' in event).toBe(false);
+    });
   });
 
   describe('logWorkflowComplete', () => {
@@ -206,6 +318,20 @@ Line 3`;
       const events = await readLogFile('complete-test');
       expect(events).toHaveLength(1);
       expect(events[0].type).toBe('workflow_complete');
+      // A run with no AI usage carries no usage keys at all.
+      expect('cost_usd' in events[0]).toBe(false);
+      expect('tokens' in events[0]).toBe(false);
+    });
+
+    it('records what the whole run spent', async () => {
+      await logWorkflowComplete(testDir, 'complete-usage-test', {
+        cost_usd: 0.19,
+        tokens: { input: 900, output: 120, cacheRead: 400 },
+      });
+
+      const events = await readLogFile('complete-usage-test');
+      expect(events[0].cost_usd).toBe(0.19);
+      expect(events[0].tokens).toEqual({ input: 900, output: 120, cacheRead: 400 });
     });
   });
 
@@ -215,22 +341,25 @@ Line 3`;
 
       // Simulate a complete DAG workflow
       await logWorkflowStart(testDir, runId, 'feature-dev', 'Add dark mode');
-      await logAssistant(testDir, runId, 'I will create a plan for dark mode...');
-      await logTool(testDir, runId, 'Write', { file_path: '/plan.md' });
-      await logAssistant(testDir, runId, 'Implementing dark mode...');
-      await logTool(testDir, runId, 'Edit', { file_path: '/src/theme.ts' });
+      await logProviderEvent(testDir, runId, 'plan', {
+        attemptId: 'attempt-1',
+        seq: 0,
+        observedAt: '2026-01-01T00:00:00.000Z',
+        event: { type: 'agent_message_chunk', text: 'I will create a plan for dark mode...' },
+      });
+      await logProviderEvent(testDir, runId, 'plan', {
+        attemptId: 'attempt-1',
+        seq: 1,
+        observedAt: '2026-01-01T00:00:00.001Z',
+        event: { type: 'tool_call', toolCallId: 'call-1', name: 'Write' },
+      });
       await logWorkflowComplete(testDir, runId);
 
       const events = await readLogFile(runId);
-      expect(events).toHaveLength(6);
-
-      // Verify event types in order
       expect(events.map(e => e.type)).toEqual([
         'workflow_start',
-        'assistant',
-        'tool',
-        'assistant',
-        'tool',
+        'provider_event',
+        'provider_event',
         'workflow_complete',
       ]);
 

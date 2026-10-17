@@ -1,45 +1,20 @@
 /**
- * Tests for `scripts/migrate-state-dir.ts` (#2200).
- *
- * Driven as a SUBPROCESS rather than by importing internals, because the
- * contract that matters here is the CLI one: exit codes, what ends up on disk,
- * and — above all — whether `.initialized` was written. That marker tells the
- * triage workflows' `state-preflight` gate "this state directory is complete";
- * writing it after a partial migration would wave through exactly the reset the
- * gate exists to prevent.
- *
- * `ARCHON_HOME` is redirected to a temp dir, so an unregistered repo resolves to
- * the `_cwd/<basename>` pseudo-project and the destination is predictable
- * without touching a real project.
- *
- * Every test owns its sandbox through `withSandbox` instead of sharing
- * module-level bindings via `beforeEach` (#2306). Those bindings used to be
- * reassigned between tests, so when a test timed out its still-running
- * assertions read the NEXT test's paths and reported a mutation that never
- * happened — on PR #2513 that surfaced as a dry run appearing to move a file.
- * Locals make an orphaned assertion able to describe only its own sandbox, so a
- * timeout reads as a timeout.
- *
- * BUDGET: deliberately left at Bun's 5000 ms default, even though these tests
- * time out on windows-latest at ~5015 ms (#2306). Raising it was considered and
- * rejected: every spawn that got as far as resolving a destination used to create
- * a 704 KB SQLite database — including a `PRAGMA busy_timeout = 5000` carrier, the
- * exact bound that turned out to be #2473's real cause — and that creation is now
- * gone. (The five argument-parsing cases never did: four exit from `parseArgs` at
- * module load, and the nonexistent-`--cwd` one exits from `main()` — all of them
- * before `resolveTarget` is reached.) Whether it was also the cause here is
- * testable only by leaving the alarm armed and seeing whether the timeouts stop.
- * A larger budget would answer the question by silencing it.
- * If it does recur, find the specific colliding bound the way #2473 did; do not
- * reach for the timeout.
+ * The migration uses real files and a scratch SQLite registry. Refusals must move
+ * nothing; successful migrations must leave state at the engine's resolved path.
+ * Each case owns its paths so a timed-out assertion cannot read another case's tree.
  */
-import { describe, test, expect } from 'bun:test';
-import { mkdtemp, mkdir, rm, writeFile, readFile, readdir } from 'fs/promises';
+import { describe, test, expect, beforeAll, afterAll, spyOn } from 'bun:test';
+import { mkdtemp, mkdir, writeFile, readFile, readdir } from 'fs/promises';
+import { removeTempTree } from '@archon/paths/test-utils';
+import { getLogLevel, setLogLevel } from '@archon/paths';
+import { SqliteAdapter } from '@archon/core/db/adapters/sqlite';
+import { main } from './migrate-state-dir';
+import { closeDatabase } from '@archon/core/db/connection';
+import { format } from 'node:util';
 import { tmpdir } from 'os';
 import { join, resolve } from 'path';
 
 const SCRIPT = resolve(import.meta.dir, 'migrate-state-dir.ts');
-const REPO_ROOT = resolve(import.meta.dir, '..');
 
 /** Per-test paths. Immutable, and never shared between tests. */
 interface Sandbox {
@@ -53,12 +28,11 @@ interface Sandbox {
 /**
  * Create a sandbox, run `body`, and always tear down.
  *
- * `maxRetries` covers the Windows case where a just-exited child still holds a
- * handle inside the sandbox: node's `rm` retries on EBUSY, EMFILE, ENFILE,
- * ENOTEMPTY and EPERM, which covers what this hits. On PR #2513 an unretried `rm`
- * threw `EBUSY … archon-migrate-dhOLl3` from teardown and failed the check. A leaked
- * temp directory is not a test failure, so a final failure warns instead of
- * throwing — but it does warn, so a genuine leak stays visible.
+ * Teardown has to survive the Windows case where a just-exited child still holds a
+ * handle inside the sandbox: on PR #2513 an unretried `rm` threw
+ * `EBUSY … archon-migrate-dhOLl3` and failed the check. `removeTempTree` owns that
+ * retry — and owns it explicitly, because passing `maxRetries` to `rm` does nothing
+ * under Bun (#2306). This docblock used to claim that option was the fix.
  */
 async function withSandbox(body: (ctx: Sandbox) => Promise<void>): Promise<void> {
   const root = await mkdtemp(join(tmpdir(), 'archon-migrate-'));
@@ -77,11 +51,7 @@ async function withSandbox(body: (ctx: Sandbox) => Promise<void>): Promise<void>
   try {
     await body(ctx);
   } finally {
-    try {
-      await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
-    } catch (error) {
-      console.warn(`sandbox cleanup failed for ${root}: ${(error as Error).message}`);
-    }
+    await removeTempTree(root);
   }
 }
 
@@ -100,11 +70,43 @@ async function collect(proc: Bun.Subprocess<'ignore', 'pipe', 'pipe'>): Promise<
   return { exitCode, stdout, stderr };
 }
 
+/**
+ * Environment for every child, pinned to this sandbox.
+ *
+ * `DATABASE_URL` is forced EMPTY rather than deleted. A contributor running the
+ * documented Postgres mode would otherwise have it reach the child, which flips
+ * `getDatabaseType()` there: `registryIsKnownEmpty` goes false and `resolveTarget`
+ * reads a Postgres registry, while the C5 fixture writes its row to this sandbox's
+ * SQLite file. The two sides would disagree and both C5 tests would fail looking
+ * like a climbing regression rather than an environment leak.
+ *
+ * Deleting the key does NOT achieve that: a spawned Bun child re-runs automatic
+ * `.env` loading from its own cwd and fills in every key the passed environment
+ * omits, so a repo-root `.env` — exactly how Postgres mode is configured — puts it
+ * straight back. An empty string is a key that is present, which dotenv leaves
+ * alone, and `getDatabaseType()` reads it as falsy. This is the same suppression
+ * `packages/cli/src/cli.test.ts` uses for its own inherited keys.
+ *
+ * The one test that wants the Postgres branch passes a real DSN via `extraEnv`.
+ */
+function childEnv(
+  ctx: Sandbox,
+  extraEnv: Record<string, string> = {}
+): Record<string, string | undefined> {
+  return {
+    ...process.env,
+    ARCHON_HOME: ctx.archonHome,
+    LOG_LEVEL: 'silent',
+    DATABASE_URL: '',
+    ...extraEnv,
+  };
+}
+
 /** Run with raw argv — no implicit `--cwd`, for argument-parsing cases. */
 async function runRaw(ctx: Sandbox, ...args: string[]): Promise<RunResult> {
   return collect(
     Bun.spawn(['bun', 'run', SCRIPT, ...args], {
-      env: { ...process.env, ARCHON_HOME: ctx.archonHome, LOG_LEVEL: 'silent' },
+      env: childEnv(ctx),
       cwd: ctx.repo,
       stdout: 'pipe',
       stderr: 'pipe',
@@ -128,28 +130,48 @@ async function runWithEnv(
   cwd: string,
   ...args: string[]
 ): Promise<RunResult> {
-  return collect(
-    Bun.spawn(['bun', 'run', SCRIPT, '--cwd', cwd, ...args], {
-      env: { ...process.env, ARCHON_HOME: ctx.archonHome, LOG_LEVEL: 'silent', ...extraEnv },
-      stdout: 'pipe',
-      stderr: 'pipe',
-    })
-  );
+  return captureMigration(ctx, extraEnv, ['--cwd', cwd, ...args]);
+}
+
+async function captureMigration(
+  ctx: Sandbox,
+  extraEnv: Record<string, string>,
+  argv: string[]
+): Promise<RunResult> {
+  const saved = { ...process.env };
+  const level = getLogLevel();
+  let stdout = '';
+  let stderr = '';
+  const log = spyOn(console, 'log').mockImplementation((...values: unknown[]) => {
+    stdout += `${format(...values)}\n`;
+  });
+  const error = spyOn(console, 'error').mockImplementation((...values: unknown[]) => {
+    stderr += `${format(...values)}\n`;
+  });
+  Object.assign(process.env, childEnv(ctx, extraEnv));
+  setLogLevel('silent');
+  try {
+    const exitCode = await main(argv);
+    return { exitCode, stdout, stderr };
+  } finally {
+    try {
+      await closeDatabase();
+    } finally {
+      log.mockRestore();
+      error.mockRestore();
+      setLogLevel(level);
+      for (const key of Object.keys(process.env)) {
+        if (!(key in saved)) delete process.env[key];
+      }
+      Object.assign(process.env, saved);
+    }
+  }
 }
 
 async function seedLegacy(ctx: Sandbox, files: Record<string, string>): Promise<void> {
   await mkdir(ctx.legacyDir, { recursive: true });
   for (const [name, content] of Object.entries(files)) {
     await writeFile(join(ctx.legacyDir, name), content);
-  }
-}
-
-async function isMarked(at: string): Promise<boolean> {
-  try {
-    await readFile(join(at, '.initialized'));
-    return true;
-  } catch {
-    return false;
   }
 }
 
@@ -181,25 +203,21 @@ async function databaseFiles(archonHome: string): Promise<string[]> {
 }
 
 describe('migrate-state-dir', () => {
-  test('--apply moves every file, marks the destination, and empties the source', async () =>
+  test('--apply moves every file and empties the source', async () =>
     withSandbox(async ctx => {
       await seedLegacy(ctx, { 'triage-state.json': '{"a":1}', 'pr-state.json': '{"b":2}' });
 
-      const result = await runMigration(ctx, '--apply');
+      const result = await runRaw(ctx, '--cwd', ctx.repo, '--apply');
 
       expect(result.exitCode).toBe(0);
       expect(result.stdout).toContain('Migrated 2 entries');
-      expect(await listOrEmpty(ctx.stateRoot)).toEqual([
-        '.initialized',
-        'pr-state.json',
-        'triage-state.json',
-      ]);
+      expect(await listOrEmpty(ctx.stateRoot)).toEqual(['pr-state.json', 'triage-state.json']);
       expect(await listOrEmpty(ctx.legacyDir)).toEqual([]);
       // Contents survive the copy — not just the filenames.
       expect(await readFile(join(ctx.stateRoot, 'triage-state.json'), 'utf-8')).toBe('{"a":1}');
     }));
 
-  test('dry run is the default and mutates nothing — no move, no marker', async () =>
+  test('dry run is the default and mutates nothing', async () =>
     withSandbox(async ctx => {
       await seedLegacy(ctx, { 'triage-state.json': '{"a":1}' });
 
@@ -209,12 +227,11 @@ describe('migrate-state-dir', () => {
       expect(result.stdout).toContain('would move');
       expect(result.stdout).toContain('Dry run — nothing was moved');
       expect(await listOrEmpty(ctx.legacyDir)).toEqual(['triage-state.json']);
-      expect(await isMarked(ctx.stateRoot)).toBe(false);
       // The destination is not even created by a dry run.
       expect(await listOrEmpty(ctx.stateRoot)).toEqual([]);
     }));
 
-  test('a destination collision exits 2, moves nothing, and does NOT mark', async () =>
+  test('a destination collision exits 2 and moves nothing', async () =>
     withSandbox(async ctx => {
       await seedLegacy(ctx, { 'triage-state.json': '{"new":true}' });
       await mkdir(ctx.stateRoot, { recursive: true });
@@ -225,20 +242,18 @@ describe('migrate-state-dir', () => {
       expect(result.exitCode).toBe(2);
       expect(result.stderr).toContain('Refusing to migrate');
       expect(result.stderr).toContain('Already present in $STATE_DIR');
-      expect(result.stderr).toContain('NOT marked initialized');
       // Neither side was touched.
       expect(await readFile(join(ctx.stateRoot, 'triage-state.json'), 'utf-8')).toBe(
         '{"existing":true}'
       );
       expect(await listOrEmpty(ctx.legacyDir)).toEqual(['triage-state.json']);
-      expect(await isMarked(ctx.stateRoot)).toBe(false);
     }));
 
-  test('a nested directory is a hard failure — nothing moves and nothing is marked', async () =>
+  test('a nested directory is a hard failure and nothing moves', async () =>
     withSandbox(async ctx => {
-      // Regression guard: this used to `continue` past the directory, then write
-      // the marker anyway and report the PRE-SKIP count as migrated — a partial
-      // migration announced as complete.
+      // Regression guard: this used to `continue` past the directory and report
+      // the PRE-SKIP count as migrated — a partial migration announced as
+      // complete.
       await seedLegacy(ctx, { 'triage-state.json': '{"a":1}' });
       await mkdir(join(ctx.legacyDir, 'nested'), { recursive: true });
       await writeFile(join(ctx.legacyDir, 'nested', 'inner.json'), '{}');
@@ -247,26 +262,22 @@ describe('migrate-state-dir', () => {
 
       expect(result.exitCode).toBe(2);
       expect(result.stderr).toContain('Nested directories');
-      expect(result.stderr).toContain('NOT marked initialized');
       expect(result.stdout).not.toContain('Migrated');
       // The sibling file must NOT have been moved — the pre-flight decides the
       // whole migration before touching anything.
       expect(await listOrEmpty(ctx.legacyDir)).toEqual(['nested', 'triage-state.json']);
-      expect(await isMarked(ctx.stateRoot)).toBe(false);
     }));
 
-  test('no legacy directory is a success that still marks the destination', async () =>
+  test('no legacy directory is a success that writes nothing', async () =>
     withSandbox(async ctx => {
       const result = await runMigration(ctx, '--apply');
 
       expect(result.exitCode).toBe(0);
       expect(result.stdout).toContain('no legacy .archon/state/ directory');
-      // Without this, an operator who correctly runs the migration on a project
-      // that has nothing to migrate would be left with an unmarked $STATE_DIR.
-      expect(await isMarked(ctx.stateRoot)).toBe(true);
+      expect(await dirExists(ctx.stateRoot)).toBe(false);
     }));
 
-  test('an empty legacy directory is a success that still marks the destination', async () =>
+  test('an empty legacy directory is a success', async () =>
     withSandbox(async ctx => {
       await mkdir(ctx.legacyDir, { recursive: true });
 
@@ -274,16 +285,6 @@ describe('migrate-state-dir', () => {
 
       expect(result.exitCode).toBe(0);
       expect(result.stdout).toContain('legacy .archon/state/ is empty');
-      expect(await isMarked(ctx.stateRoot)).toBe(true);
-    }));
-
-  test('a no-op dry run reports without marking', async () =>
-    withSandbox(async ctx => {
-      const result = await runMigration(ctx);
-
-      expect(result.exitCode).toBe(0);
-      expect(result.stdout).toContain('re-run with --apply');
-      expect(await isMarked(ctx.stateRoot)).toBe(false);
     }));
 
   // A read-only lookup that CREATES the thing it reads is not read-only. The
@@ -307,8 +308,7 @@ describe('migrate-state-dir', () => {
         // The skip is sound only for SQLite: a remote registry's contents cannot
         // be deduced from the absence of a local file. Without the dialect clause
         // the whole suite still passes while every DATABASE_URL install silently
-        // takes the _cwd fallback — a wrong destination in a script that writes
-        // `.initialized`.
+        // takes the _cwd fallback — a wrong destination for the moved files.
         //
         // The DSN points at a UNIX SOCKET path inside this test's own sandbox, so
         // the lookup fails with ENOENT at the filesystem layer — no TCP, no
@@ -327,12 +327,12 @@ describe('migrate-state-dir', () => {
 
         expect(result.exitCode).toBe(1);
         expect(result.stderr).toContain('Could not read the codebase registry');
-        // It refused rather than guessing: nothing moved, nothing marked.
+        // It refused rather than guessing: nothing moved.
         expect(await listOrEmpty(ctx.legacyDir)).toEqual(['triage-state.json']);
-        expect(await isMarked(ctx.stateRoot)).toBe(false);
+        expect(await dirExists(ctx.stateRoot)).toBe(false);
       }));
 
-    test('--apply creates no database either, and still migrates and marks', async () =>
+    test('--apply creates no database either, and still migrates', async () =>
       withSandbox(async ctx => {
         // Scoping the skip to dry runs would put the cold schema apply straight
         // back on the path every real migration takes.
@@ -342,7 +342,7 @@ describe('migrate-state-dir', () => {
 
         expect(result.exitCode).toBe(0);
         expect(await databaseFiles(ctx.archonHome)).toEqual([]);
-        expect(await listOrEmpty(ctx.stateRoot)).toEqual(['.initialized', 'triage-state.json']);
+        expect(await listOrEmpty(ctx.stateRoot)).toEqual(['triage-state.json']);
       }));
   });
 
@@ -350,7 +350,7 @@ describe('migrate-state-dir', () => {
     // A migration tool that silently operates on the wrong directory is the
     // failure family this script exists to prevent. `--cwd --apply` used to
     // swallow the flag as a path, resolve to <pwd>/--apply, find no legacy
-    // state, and exit 0 having written a junk `.initialized`.
+    // state, and exit 0.
     test('--cwd followed by a flag exits 1 and writes nothing', async () =>
       withSandbox(async ctx => {
         const result = await runRaw(ctx, '--cwd', '--apply');
@@ -363,7 +363,7 @@ describe('migrate-state-dir', () => {
 
     test('--cwd with no value at all exits 1 and writes nothing', async () =>
       withSandbox(async ctx => {
-        const result = await runRaw(ctx, '--cwd');
+        const result = await captureMigration(ctx, {}, ['--cwd']);
 
         expect(result.exitCode).toBe(1);
         expect(result.stderr).toContain('--cwd requires a directory path');
@@ -383,7 +383,13 @@ describe('migrate-state-dir', () => {
 
     test('a repeated --cwd exits 1 rather than silently using the last', async () =>
       withSandbox(async ctx => {
-        const result = await runRaw(ctx, '--cwd', ctx.repo, '--cwd', '/somewhere/else', '--apply');
+        const result = await captureMigration(ctx, {}, [
+          '--cwd',
+          ctx.repo,
+          '--cwd',
+          '/somewhere/else',
+          '--apply',
+        ]);
 
         expect(result.exitCode).toBe(1);
         expect(result.stderr).toContain('--cwd was given more than once');
@@ -393,8 +399,12 @@ describe('migrate-state-dir', () => {
     test('a nonexistent --cwd exits 1 instead of a confident no-op success', async () =>
       withSandbox(async ctx => {
         // Previously this resolved to the _cwd fallback, found no legacy state,
-        // and reported success while marking a directory nobody asked for.
-        const result = await runRaw(ctx, '--cwd', join(ctx.root, 'no-such-dir'), '--apply');
+        // and reported success for a directory nobody asked for.
+        const result = await captureMigration(ctx, {}, [
+          '--cwd',
+          join(ctx.root, 'no-such-dir'),
+          '--apply',
+        ]);
 
         expect(result.exitCode).toBe(1);
         expect(result.stderr).toContain('Directory does not exist');
@@ -406,10 +416,11 @@ describe('migrate-state-dir', () => {
     // `findCodebaseByPathPrefix` matches any SUBDIRECTORY of a registered
     // project, so the destination climbed to the project root while the source
     // stayed at the literal cwd. The script then found no legacy state *under
-    // the subdirectory*, declared "nothing to migrate", and wrote `.initialized`
-    // into the REAL project's state root — disarming `state-preflight` for a
-    // project whose state had never been migrated.
-    const PROJECT_NAME = 'acme/myrepo';
+    // the subdirectory* and declared "nothing to migrate" for a project whose
+    // state had never been migrated.
+    /** One registered project per case, so no two cases share a destination. */
+    const CASE_NAMES = ['climbs', 'ambiguous'] as const;
+    type CaseName = (typeof CASE_NAMES)[number];
 
     interface ProjectSandbox extends Sandbox {
       readonly subdir: string;
@@ -417,82 +428,99 @@ describe('migrate-state-dir', () => {
     }
 
     /**
-     * Registering also CREATES the registry, which is what makes these two tests
-     * the guard that #2306's "skip the lookup when there is no database" cannot
-     * silently disable project resolution: here a database exists, so the lookup
-     * must still run and still climb.
-     *
-     * Registered in a SUBPROCESS: @archon/core's DB connection is a module-level
-     * singleton, so registering in-process would cache a handle to the first
-     * test's temp ARCHON_HOME and fail with SQLITE_IOERR_VNODE once that
-     * directory is torn down.
+     * Root of the ONE registry these cases share. Assigned by `beforeAll`; every
+     * other path is a pure function of it, so nothing is reassigned between tests.
      */
-    async function withProjectSandbox(body: (ctx: ProjectSandbox) => Promise<void>): Promise<void> {
-      return withSandbox(async base => {
-        const ctx: ProjectSandbox = {
-          ...base,
-          subdir: join(base.repo, 'packages', 'foo'),
-          projectStateRoot: join(base.archonHome, 'workspaces', 'acme', 'myrepo', 'state'),
-        };
-        await mkdir(ctx.subdir, { recursive: true });
+    let registryRoot = '';
 
-        const src = [
-          "const db = await import('@archon/core/db/codebases');",
-          'await db.createCodebase({',
-          `  name: ${JSON.stringify(PROJECT_NAME)},`,
-          `  repository_url: ${JSON.stringify(`https://github.com/${PROJECT_NAME}`)},`,
-          `  default_cwd: ${JSON.stringify(ctx.repo)},`,
-          "  default_branch: 'main',",
-          '});',
-        ].join('\n');
-        const proc = Bun.spawn(['bun', '-e', src], {
-          cwd: REPO_ROOT,
-          env: { ...process.env, ARCHON_HOME: ctx.archonHome, LOG_LEVEL: 'silent' },
-          stdout: 'pipe',
-          stderr: 'pipe',
-        });
-        const { exitCode, stderr } = await collect(proc);
-        if (exitCode !== 0) {
-          throw new Error(`registerProject failed (${String(exitCode)}): ${stderr}`);
-        }
-
-        await body(ctx);
-      });
+    /**
+     * Every path a case touches, derived from its name alone.
+     *
+     * The per-case name is the isolation: it is the repository directory, so each
+     * case gets its own `legacyDir`, and it is the registered project name, so
+     * each case gets its own `projectStateRoot` under the shared home. Two cases
+     * therefore never read or write the same file, which keeps the property the
+     * file docblock protects — an assertion still running after its test timed out
+     * can only ever describe its own case.
+     */
+    function sandboxFor(name: CaseName): ProjectSandbox {
+      const archonHome = join(registryRoot, 'home');
+      const repo = join(registryRoot, name);
+      return {
+        root: registryRoot,
+        archonHome,
+        repo,
+        legacyDir: join(repo, '.archon', 'state'),
+        stateRoot: join(archonHome, 'workspaces', '_cwd', name, 'state'),
+        subdir: join(repo, 'packages', 'foo'),
+        projectStateRoot: join(archonHome, 'workspaces', 'acme', name, 'state'),
+      };
     }
 
-    test('migrates the PROJECT root when invoked from a subdirectory', async () =>
-      withProjectSandbox(async ctx => {
-        await seedLegacy(ctx, { 'triage-state.json': '{"real":"state"}' });
+    // The two cases share a read-only registry, with separate source and destination trees.
+    beforeAll(async () => {
+      registryRoot = await mkdtemp(join(tmpdir(), 'archon-migrate-c5-'));
+      await mkdir(join(registryRoot, 'home'), { recursive: true });
+      for (const name of CASE_NAMES) {
+        await mkdir(sandboxFor(name).subdir, { recursive: true });
+      }
 
-        const result = await runIn(ctx, ctx.subdir, '--apply');
-        expect(result.exitCode).toBe(0);
+      // Opening the adapter announces its schema init at info, which every
+      // subprocess here already suppresses with LOG_LEVEL=silent. Scoped rather
+      // than set once at module load: `setLogLevel` mutates the process-wide
+      // root logger, and `bun test ./scripts/` runs all five files in one
+      // process, so an unrestored level would silently follow the others.
+      const priorLogLevel = getLogLevel();
+      setLogLevel('silent');
+      const registry = new SqliteAdapter(join(registryRoot, 'home', 'archon.db'));
+      try {
+        for (const name of CASE_NAMES) {
+          await registry.query(
+            'INSERT INTO remote_agent_codebases (name, default_cwd) VALUES ($1, $2)',
+            [`acme/${name}`, sandboxFor(name).repo]
+          );
+        }
+      } finally {
+        await registry.close();
+        setLogLevel(priorLogLevel);
+      }
+    });
 
-        // It says out loud that it climbed, rather than silently retargeting.
-        expect(result.stdout).toContain('resolved to the registered project root');
-        // The state actually moved — the old behaviour left it behind.
-        expect(await listOrEmpty(ctx.legacyDir)).toEqual([]);
-        expect(await listOrEmpty(ctx.projectStateRoot)).toEqual([
-          '.initialized',
-          'triage-state.json',
-        ]);
-      }));
+    afterAll(async () => {
+      // Empty only when the hook above failed before mkdtemp returned.
+      if (registryRoot) await removeTempTree(registryRoot);
+    });
 
-    test('refuses when BOTH the subdirectory and the project root hold legacy state', async () =>
-      withProjectSandbox(async ctx => {
-        // Ambiguous: migrating only the project's while marking would leave the
-        // subdirectory's unmigrated behind a satisfied marker — C5 one level down.
-        await seedLegacy(ctx, { 'triage-state.json': '{"project":true}' });
-        await mkdir(join(ctx.subdir, '.archon', 'state'), { recursive: true });
-        await writeFile(join(ctx.subdir, '.archon', 'state', 'other.json'), '{"subdir":true}');
+    test('migrates the PROJECT root when invoked from a subdirectory', async () => {
+      const ctx = sandboxFor('climbs');
+      await seedLegacy(ctx, { 'triage-state.json': '{"real":"state"}' });
 
-        const result = await runIn(ctx, ctx.subdir, '--apply');
+      const result = await runIn(ctx, ctx.subdir, '--apply');
+      expect(result.exitCode).toBe(0);
 
-        expect(result.exitCode).toBe(2);
-        expect(result.stderr).toContain('two candidate sources');
-        // Nothing moved, and critically nothing marked.
-        expect(await listOrEmpty(ctx.legacyDir)).toEqual(['triage-state.json']);
-        expect(await isMarked(ctx.projectStateRoot)).toBe(false);
-      }));
+      // It says out loud that it climbed, rather than silently retargeting.
+      expect(result.stdout).toContain('resolved to the registered project root');
+      // The state actually moved — the old behaviour left it behind.
+      expect(await listOrEmpty(ctx.legacyDir)).toEqual([]);
+      expect(await listOrEmpty(ctx.projectStateRoot)).toEqual(['triage-state.json']);
+    });
+
+    test('refuses when BOTH the subdirectory and the project root hold legacy state', async () => {
+      const ctx = sandboxFor('ambiguous');
+      // Ambiguous: migrating only the project's would report success while
+      // leaving the subdirectory's unmigrated — C5 one level down.
+      await seedLegacy(ctx, { 'triage-state.json': '{"project":true}' });
+      await mkdir(join(ctx.subdir, '.archon', 'state'), { recursive: true });
+      await writeFile(join(ctx.subdir, '.archon', 'state', 'other.json'), '{"subdir":true}');
+
+      const result = await runIn(ctx, ctx.subdir, '--apply');
+
+      expect(result.exitCode).toBe(2);
+      expect(result.stderr).toContain('two candidate sources');
+      // Nothing moved.
+      expect(await listOrEmpty(ctx.legacyDir)).toEqual(['triage-state.json']);
+      expect(await dirExists(ctx.projectStateRoot)).toBe(false);
+    });
   });
 
   test('progress lines are printed only for entries actually moved', async () =>
@@ -521,6 +549,5 @@ describe('migrate-state-dir', () => {
       expect(second.exitCode).toBe(0);
       expect(second.stdout).toContain('legacy .archon/state/ is empty');
       expect(await readFile(join(ctx.stateRoot, 'triage-state.json'), 'utf-8')).toBe('{"a":1}');
-      expect(await isMarked(ctx.stateRoot)).toBe(true);
     }));
 });

@@ -8,17 +8,21 @@
  * `JSON.parse` on read — so SQLite and Postgres behave identically. An empty
  * map is persisted as NULL (never `'{}'`).
  *
- * Validation of tier names / alias names / providers belongs to the callers
- * (routes + CLI) — the store is a dumb per-key merge.
+ * Write validation of alias names and providers belongs to the callers
+ * (routes + CLI). Stored tier and alias shapes are validated again on read so
+ * legacy or corrupt JSON cannot escape as typed preferences.
  */
 import { pool, getDialect } from './connection';
 import { createLogger } from '@archon/paths';
-import type {
-  RawAliasEntry,
-  RawAliasesConfig,
-  RawTiersConfig,
-  TierName,
-} from '@archon/workflows/model-validation';
+import {
+  rawAliasesConfigSchema,
+  rawTiersConfigSchema,
+  type RawAliasEntry,
+  type RawAliasesConfig,
+  type RawTiersConfig,
+  type TierName,
+} from '@archon/workflows/schemas/model-binding';
+import type { ZodType } from 'zod';
 import type { UserAiPrefsRow } from '../schemas/user-ai-prefs-row';
 
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -45,15 +49,33 @@ export interface UserAiPrefs {
 export type UserTiersPatch = Partial<Record<TierName, RawAliasEntry | null>>;
 export type UserAliasesPatch = Record<string, RawAliasEntry | null>;
 
-function parseJsonColumn(userId: string, column: string, raw: string | null): unknown {
+function parseJsonColumn<T>(
+  userId: string,
+  column: string,
+  raw: string | null,
+  schema: ZodType<T>
+): T | undefined {
   if (!raw) return undefined;
+  let parsed: unknown;
   try {
-    return JSON.parse(raw);
+    parsed = JSON.parse(raw);
   } catch (err) {
     // A corrupt column must not break model resolution — log and behave as unset.
     getLog().error({ err: err as Error, userId, column }, 'db.user_ai_prefs_parse_failed');
     return undefined;
   }
+
+  const result = schema.safeParse(parsed);
+  if (!result.success) {
+    const issues = result.error.issues
+      .map(issue => `${issue.path.join('.') || '<root>'}: ${issue.message}`)
+      .join('; ');
+    const err = new Error(`Invalid stored AI preferences in '${column}': ${issues}`);
+    // Treat only the invalid column as unset so valid preferences in the row survive.
+    getLog().error({ err, userId, column }, 'db.user_ai_prefs_validation_failed');
+    return undefined;
+  }
+  return result.data;
 }
 
 /** Fetch a user's AI prefs. Returns `{}` when the user has no row. */
@@ -72,8 +94,8 @@ export async function getUserAiPrefs(userId: string): Promise<UserAiPrefs> {
   }
   const row = result.rows[0];
   if (!row) return {};
-  const tiers = parseJsonColumn(userId, 'tiers', row.tiers) as RawTiersConfig | undefined;
-  const aliases = parseJsonColumn(userId, 'aliases', row.aliases) as RawAliasesConfig | undefined;
+  const tiers = parseJsonColumn(userId, 'tiers', row.tiers, rawTiersConfigSchema);
+  const aliases = parseJsonColumn(userId, 'aliases', row.aliases, rawAliasesConfigSchema);
   return {
     ...(tiers !== undefined ? { tiers } : {}),
     ...(aliases !== undefined ? { aliases } : {}),
@@ -106,20 +128,22 @@ async function upsertPrefsColumn(
 }
 
 /** Serialize a merged map: empty object → NULL (never persist `'{}'`). */
-function toJsonOrNull(map: Record<string, RawAliasEntry>): string | null {
+function toJsonOrNull(map: Partial<Record<string, RawAliasEntry>>): string | null {
   return Object.keys(map).length > 0 ? JSON.stringify(map) : null;
 }
 
 /** Apply a per-key patch (`null` = unset) on top of the stored map. */
-function applyPatch(
-  current: Record<string, RawAliasEntry>,
-  patch: Record<string, RawAliasEntry | null | undefined>
-): Record<string, RawAliasEntry> {
-  const merged: Record<string, RawAliasEntry> = {};
-  for (const [name, entry] of Object.entries(current)) {
-    if (patch[name] !== null) merged[name] = entry;
+function applyPatch<K extends string>(
+  current: Partial<Record<K, RawAliasEntry>>,
+  patch: Partial<Record<K, RawAliasEntry | null>>
+): Partial<Record<K, RawAliasEntry>> {
+  const merged: Partial<Record<K, RawAliasEntry>> = {};
+  for (const name in current) {
+    const entry = current[name];
+    if (entry !== undefined && patch[name] !== null) merged[name] = entry;
   }
-  for (const [name, entry] of Object.entries(patch)) {
+  for (const name in patch) {
+    const entry = patch[name];
     if (entry !== null && entry !== undefined) merged[name] = entry;
   }
   return merged;
@@ -136,7 +160,7 @@ function applyPatch(
  */
 export async function setUserTiers(userId: string, patch: UserTiersPatch): Promise<void> {
   const current = (await getUserAiPrefs(userId)).tiers ?? {};
-  const merged = applyPatch(current as Record<string, RawAliasEntry>, patch);
+  const merged = applyPatch(current, patch);
   await upsertPrefsColumn(userId, 'tiers', toJsonOrNull(merged));
 }
 

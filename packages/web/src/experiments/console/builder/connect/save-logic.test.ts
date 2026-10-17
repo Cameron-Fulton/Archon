@@ -5,7 +5,6 @@ import {
   validationFailureToIssues,
   clientIssue,
   errorToIssues,
-  errorDetail,
   blockingErrors,
   isReadOnlySource,
   saveTargetFor,
@@ -123,18 +122,6 @@ describe('errorToIssues', () => {
   });
 });
 
-describe('errorDetail', () => {
-  test('HttpError → parsed server message', () => {
-    const err = new HttpError(403, '/api/workflows/foo', JSON.stringify({ error: 'denied' }));
-    expect(errorDetail(err)).toBe('denied');
-  });
-
-  test('generic Error → message; non-Error → String()', () => {
-    expect(errorDetail(new Error('boom'))).toBe('boom');
-    expect(errorDetail(42)).toBe('42');
-  });
-});
-
 describe('blockingErrors', () => {
   test('keeps only severity:error', () => {
     const issues: Issue[] = [
@@ -153,8 +140,9 @@ describe('blockingErrors', () => {
 });
 
 describe('isReadOnlySource / saveTargetFor', () => {
-  test('only bundled is read-only', () => {
+  test('only bundled and installed are read-only', () => {
     expect(isReadOnlySource('bundled')).toBe(true);
+    expect(isReadOnlySource('installed')).toBe(true);
     expect(isReadOnlySource('project')).toBe(false);
     expect(isReadOnlySource('global')).toBe(false);
   });
@@ -163,6 +151,21 @@ describe('isReadOnlySource / saveTargetFor', () => {
     expect(saveTargetFor('bundled')).toBe('project');
     expect(saveTargetFor('project')).toBe('project');
     expect(saveTargetFor('global')).toBe('global');
+    expect(saveTargetFor('installed')).toBe('project');
+  });
+
+  // #2578 — the helpers accept `string` precisely so an unrecognised wire value
+  // does not silently become read-only / write-to-global. These tests pin that
+  // observable contract against the regressions noted in the review (a
+  // `source !== 'project' && source !== 'global'` rewrite would make the
+  // editor offer Save-as instead of Save; an inverted `saveTargetFor` would
+  // write the workflow into `~/.archon/workflows/` instead of the project).
+  test('an unrecognised source is editable in place, not read-only (#2578)', () => {
+    expect(isReadOnlySource('something-new')).toBe(false);
+  });
+
+  test('an unrecognised source saves to project scope, the most permissive target (#2578)', () => {
+    expect(saveTargetFor('something-new')).toBe('project');
   });
 });
 

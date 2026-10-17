@@ -1,5 +1,12 @@
 import { DefaultResourceLoader, getAgentDir } from '@earendil-works/pi-coding-agent';
 import type { ProviderConfig } from '@earendil-works/pi-coding-agent';
+import { createLogger } from '@archon/paths';
+
+let cachedLog: ReturnType<typeof createLogger> | undefined;
+function getLog(): ReturnType<typeof createLogger> {
+  if (!cachedLog) cachedLog = createLogger('provider.pi.resource-loader');
+  return cachedLog;
+}
 
 /**
  * In pi-coding-agent <= 0.67.x, DefaultResourceLoader and PackageManager
@@ -14,12 +21,11 @@ import type { ProviderConfig } from '@earendil-works/pi-coding-agent';
  * This matches the exact behavior of the pre-0.71 fallback.
  */
 
-export interface NoopResourceLoaderOptions {
+export interface PiResourceLoaderOptions {
   /**
    * Override Pi's system prompt entirely. When omitted, Pi uses its default.
-   * Forwarded to `DefaultResourceLoader({ systemPrompt })` — the no* flags
-   * below still suppress all discovery of `AGENTS.md` / `CLAUDE.md` context
-   * files that would otherwise augment or replace the prompt.
+   * Forwarded to `DefaultResourceLoader({ systemPrompt })`. Pi still appends
+   * the context files it discovers through its native project and user rules.
    */
   systemPrompt?: string;
 
@@ -61,14 +67,16 @@ export interface NoopResourceLoaderOptions {
 }
 
 /**
- * Build a Pi ResourceLoader. By default performs no filesystem discovery —
- * Archon is the source of truth for skills, prompts, themes, and context
- * files, and Pi should not walk cwd or read `~/.pi/agent/` during server-side
- * workflow execution. When `enableExtensions: true`, the `noExtensions` gate
- * is lifted so Pi discovers and loads tools + hooks from the community
- * ecosystem (see `NoopResourceLoaderOptions.enableExtensions`). Skills and
- * prompts/themes remain suppressed even when extensions are enabled — skills
- * are still driven by Archon's explicit `additionalSkillPaths` plumbing.
+ * Build the ResourceLoader Archon supplies to Pi. Archon owns explicit skill,
+ * prompt-template, and theme delivery, but leaves context-file discovery to
+ * Pi. Pi therefore applies its native defaults, including user and project
+ * `AGENTS.md` / `CLAUDE.md` files, without an Archon-specific toggle.
+ *
+ * When `enableExtensions: true`, the `noExtensions` gate is lifted so Pi
+ * discovers and loads tools + hooks from the community ecosystem (see
+ * `PiResourceLoaderOptions.enableExtensions`). Skills and prompts/themes
+ * remain suppressed even when extensions are enabled — skills are still
+ * driven by Archon's explicit `additionalSkillPaths` plumbing.
  *
  * Implementation note: we delegate to `DefaultResourceLoader` with the
  * relevant `no*` flags set, rather than implementing `ResourceLoader`
@@ -76,9 +84,9 @@ export interface NoopResourceLoaderOptions {
  * requiring a real `ExtensionRuntime`, which we can't meaningfully stub.
  * DefaultResourceLoader honors the flags and returns empty-but-valid results.
  */
-export function createNoopResourceLoader(
+export function createPiResourceLoader(
   cwd: string,
-  options: NoopResourceLoaderOptions = {}
+  options: PiResourceLoaderOptions = {}
 ): DefaultResourceLoader {
   return new DefaultResourceLoader({
     cwd,
@@ -90,7 +98,6 @@ export function createNoopResourceLoader(
     noSkills: true,
     noPromptTemplates: true,
     noThemes: true,
-    noContextFiles: true,
     ...(options.systemPrompt !== undefined ? { systemPrompt: options.systemPrompt } : {}),
     ...(options.additionalSkillPaths && options.additionalSkillPaths.length > 0
       ? { additionalSkillPaths: options.additionalSkillPaths }
@@ -129,6 +136,13 @@ export function createNoopResourceLoader(
  * extensions while the first is still live — re-introducing the very deadlock
  * this cache prevents. Time/idle-based reclamation belongs with isolation
  * cleanup (a future cross-package hook), not a blind cap here.
+ *
+ * A reload that never settles is not evicted either, for the same reason, and an
+ * abort cannot tell a wedged reload from a slow one (issue #3769). A retry waits
+ * on the same reload again: it succeeds once a slow reload settles, and times out
+ * again on a wedged one, which only a fresh process clears. Source and Docker
+ * hosts already run each Pi query in its own process, so a wedge persists only
+ * where Pi runs in-process (release binaries).
  */
 const reloadedExtensionLoaderCache = new Map<string, Promise<ReloadedExtensionLoader>>();
 
@@ -195,11 +209,15 @@ function extensionLoaderCacheKey(
  * Concurrency: the cache stores the in-flight Promise (not the resolved entry)
  * so concurrent same-layer nodes await a single shared `reload()` instead of
  * racing into two. A failed reload is evicted so the next call retries cleanly.
+ * `abortSignal` ends only this caller's wait, never the shared reload.
  */
 export async function getOrCreateReloadedExtensionLoader(
   cwd: string,
-  options: Pick<NoopResourceLoaderOptions, 'systemPrompt' | 'additionalSkillPaths'> = {}
+  options: Pick<PiResourceLoaderOptions, 'systemPrompt' | 'additionalSkillPaths'> = {},
+  abortSignal?: AbortSignal
 ): Promise<ReloadedExtensionLoader> {
+  // An abort before waiting says nothing about the reload, so it leaves the cache alone.
+  if (abortSignal?.aborted) throw new Error('Query aborted');
   const key = extensionLoaderCacheKey(
     cwd,
     options.systemPrompt,
@@ -208,7 +226,7 @@ export async function getOrCreateReloadedExtensionLoader(
   let pending = reloadedExtensionLoaderCache.get(key);
   if (!pending) {
     pending = (async (): Promise<ReloadedExtensionLoader> => {
-      const loader = createNoopResourceLoader(cwd, { ...options, enableExtensions: true });
+      const loader = createPiResourceLoader(cwd, { ...options, enableExtensions: true });
       // reload() loads the extensions into the loader so createAgentSession can
       // build session.extensionRunner. Without it the runner is undefined and the
       // provider's `if (runner)` flag pass-through is skipped — extensionFlags
@@ -241,7 +259,20 @@ export async function getOrCreateReloadedExtensionLoader(
     // Evict on failure so a transient reload error doesn't poison the cache.
     pending.catch(() => reloadedExtensionLoaderCache.delete(key));
   }
-  return pending;
+  if (!abortSignal) return pending;
+  const shared = pending;
+  const waitStartedAt = Date.now();
+  return new Promise((resolve, reject) => {
+    const onAbort = (): void => {
+      getLog().warn(
+        { cwd, waitedMs: Date.now() - waitStartedAt },
+        'pi.extension_reload_wait_aborted'
+      );
+      reject(new Error('Query aborted'));
+    };
+    abortSignal.addEventListener('abort', onAbort, { once: true });
+    shared.then(resolve, reject).finally(() => abortSignal.removeEventListener('abort', onAbort));
+  });
 }
 
 /**

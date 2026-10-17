@@ -1,30 +1,45 @@
+// @archon-test-isolated
+import { setPlatformPolicies } from '../platforms/registry';
 import { describe, test, expect, mock, beforeEach } from 'bun:test';
+import { toBranchName } from '@archon/git';
+import type * as IsolationDb from '../db/isolation-environments';
+import type * as CleanupService from '../services/cleanup-service';
+
+beforeEach(() => setPlatformPolicies([{ id: 'web', workspaceRetention: 'age-based' }]));
 
 // ---------------------------------------------------------------------------
 // Mock modules before importing the module under test
 // ---------------------------------------------------------------------------
 
-const mockWorktreeExists = mock(() => Promise.resolve(true));
-const mockToWorktreePath = mock((p: string) => p);
-mock.module('@archon/git', () => ({
-  worktreeExists: mockWorktreeExists,
-  toWorktreePath: mockToWorktreePath,
-}));
+const mockLstat = mock(() => Promise.resolve());
+mock.module('node:fs/promises', () => ({ lstat: mockLstat }));
 
-const mockListAllActiveWithCodebase = mock(() => Promise.resolve([]));
-const mockListByCodebaseWithAge = mock(() => Promise.resolve([]));
-const mockUpdateStatus = mock(() => Promise.resolve());
+const mockListAllActiveWithCodebase = mock<typeof IsolationDb.listAllActiveWithCodebase>(() =>
+  Promise.resolve([])
+);
+const mockListByCodebaseWithAge = mock<typeof IsolationDb.listByCodebaseWithAge>(() =>
+  Promise.resolve([])
+);
+const mockMarkWorktreeDestroyed = mock<typeof IsolationDb.markWorktreeDestroyed>(() =>
+  Promise.resolve()
+);
 mock.module('../db/isolation-environments', () => ({
   listAllActiveWithCodebase: mockListAllActiveWithCodebase,
   listByCodebaseWithAge: mockListByCodebaseWithAge,
-  updateStatus: mockUpdateStatus,
+  updateStatus: mock(() => Promise.resolve()),
+  markWorktreeDestroyed: mockMarkWorktreeDestroyed,
 }));
 
-const mockCleanupStale = mock(() => Promise.resolve({ removed: 0, errors: [] }));
-const mockCleanupMerged = mock(() => Promise.resolve({ removed: 0, errors: [] }));
+const MERGED_BASE_REF = toBranchName('origin/main');
+const mockCleanupMerged = mock<typeof CleanupService.cleanupMergedWorktrees>(() =>
+  Promise.resolve({ removed: [], skipped: [], releasedFailedRuns: [], baseRef: MERGED_BASE_REF })
+);
+const mockGetLiveRunBlocker = mock<typeof CleanupService.getLiveRunBlocker>(() =>
+  Promise.resolve(null)
+);
 mock.module('../services/cleanup-service', () => ({
-  cleanupStaleWorktrees: mockCleanupStale,
   cleanupMergedWorktrees: mockCleanupMerged,
+  getLiveRunBlocker: mockGetLiveRunBlocker,
 }));
 
 const mockLogger = {
@@ -40,28 +55,39 @@ mock.module('@archon/paths', () => ({
 }));
 
 // Import AFTER mocks
-const { listEnvironments, cleanupStaleEnvironments, cleanupMergedEnvironments } =
-  await import('./isolation-operations');
+const { listEnvironments, cleanupMergedEnvironments } = await import('./isolation-operations');
 
 // ---------------------------------------------------------------------------
 // Fixtures
 // ---------------------------------------------------------------------------
 
-function makeActiveEnv(overrides: Record<string, unknown> = {}) {
+type ActiveEnv = Awaited<ReturnType<typeof IsolationDb.listAllActiveWithCodebase>>[number];
+type EnvWithAge = Awaited<ReturnType<typeof IsolationDb.listByCodebaseWithAge>>[number];
+
+function makeActiveEnv(overrides: Partial<ActiveEnv> = {}): ActiveEnv {
   return {
+    id: 'env-1',
     codebase_id: 'cb-1',
+    workflow_type: 'issue',
+    workflow_id: 'wf-1',
+    provider: 'worktree',
+    working_path: '/worktrees/feat',
+    branch_name: 'feat',
+    status: 'active',
+    created_at: new Date(),
+    created_by_platform: 'web',
+    created_by_user_id: null,
+    metadata: {},
     codebase_repository_url: 'https://github.com/owner/repo',
+    codebase_name: 'test-project',
     codebase_default_cwd: '/repo',
     ...overrides,
   };
 }
 
-function makeEnvWithAge(overrides: Record<string, unknown> = {}) {
+function makeEnvWithAge(overrides: Partial<EnvWithAge> = {}): EnvWithAge {
   return {
-    id: 'env-1',
-    working_path: '/worktrees/feat',
-    branch_name: 'feat',
-    workflow_id: 'wf-1',
+    ...makeActiveEnv(),
     days_since_activity: 1,
     ...overrides,
   };
@@ -75,8 +101,11 @@ describe('listEnvironments', () => {
   beforeEach(() => {
     mockListAllActiveWithCodebase.mockClear();
     mockListByCodebaseWithAge.mockClear();
-    mockWorktreeExists.mockClear();
-    mockUpdateStatus.mockClear();
+    mockLstat.mockReset();
+    mockLstat.mockImplementation(() => Promise.resolve());
+    mockMarkWorktreeDestroyed.mockClear();
+    mockGetLiveRunBlocker.mockClear();
+    mockGetLiveRunBlocker.mockImplementation(() => Promise.resolve(null));
     mockLogger.info.mockClear();
     mockLogger.warn.mockClear();
   });
@@ -92,6 +121,32 @@ describe('listEnvironments', () => {
     expect(mockListByCodebaseWithAge).not.toHaveBeenCalled();
   });
 
+  test('keeps and reports a missing worktree from an uninstalled chat platform', async () => {
+    const env = makeEnvWithAge({ id: 'removed-chat-env', created_by_platform: 'removed-chat' });
+    mockListAllActiveWithCodebase.mockResolvedValueOnce([makeActiveEnv()]);
+    mockListByCodebaseWithAge.mockResolvedValueOnce([env]);
+    mockLstat.mockRejectedValue(Object.assign(new Error('missing'), { code: 'ENOENT' }));
+    const result = await listEnvironments();
+    expect(result.ghostsReconciled).toBe(0);
+    expect(result.codebases[0]?.environments[0]?.cleanupSkipReason).toContain(
+      "platform 'removed-chat' is not registered"
+    );
+    expect(mockMarkWorktreeDestroyed).not.toHaveBeenCalled();
+    expect(mockLstat).not.toHaveBeenCalled();
+  });
+
+  test('keeps containers visible without inspecting their host paths', async () => {
+    const env = makeEnvWithAge({ provider: 'container', working_path: '/missing' });
+    mockListAllActiveWithCodebase.mockResolvedValueOnce([makeActiveEnv({ provider: 'container' })]);
+    mockListByCodebaseWithAge.mockResolvedValueOnce([env]);
+    mockLstat.mockRejectedValueOnce(Object.assign(new Error('missing'), { code: 'ENOENT' }));
+    const result = await listEnvironments();
+    expect(result.ghostsReconciled).toBe(0);
+    expect(result.codebases[0]?.environments).toEqual([env]);
+    expect(mockMarkWorktreeDestroyed).not.toHaveBeenCalled();
+    expect(mockLstat).not.toHaveBeenCalled();
+  });
+
   test('marks missing worktree as destroyed and increments ghostsReconciled', async () => {
     mockListAllActiveWithCodebase.mockResolvedValueOnce([makeActiveEnv()]);
     mockListByCodebaseWithAge
@@ -100,19 +155,51 @@ describe('listEnvironments', () => {
       ])
       // Re-fetch after ghost cleanup returns empty
       .mockResolvedValueOnce([]);
-    mockWorktreeExists.mockResolvedValueOnce(false); // ghost
+    mockLstat.mockRejectedValueOnce(Object.assign(new Error('missing'), { code: 'ENOENT' })); // ghost
 
     const result = await listEnvironments();
 
-    expect(mockUpdateStatus).toHaveBeenCalledWith('env-ghost', 'destroyed');
+    expect(mockMarkWorktreeDestroyed).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'env-ghost' })
+    );
     expect(result.ghostsReconciled).toBe(1);
     expect(result.totalEnvironments).toBe(0); // re-fetch returned empty
+  });
+
+  // listEnvironments() runs ahead of the per-item live-run guard in the `isolation
+  // cleanup` commands, so ghosting a row here would hide it from that guard and
+  // invalidate the owning run's resume handle.
+  test('leaves a missing worktree active when a run can still claim it', async () => {
+    mockListAllActiveWithCodebase.mockResolvedValueOnce([makeActiveEnv()]);
+    const env = makeEnvWithAge({ id: 'env-owned', working_path: '/worktrees/gone' });
+    mockListByCodebaseWithAge.mockResolvedValueOnce([env]);
+    mockLstat.mockRejectedValueOnce(Object.assign(new Error('missing'), { code: 'ENOENT' }));
+    mockGetLiveRunBlocker.mockImplementation(() =>
+      Promise.resolve({
+        reason: 'live_run',
+        display: 'run run-abcd is failed',
+        runId: 'run-abcdef12',
+        runStatus: 'failed',
+      })
+    );
+
+    const result = await listEnvironments();
+
+    expect(mockMarkWorktreeDestroyed).not.toHaveBeenCalled();
+    expect(result.ghostsReconciled).toBe(0);
+    // No re-fetch, and the env stays visible so the operator can act on it.
+    expect(mockListByCodebaseWithAge).toHaveBeenCalledTimes(1);
+    expect(result.totalEnvironments).toBe(1);
+    expect(mockLogger.info).toHaveBeenCalledWith(
+      expect.objectContaining({ envId: 'env-owned', runId: 'run-abcdef12', runStatus: 'failed' }),
+      'isolation.ghost_kept_for_live_run'
+    );
   });
 
   test('does not re-fetch when no ghosts found', async () => {
     mockListAllActiveWithCodebase.mockResolvedValueOnce([makeActiveEnv()]);
     mockListByCodebaseWithAge.mockResolvedValueOnce([makeEnvWithAge()]);
-    mockWorktreeExists.mockResolvedValueOnce(true); // not a ghost
+    mockLstat.mockResolvedValueOnce(undefined); // not a ghost
 
     await listEnvironments();
 
@@ -120,14 +207,14 @@ describe('listEnvironments', () => {
     expect(mockListByCodebaseWithAge).toHaveBeenCalledTimes(1);
   });
 
-  test('handles worktreeExists error in reconcileGhosts without crashing', async () => {
+  test('handles filesystem error in reconcileGhosts without crashing', async () => {
     mockListAllActiveWithCodebase.mockResolvedValueOnce([makeActiveEnv()]);
     mockListByCodebaseWithAge.mockResolvedValue([makeEnvWithAge({ id: 'env-err' })]);
-    mockWorktreeExists.mockRejectedValueOnce(new Error('permission denied'));
+    mockLstat.mockRejectedValueOnce(new Error('permission denied'));
 
     // Should not throw — error is swallowed per the try/catch in reconcileGhosts
     await expect(listEnvironments()).resolves.toBeDefined();
-    expect(mockUpdateStatus).not.toHaveBeenCalled();
+    expect(mockMarkWorktreeDestroyed).not.toHaveBeenCalled();
     expect(mockLogger.warn).toHaveBeenCalledWith(
       expect.objectContaining({ envId: 'env-err' }),
       'isolation.ghost_reconciliation_failed'
@@ -140,7 +227,7 @@ describe('listEnvironments', () => {
     ]);
     const env = makeEnvWithAge({ id: 'env-live' });
     mockListByCodebaseWithAge.mockResolvedValueOnce([env]);
-    mockWorktreeExists.mockResolvedValueOnce(true);
+    mockLstat.mockResolvedValueOnce(undefined);
 
     const result = await listEnvironments();
 
@@ -152,58 +239,45 @@ describe('listEnvironments', () => {
   });
 });
 
-describe('cleanupStaleEnvironments', () => {
-  beforeEach(() => {
-    mockListAllActiveWithCodebase.mockClear();
-    mockWorktreeExists.mockClear();
-    mockCleanupStale.mockClear();
-  });
-
-  test('reconciles ghosts then delegates to cleanupStaleWorktrees', async () => {
-    // listAllActiveWithCodebase returns envs with codebase_id matching 'cb-1'
-    mockListAllActiveWithCodebase.mockResolvedValueOnce([
-      {
-        ...makeActiveEnv({ codebase_id: 'cb-1' }),
-        id: 'env-1',
-        working_path: '/worktrees/feat',
-        branch_name: 'feat',
-        workflow_id: 'wf-1',
-      },
-    ]);
-    mockWorktreeExists.mockResolvedValueOnce(true); // not a ghost
-    mockCleanupStale.mockResolvedValueOnce({ removed: 1, errors: [] });
-
-    const result = await cleanupStaleEnvironments('cb-1', '/main');
-
-    expect(mockCleanupStale).toHaveBeenCalledWith('cb-1', '/main');
-    expect(result.removed).toBe(1);
-  });
-});
-
 describe('cleanupMergedEnvironments', () => {
   beforeEach(() => {
     mockCleanupMerged.mockClear();
   });
 
   test('delegates to cleanupMergedWorktrees', async () => {
-    mockCleanupMerged.mockResolvedValueOnce({ removed: 2, errors: [] });
+    mockCleanupMerged.mockResolvedValueOnce({
+      removed: ['feat-a', 'feat-b'],
+      skipped: [],
+      releasedFailedRuns: [],
+      baseRef: MERGED_BASE_REF,
+    });
 
     const result = await cleanupMergedEnvironments('cb-1', '/main');
 
     expect(mockCleanupMerged).toHaveBeenCalledWith('cb-1', '/main', {});
-    expect(result.removed).toBe(2);
+    expect(result.removed).toEqual(['feat-a', 'feat-b']);
   });
 
-  test('passes through errors from cleanupMergedWorktrees', async () => {
-    mockCleanupMerged.mockResolvedValueOnce({ removed: 0, errors: ['branch-a: git error'] });
+  test('passes through skipped branches from cleanupMergedWorktrees', async () => {
+    mockCleanupMerged.mockResolvedValueOnce({
+      removed: [],
+      skipped: [{ branchName: 'branch-a', reason: 'git error' }],
+      releasedFailedRuns: [],
+      baseRef: MERGED_BASE_REF,
+    });
 
     const result = await cleanupMergedEnvironments('cb-1', '/main');
 
-    expect(result.errors).toEqual(['branch-a: git error']);
+    expect(result.skipped).toEqual([{ branchName: 'branch-a', reason: 'git error' }]);
   });
 
   test('forwards includeClosed option to cleanupMergedWorktrees', async () => {
-    mockCleanupMerged.mockResolvedValueOnce({ removed: 1, errors: [] });
+    mockCleanupMerged.mockResolvedValueOnce({
+      removed: ['feat'],
+      skipped: [],
+      releasedFailedRuns: [],
+      baseRef: MERGED_BASE_REF,
+    });
 
     await cleanupMergedEnvironments('cb-1', '/main', { includeClosed: true });
 

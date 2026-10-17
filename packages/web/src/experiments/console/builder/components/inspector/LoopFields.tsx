@@ -53,13 +53,21 @@ export function LoopFields({
           }}
         />
       )}
+      {/* Optional since #2563 — clearing the box drops the field entirely, so a loop
+          driven only by `until bash` carries no prose signal.
+
+          Both boxes drop a blank value rather than storing it: a leftover space
+          would otherwise survive as `until: " "`, which the engine rejects and which
+          is broken at runtime anyway (a blank signal matches any whitespace-only
+          line, and `bash -c "   "` exits 0). Whitespace INSIDE a value is kept — only
+          an entirely-blank box means "not declared". */}
       <TextField
-        label="Until (completion signal)"
-        value={data.until}
+        label="Until (optional completion signal)"
+        value={data.until ?? ''}
         mono
         placeholder="COMPLETE"
-        onChange={(until): void => {
-          onChange({ ...data, until });
+        onChange={(raw): void => {
+          onChange({ ...data, until: raw.trim().length > 0 ? raw : undefined });
         }}
       />
       <TextField
@@ -68,9 +76,23 @@ export function LoopFields({
         mono
         placeholder="bun run validate"
         onChange={(raw): void => {
-          onChange({ ...data, until_bash: raw.length > 0 ? raw : undefined });
+          onChange({ ...data, until_bash: raw.trim().length > 0 ? raw : undefined });
         }}
       />
+      <TextField
+        label="Until field (boolean in output_format)"
+        value={data.until_field ?? ''}
+        mono
+        placeholder="done"
+        onChange={(raw): void => {
+          onChange({ ...data, until_field: raw.trim().length > 0 ? raw : undefined });
+        }}
+      />
+      <p className="text-[11.5px] text-text-secondary">
+        Until field requires an output_format schema on this node. Author the schema in YAML; the
+        builder does not edit output_format. The field must be declared in properties, listed in
+        required, and have type boolean if a string type is declared.
+      </p>
       <NumberField
         label="Max iterations"
         value={data.max_iterations}

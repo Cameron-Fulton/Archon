@@ -4,7 +4,7 @@
  * Typed registry where each entry is a ProviderRegistration record (factory + metadata).
  * Replaces the hardcoded factory switch from Phase 1.
  *
- * Bootstrap: callers must call registerBuiltinProviders() at process entrypoints
+ * Bootstrap: callers must register their providers at process entrypoints
  * (server startup, CLI init) before any provider lookups.
  */
 import type {
@@ -13,15 +13,15 @@ import type {
   ProviderRegistration,
   ProviderInfo,
 } from './types';
-import { ClaudeProvider } from './claude/provider';
-import { CodexProvider } from './codex/provider';
-import { CLAUDE_CAPABILITIES } from './claude/capabilities';
-import { CODEX_CAPABILITIES } from './codex/capabilities';
-import { registerCopilotProvider } from './community/copilot/registration';
-import { registerOpencodeProvider } from './community/opencode/registration';
-import { registerPiProvider } from './community/pi/registration';
-import { UnknownProviderError } from './errors';
 import { createLogger } from '@archon/paths';
+import {
+  EFFORT_LADDER,
+  assertProviderRegistrationAllowed,
+  type ProviderRegistry,
+  parseProviderRunModel as parseRegisteredRunModel,
+  UnknownProviderError,
+  missingProviderMessage,
+} from '@archon/provider-contract';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -33,14 +33,62 @@ function getLog(): ReturnType<typeof createLogger> {
 /** Backing store for registered providers. */
 const registry = new Map<string, ProviderRegistration>();
 
+const unavailableProviders = new Map<string, string>();
+
+export function markProviderUnavailable(id: string, reason: string): void {
+  unavailableProviders.set(id, reason);
+}
+
+export const providerRegistry: ProviderRegistry = {
+  unavailable: id => unavailableProviders.get(id),
+  get: id => registry.get(id),
+  list: () => [...registry.values()],
+};
+
+/** Deprecated providers whose notice this process already reported. */
+const deprecationNoticed = new Set<string>();
+
+type DeprecationReporter = (provider: string, notice: string) => void;
+
+const logDeprecation: DeprecationReporter = (provider, notice) =>
+  getLog().warn({ provider, notice }, 'provider.deprecated');
+
+let reportDeprecation = logDeprecation;
+
+/**
+ * Replace how a deprecated provider's first use is reported. A host whose user reads a
+ * terminal shows the notice as text; the default logs it.
+ */
+export function setDeprecationReporter(report: DeprecationReporter): void {
+  reportDeprecation = report;
+}
+
 /**
  * Register a provider. Throws on duplicate registration.
  */
 export function registerProvider(entry: ProviderRegistration): void {
-  if (registry.has(entry.id)) {
-    throw new Error(`Provider '${entry.id}' is already registered`);
-  }
-  registry.set(entry.id, entry);
+  assertProviderRegistrationAllowed(entry, registry.values());
+  const registration: ProviderRegistration = {
+    ...entry,
+    factory: () => {
+      const provider = entry.factory();
+      const resolveCredentialModel = provider.resolveCredentialModel?.bind(provider);
+      const diagnose = provider.diagnose?.bind(provider);
+      const listModels = provider.listModels?.bind(provider);
+      const adapter = {
+        checkCredential: provider.checkCredential.bind(provider),
+        sendQuery: provider.sendQuery.bind(provider),
+        getType: provider.getType.bind(provider),
+        getCapabilities: () => registration.capabilities,
+        ...(resolveCredentialModel ? { resolveCredentialModel } : {}),
+        ...(diagnose ? { diagnose } : {}),
+        ...(listModels ? { listModels } : {}),
+      } satisfies IAgentProvider;
+      return adapter satisfies Record<Exclude<keyof IAgentProvider, keyof typeof adapter>, never>;
+    },
+  };
+  registry.set(entry.id, registration);
+  unavailableProviders.delete(entry.id);
   getLog().debug({ provider: entry.id, builtIn: entry.builtIn }, 'provider.registered');
 }
 
@@ -51,9 +99,18 @@ export function registerProvider(entry: ProviderRegistration): void {
 export function getAgentProvider(id: string): IAgentProvider {
   const entry = registry.get(id);
   if (!entry) {
-    throw new UnknownProviderError(id, [...registry.keys()]);
+    throw new UnknownProviderError(
+      id,
+      [...registry.keys()],
+      missingProviderMessage(providerRegistry, id)
+    );
   }
   getLog().debug({ provider: id }, 'provider_selected');
+  // Every node and turn resolves its provider here, so the notice is gated per process.
+  if (entry.deprecationNotice && !deprecationNoticed.has(id)) {
+    deprecationNoticed.add(id);
+    reportDeprecation(id, entry.deprecationNotice);
+  }
   return entry.factory();
 }
 
@@ -64,7 +121,11 @@ export function getAgentProvider(id: string): IAgentProvider {
 export function getRegistration(id: string): ProviderRegistration {
   const entry = registry.get(id);
   if (!entry) {
-    throw new UnknownProviderError(id, [...registry.keys()]);
+    throw new UnknownProviderError(
+      id,
+      [...registry.keys()],
+      missingProviderMessage(providerRegistry, id)
+    );
   }
   return entry;
 }
@@ -75,6 +136,11 @@ export function getRegistration(id: string): ProviderRegistration {
  */
 export function getProviderCapabilities(id: string): ProviderCapabilities {
   return getRegistration(id).capabilities;
+}
+
+/** Validate and normalize a run-owned model through the provider's strict parser. */
+export function parseProviderRunModel(id: string, model: string): string {
+  return parseRegisteredRunModel(getRegistration(id), model);
 }
 
 /**
@@ -93,6 +159,7 @@ export function getProviderInfoList(): ProviderInfo[] {
     displayName,
     capabilities,
     builtIn,
+    ...(capabilities.effortControl ? { effortLevels: EFFORT_LADDER } : {}),
   }));
 }
 
@@ -103,85 +170,10 @@ export function isRegisteredProvider(id: string): boolean {
   return registry.has(id);
 }
 
-/**
- * Register built-in providers (Claude, Codex). Idempotent — skips already-registered IDs.
- * Must be called at process entrypoints (server, CLI) before any provider lookups.
- */
-export function registerBuiltinProviders(): void {
-  const builtins: ProviderRegistration[] = [
-    {
-      id: 'claude',
-      displayName: 'Claude (Anthropic)',
-      factory: () => new ClaudeProvider(),
-      capabilities: CLAUDE_CAPABILITIES,
-      builtIn: true,
-      credentials: {
-        kind: 'static',
-        specs: [
-          {
-            vendor: 'anthropic',
-            displayName: 'Anthropic',
-            kinds: ['api_key', 'subscription'],
-          },
-        ],
-      },
-    },
-    {
-      id: 'codex',
-      displayName: 'Codex (OpenAI)',
-      factory: () => new CodexProvider(),
-      capabilities: CODEX_CAPABILITIES,
-      builtIn: true,
-      credentials: {
-        kind: 'static',
-        specs: [
-          {
-            // Subscription (ChatGPT) login runs Archon's own PKCE flow —
-            // see @archon/core credentials/openai-oauth.ts (#1924).
-            vendor: 'openai',
-            displayName: 'OpenAI',
-            kinds: ['api_key', 'subscription'],
-          },
-        ],
-      },
-    },
-  ];
-
-  for (const entry of builtins) {
-    if (!registry.has(entry.id)) {
-      registry.set(entry.id, entry);
-      getLog().debug({ provider: entry.id }, 'builtin_provider.registered');
-    }
-  }
-}
-
-/**
- * Register all bundled community providers in one call.
- *
- * Process entrypoints (server, CLI, config-loader) call this once after
- * `registerBuiltinProviders()`. Adding a new community provider means:
- *   1. Drop the implementation under `packages/providers/src/community/<id>/`.
- *   2. Export a `register<Name>Provider()` function from it.
- *   3. Import + call it here.
- *
- * That's the entire cross-cutting change outside the provider's own
- * directory. No entrypoint edits, no config-type edits — just add a line
- * to this function. That's the Phase 2 contract (#1195): community
- * providers are a localized addition.
- *
- * Each `register*Provider` is itself idempotent, so calling this
- * aggregator multiple times (e.g. from both CLI and config-loader paths)
- * is safe. Errors during registration are not caught here — a broken
- * community provider should fail loud at bootstrap, not silently
- * disappear.
- */
-export function registerCommunityProviders(): void {
-  registerOpencodeProvider();
-  registerPiProvider();
-  registerCopilotProvider();
-}
-
 /** @internal Test-only — clears the registry. Not for production use. */
 export function clearRegistry(): void {
   registry.clear();
+  unavailableProviders.clear();
+  deprecationNoticed.clear();
+  reportDeprecation = logDeprecation;
 }

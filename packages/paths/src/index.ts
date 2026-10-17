@@ -1,14 +1,19 @@
 // Archon path resolution utilities
 export {
   expandTilde,
+  canonicalizeProjectPath,
   isDocker,
   isWSL,
   getWSLDistroName,
   getArchonHome,
   getArchonWorkspacesPath,
+  isPathInside,
+  isInsideArchonWorkspaces,
   ensureArchonWorkspacesPath,
   getArchonWorktreesPath,
+  getArchonTempPath,
   getArchonConfigPath,
+  getInstallManifestPath,
   getCredentialKeyPath,
   getArchonEnvPath,
   getRepoArchonEnvPath,
@@ -19,11 +24,11 @@ export {
   getCommandFolderSearchPaths,
   getWorkflowFolderSearchPaths,
   getAppArchonBasePath,
-  getDefaultCommandsPath,
-  getDefaultWorkflowsPath,
+  getBundledWorkflowsPath,
   logArchonPaths,
   validateAppDefaultsPaths,
   parseOwnerRepo,
+  toSafeNameSegment,
   resolveRepoProjectIdentity,
   getProjectRoot,
   getProjectSourcePath,
@@ -38,27 +43,54 @@ export {
   getProjectStoragePaths,
   getStoragePathsForRoot,
   isInsideArchonHome,
+  resolveRunStorageRoot,
   getRunArtifactsDirForKey,
   getRunArtifactsDirForRoot,
+  RUN_ARTIFACTS_ENGINE_SUBDIR,
+  isRunArtifactsEngineEntry,
+  getRunLogPathForRoot,
+  getRunWorkflowSourceDirForRoot,
   slugifyFolderName,
   getFolderProjectRoot,
   getFolderProjectArtifactsPath,
   getFolderProjectLogsPath,
   getFolderRunArtifactsPath,
   ensureFolderProjectStructure,
-  resolveProjectRootFromCwd,
   ensureProjectStructure,
   createProjectSourceSymlink,
+  ProjectSourceOccupiedError,
   findMarkdownFilesRecursive,
+  findCommandFiles,
   getWebDistDir,
+  getSourceWebDistDir,
+  getSourceServerEntry,
+  getSourceProviderEntry,
+  getServerDistDir,
+  projectKeyForStorageRoot,
+  projectKeyForCodebase,
 } from './archon-paths';
 export type { ProjectStorageKey, ProjectStoragePaths } from './archon-paths';
 
+// Detached workflow install identity
+export {
+  DETACHED_INSTALL_CONTEXT_KEYS,
+  captureDetachedInstallContext,
+  restoreDetachedInstallContext,
+} from './detached-install-context';
+export type { DetachedInstallContext, DetachedInstallContextKey } from './detached-install-context';
+
 // Env loader
-export { loadArchonEnv, isVerboseBoot } from './env-loader';
+export { loadArchonEnv, isVerboseBoot, getPluginsPath, getArchonEnvNames } from './env-loader';
 
 // Logger
-export { createLogger, setLogLevel, getLogLevel, rootLogger } from './logger';
+export {
+  createLogger,
+  setLogLevel,
+  getLogLevel,
+  setLogDestination,
+  setLogSink,
+  rootLogger,
+} from './logger';
 export type { Logger } from './logger';
 
 // Build-time constants (rewritten by scripts/build-binaries.sh)
@@ -67,12 +99,18 @@ export {
   BUNDLED_VERSION,
   BUNDLED_GIT_COMMIT,
   BUNDLED_WEB_DIST_SHA256,
+  BUNDLED_SERVER_SHA256,
 } from './bundled-build';
+
+// Compiled CLI discovery manifest
+export { refreshCompiledInstallManifest } from './install-manifest';
+export type { InstallManifest } from './install-manifest';
 
 // Update check
 export {
   checkForUpdate,
   getCachedUpdateCheck,
+  takeCachedUpdateNotice,
   isNewerVersion,
   parseLatestRelease,
 } from './update-check';
@@ -90,7 +128,7 @@ export {
   captureChatTurn,
   captureApprovalResolved,
   captureCodebaseRegistered,
-  captureWorkflowCompleted,
+  captureWorkflowTerminal,
   classifyWorkflowForTelemetry,
   TELEMETRY_SCHEMA_VERSION,
   shutdownTelemetry,
@@ -103,7 +141,11 @@ export type {
   ArchonStartedProperties,
   ChatTurnProperties,
   DeploymentShapeProperties,
-  WorkflowCompletedProperties,
+  WorkflowTerminalProperties,
+  WorkflowShapeProperties,
+  WorkflowAncestryProperties,
+  PromptCharsBucket,
+  WorkflowCancelReason,
   WorkflowExitReason,
   WorkflowErrorClass,
   WorkflowNodeType,

@@ -1,3 +1,5 @@
+import type { ApprovalContext } from './schemas/workflow-run';
+import type { NodeExecutionMetadata } from './schemas/node-execution';
 /**
  * WorkflowEventEmitter - typed event emitter for workflow execution observability.
  *
@@ -10,7 +12,8 @@
  * - Conversation-scoped subscriptions via registerRun() mapping
  */
 import { EventEmitter } from 'events';
-import type { ArtifactType } from './schemas';
+import type { ArtifactType, EffortLevel, NodeSkipReason, SkipCause, TierName } from './schemas';
+import type { ProviderEventEnvelope } from './schemas/provider-event';
 import { createLogger } from '@archon/paths';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
@@ -28,7 +31,8 @@ interface WorkflowStartedEvent {
   type: 'workflow_started';
   runId: string;
   workflowName: string;
-  conversationId: string;
+  conversationId: string | null;
+  transcriptPath: string;
 }
 
 interface WorkflowCompletedEvent {
@@ -80,28 +84,39 @@ interface WorkflowArtifactEvent {
 }
 
 interface NodeStartedEvent {
+  execution?: NodeExecutionMetadata;
   type: 'node_started';
   runId: string;
   nodeId: string;
   nodeName: string; // command name or node.id for inline prompts
   provider?: string; // resolved AI provider (absent for bash/script nodes)
   model?: string; // resolved model string (absent for bash/script nodes)
-  tier?: 'small' | 'medium' | 'large'; // only set when node.model was a tier keyword
-  effort?: string; // resolved AI effort (absent when unset or unsupported)
+  tier?: TierName; // only set when node.model was a tier keyword
+  effort?: EffortLevel; // resolved AI effort (absent when unset or unsupported)
+}
+
+interface NodeSuspendedEvent {
+  type: 'node_suspended';
+  runId: string;
+  nodeId: string;
+  nodeName: string;
+  execution: NodeExecutionMetadata;
 }
 
 interface NodeCompletedEvent {
+  execution?: NodeExecutionMetadata;
   type: 'node_completed';
   runId: string;
   nodeId: string;
   nodeName: string;
-  duration: number;
+  duration?: number;
   costUsd?: number;
   stopReason?: string;
   numTurns?: number;
 }
 
 interface NodeFailedEvent {
+  execution?: NodeExecutionMetadata;
   type: 'node_failed';
   runId: string;
   nodeId: string;
@@ -110,37 +125,45 @@ interface NodeFailedEvent {
 }
 
 interface NodeSkippedEvent {
+  execution?: NodeExecutionMetadata;
   type: 'node_skipped';
   runId: string;
   nodeId: string;
   nodeName: string;
-  reason: 'when_condition' | 'when_condition_parse_error' | 'trigger_rule' | 'prior_success';
+  reason: Exclude<NodeSkipReason, 'prior_success'>;
+  cause: SkipCause;
 }
 
-interface ToolStartedEvent {
-  type: 'tool_started';
+/**
+ * A resumed pass declined to re-run a node an earlier pass completed. Mirrors the
+ * persisted `node_skipped_prior_success` event_type so a consumer switching on
+ * `type` cannot fold prior success into a genuine skip.
+ */
+interface NodeSkippedPriorSuccessEvent {
+  type: 'node_skipped_prior_success';
   runId: string;
-  toolName: string;
-  stepName: string;
-  toolCallId: string;
+  nodeId: string;
+  nodeName: string;
 }
 
-interface ToolCompletedEvent {
-  type: 'tool_completed';
+/**
+ * One provider event, in the envelope the store and the JSONL log record (see
+ * `schemas/provider-event.ts`). `stepName` is the persisted step name, so a live frame
+ * and a served record name the node the same way.
+ */
+export type ProviderEventEmitterEvent = {
+  type: 'provider_event';
   runId: string;
-  toolName: string;
   stepName: string;
-  durationMs: number;
-  toolCallId: string;
-  toolOutcome?: 'success' | 'error' | 'interrupted' | 'unknown';
-  exitCode?: number;
-}
+} & ProviderEventEnvelope;
 
 interface ApprovalPendingEvent {
   type: 'approval_pending';
   runId: string;
   nodeId: string;
   message: string;
+  decisions?: ApprovalContext['decisions'];
+  pauseId?: ApprovalContext['pauseId'];
 }
 
 interface WorkflowCancelledEvent {
@@ -148,47 +171,6 @@ interface WorkflowCancelledEvent {
   runId: string;
   nodeId: string;
   reason: string;
-}
-
-// ─── Subagent Task Lifecycle (aggregated from Claude provider task_* chunks) ──
-// Forwarded by the dag-executor whenever a `task_started` / `task_progress` /
-// `task_notification` MessageChunk arrives from the provider. The bridge maps
-// these to `workflow_task_activity` SSE events for the Web UI. `nodeId` ties
-// the task to the parent workflow node (a single node can spawn many subagents).
-interface TaskActivityEvent {
-  type: 'task_activity';
-  runId: string;
-  nodeId: string;
-  taskId: string;
-  activity: 'started' | 'progress' | 'completed' | 'failed' | 'stopped';
-  description?: string;
-  summary?: string;
-  usage?: { total_tokens: number; tool_uses: number; duration_ms: number };
-  lastToolName?: string;
-  taskType?: string;
-  /** Transcript/output file the settled task points at (task_notification only)
-   *  — the artifact trail for delegated work (#2083). */
-  outputFile?: string;
-  /** True when SDK signaled skip_transcript (housekeeping) — propagated so the
-   *  UI / persistence layer can decide whether to surface. The provider
-   *  filters these out today, but the field is here for forward-compat. */
-  ambient?: boolean;
-}
-
-// ─── Hook Lifecycle (aggregated from Claude provider hook_* chunks) ─────
-// Same aggregation pattern as TaskActivityEvent. Maps to `workflow_hook_activity`
-// SSE events; the Web UI renders them as inline indicators under the parent
-// node (e.g. `PreToolUse(Bash) → approved`).
-interface HookActivityEvent {
-  type: 'hook_activity';
-  runId: string;
-  nodeId: string;
-  hookId: string;
-  hookName: string;
-  hookEvent: string;
-  activity: 'started' | 'response';
-  outcome?: 'success' | 'error' | 'cancelled';
-  exitCode?: number;
 }
 
 /**
@@ -212,23 +194,23 @@ export interface ContainerLifecycleEvent {
 }
 
 export type WorkflowEmitterEvent =
+  | { type: 'run_attention_changed'; runId: string; streamId: string; hasAttention: boolean }
   | WorkflowStartedEvent
   | WorkflowCompletedEvent
   | WorkflowFailedEvent
   | LoopIterationStartedEvent
   | LoopIterationCompletedEvent
   | LoopIterationFailedEvent
+  | NodeSuspendedEvent
   | NodeStartedEvent
   | NodeCompletedEvent
   | NodeFailedEvent
   | NodeSkippedEvent
+  | NodeSkippedPriorSuccessEvent
   | WorkflowArtifactEvent
-  | ToolStartedEvent
-  | ToolCompletedEvent
+  | ProviderEventEmitterEvent
   | ApprovalPendingEvent
   | WorkflowCancelledEvent
-  | TaskActivityEvent
-  | HookActivityEvent
   | ContainerLifecycleEvent;
 
 // ---------------------------------------------------------------------------

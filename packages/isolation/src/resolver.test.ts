@@ -1,13 +1,19 @@
+import { IsolationFailure } from './errors';
+import { GitFailure } from '@archon/git';
 import { describe, test, expect, beforeEach, afterEach, spyOn, mock } from 'bun:test';
 import * as git from '@archon/git';
+
+const mockWarn = mock<(...args: unknown[]) => void>(() => undefined);
+const mockCleanupError = mock<(...args: unknown[]) => void>(() => undefined);
+const mockCleanupInfo = mock<(...args: unknown[]) => void>(() => undefined);
 
 // Mock logger to suppress noisy output
 mock.module('@archon/paths', () => ({
   createLogger: () => ({
     fatal: () => undefined,
-    error: () => undefined,
-    warn: () => undefined,
-    info: () => undefined,
+    error: mockCleanupError,
+    warn: mockWarn,
+    info: mockCleanupInfo,
     debug: () => undefined,
     trace: () => undefined,
     child: () => undefined,
@@ -15,9 +21,16 @@ mock.module('@archon/paths', () => ({
 }));
 
 import { IsolationResolver } from './resolver';
+import { MissingProjectDirectoryError } from './errors';
 import type { IsolationResolverDeps } from './resolver';
 import type { IIsolationStore } from './store';
-import type { IsolationEnvironmentRow, IsolatedEnvironment } from './types';
+import type {
+  DestroyResult,
+  IsolationEnvironmentRow,
+  WorktreeCreationEnvironment,
+  IsolationRequest,
+  ResolutionMethod,
+} from './types';
 
 function makeEnvRow(overrides?: Partial<IsolationEnvironmentRow>): IsolationEnvironmentRow {
   return {
@@ -31,6 +44,7 @@ function makeEnvRow(overrides?: Partial<IsolationEnvironmentRow>): IsolationEnvi
     status: 'active',
     created_at: new Date(),
     created_by_platform: 'web',
+    created_by_user_id: null,
     metadata: {},
     ...overrides,
   };
@@ -40,6 +54,7 @@ function makeMockStore(overrides?: Partial<IIsolationStore>): IIsolationStore {
   return {
     getById: async () => null,
     findActiveByWorkflow: async () => null,
+    listActive: async () => [],
     create: async env =>
       makeEnvRow({
         codebase_id: env.codebase_id,
@@ -49,6 +64,8 @@ function makeMockStore(overrides?: Partial<IIsolationStore>): IIsolationStore {
         branch_name: env.branch_name,
       }),
     updateStatus: async () => undefined,
+    markWorktreeDestroyed: async () => undefined,
+    updateMetadata: async () => undefined,
     countActiveByCodebase: async () => 0,
     ...overrides,
   };
@@ -57,14 +74,19 @@ function makeMockStore(overrides?: Partial<IIsolationStore>): IIsolationStore {
 function makeMockProvider() {
   return {
     providerType: 'worktree' as const,
-    create: async (_request: unknown): Promise<IsolatedEnvironment> => ({
+    create: async (_request: unknown): Promise<WorktreeCreationEnvironment> => ({
       id: '/worktrees/new-branch',
       provider: 'worktree',
       workingPath: '/worktrees/new-branch',
-      branchName: 'new-branch',
+      branchName: git.toBranchName('new-branch'),
       status: 'active',
       createdAt: new Date(),
-      metadata: { adopted: false },
+      metadata: {
+        provenance: 'created',
+        adopted: false,
+        creationId: '58e2e55c-b565-4cca-8786-4bc9b86d6fa8',
+        branchCreated: true,
+      },
     }),
     destroy: async () => ({
       worktreeRemoved: true,
@@ -82,6 +104,58 @@ function makeMockProvider() {
 const defaultCodebase = { id: 'cb-1', defaultCwd: '/repos/myrepo', name: 'my-repo' };
 
 describe('IsolationResolver', () => {
+  test('refuses non-worktree records without adoption metadata or warnings', async () => {
+    const exists = spyOn(git, 'worktreeExists').mockResolvedValue(true);
+    const updateMetadata = mock(async () => {});
+    const env = makeEnvRow({ provider: 'container' });
+    const resolver = createResolver({
+      store: makeMockStore({
+        getById: async () => env,
+        updateMetadata,
+      }),
+    });
+    try {
+      await expect(
+        resolver.resolve({
+          existingEnvId: env.id,
+          codebase: defaultCodebase,
+          platformType: 'cli',
+        })
+      ).rejects.toThrow('is not a worktree');
+      expect(updateMetadata).not.toHaveBeenCalled();
+      expect(mockWarn.mock.calls.filter(([, event]) => event === 'worktree_adopted')).toHaveLength(
+        0
+      );
+    } finally {
+      exists.mockRestore();
+    }
+  });
+
+  test('a failed adoption write refuses reuse and emits no success warning', async () => {
+    const exists = spyOn(git, 'worktreeExists').mockResolvedValue(true);
+    const create = mock(async () => makeEnvRow());
+    const resolver = createResolver({
+      store: makeMockStore({
+        getById: async () => makeEnvRow(),
+        updateMetadata: async () => {
+          throw new Error('adoption write failed');
+        },
+        create,
+      }),
+    });
+    try {
+      await expect(
+        resolver.resolve({ existingEnvId: 'env-1', codebase: defaultCodebase, platformType: 'cli' })
+      ).rejects.toThrow('adoption write failed');
+      expect(create).not.toHaveBeenCalled();
+      expect(mockWarn.mock.calls.filter(([, event]) => event === 'worktree_adopted')).toHaveLength(
+        0
+      );
+    } finally {
+      exists.mockRestore();
+    }
+  });
+
   let worktreeExistsSpy: ReturnType<typeof spyOn>;
   let getCanonicalSpy: ReturnType<typeof spyOn>;
   let findWorktreeByBranchSpy: ReturnType<typeof spyOn>;
@@ -89,6 +163,7 @@ describe('IsolationResolver', () => {
   let verifyWorktreeOwnershipSpy: ReturnType<typeof spyOn>;
 
   beforeEach(() => {
+    mockWarn.mockClear();
     worktreeExistsSpy = spyOn(git, 'worktreeExists').mockResolvedValue(true);
     getCanonicalSpy = spyOn(git, 'getCanonicalRepoPath').mockResolvedValue(
       '/repos/myrepo' as git.RepoPath
@@ -117,6 +192,24 @@ describe('IsolationResolver', () => {
     });
   }
 
+  test('passes the setup executor as transient creation context', async () => {
+    const provider = makeMockProvider();
+    const create = spyOn(provider, 'create');
+    const setupExecutor = async (): Promise<void> => {};
+    const resolver = createResolver({ provider });
+    await resolver.resolve({
+      existingEnvId: null,
+      codebase: defaultCodebase,
+      platformType: 'web',
+      setupExecutor,
+    });
+    expect(create).toHaveBeenCalledWith(
+      expect.objectContaining({ codebaseId: defaultCodebase.id }),
+      setupExecutor
+    );
+    expect(create.mock.calls[0]?.[0]).not.toHaveProperty('setupExecutor');
+  });
+
   test('existing env valid — returns resolved with method existing', async () => {
     const env = makeEnvRow();
     const resolver = createResolver({
@@ -136,6 +229,33 @@ describe('IsolationResolver', () => {
       expect(result.cwd).toBe('/worktrees/issue-42');
     }
   });
+
+  test.each(['existing', 'workflow', 'linked'] as const)(
+    'refuses a container from %s lookup before missing-path reconciliation',
+    async lookup => {
+      const env = makeEnvRow({ provider: 'container', branch_name: '' });
+      const updateStatus = mock(async () => {});
+      const resolver = createResolver({
+        store: makeMockStore({
+          getById: async () => env,
+          findActiveByWorkflow: async (_id, type) =>
+            lookup === 'workflow' || type === 'issue' ? env : null,
+          updateStatus,
+        }),
+      });
+      worktreeExistsSpy.mockResolvedValue(false);
+      await expect(
+        resolver.resolve({
+          existingEnvId: lookup === 'existing' ? env.id : null,
+          codebase: defaultCodebase,
+          platformType: 'web',
+          hints: { workflowType: 'pr', workflowId: '42', linkedIssues: [10] },
+        })
+      ).rejects.toThrow('not a worktree');
+      expect(worktreeExistsSpy).not.toHaveBeenCalled();
+      expect(updateStatus).not.toHaveBeenCalled();
+    }
+  );
 
   test('existing env stale (not on disk) — returns stale_cleaned', async () => {
     const env = makeEnvRow();
@@ -305,19 +425,35 @@ describe('IsolationResolver', () => {
       working_path: '/worktrees/feature-branch',
       branch_name: 'feature-branch',
     });
+    const create = mock(async (_input: Parameters<IIsolationStore['create']>[0]) => adoptedEnv);
     const resolver = createResolver({
       store: makeMockStore({
-        create: async () => adoptedEnv,
+        create,
       }),
     });
 
     const result = await resolver.resolve({
       existingEnvId: null,
       codebase: defaultCodebase,
-      hints: { workflowType: 'pr', workflowId: '99', prBranch: 'feature-branch' },
+      hints: { workflowType: 'pr', workflowId: '99', prBranch: git.toBranchName('feature-branch') },
       platformType: 'web',
     });
 
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(create.mock.calls[0][0].metadata).toEqual({
+      adopted: true,
+      adopted_from: 'skill',
+      worktree_creation_id: null,
+      worktree_branch_created: false,
+    });
+    expect(
+      mockWarn.mock.calls.filter(([, event]) => event === 'isolation_worktree_adopted')
+    ).toEqual([
+      [
+        { adoptedPath: '/worktrees/feature-branch', prBranch: 'feature-branch' },
+        'isolation_worktree_adopted',
+      ],
+    ]);
     expect(result.status).toBe('resolved');
     if (result.status === 'resolved') {
       expect(result.method.type).toBe('branch_adoption');
@@ -328,7 +464,21 @@ describe('IsolationResolver', () => {
   });
 
   test('create new — returns resolved with created method', async () => {
-    const resolver = createResolver();
+    // A canonical path distinct from defaultCwd proves the rollback proof
+    // carries the canonical repo path, not the codebase's working path.
+    const canonicalRepoPath = git.toRepoPath('/repos/canonical-myrepo');
+    getCanonicalSpy.mockResolvedValue(canonicalRepoPath);
+    let capturedRequest: { canonicalRepoPath?: unknown } | undefined;
+    const provider = makeMockProvider();
+    const resolver = createResolver({
+      provider: {
+        ...provider,
+        create: async request => {
+          capturedRequest = request as { canonicalRepoPath?: unknown };
+          return provider.create(request);
+        },
+      },
+    });
 
     const result = await resolver.resolve({
       existingEnvId: null,
@@ -337,13 +487,19 @@ describe('IsolationResolver', () => {
       platformType: 'web',
     });
 
+    expect(capturedRequest?.canonicalRepoPath).toBe(canonicalRepoPath);
     expect(result.status).toBe('resolved');
     if (result.status === 'resolved') {
-      expect(result.method.type).toBe('created');
+      expect(result.method).toEqual({
+        type: 'created',
+        creationId: '58e2e55c-b565-4cca-8786-4bc9b86d6fa8',
+        canonicalRepoPath,
+        branchCreated: true,
+      });
     }
   });
 
-  test('passes fromBranch hint when creating task isolation', async () => {
+  test('passes new-branch selection when creating task isolation', async () => {
     let capturedRequest: unknown;
     const resolver = createResolver({
       provider: {
@@ -354,10 +510,15 @@ describe('IsolationResolver', () => {
             id: '/worktrees/new-branch',
             provider: 'worktree',
             workingPath: '/worktrees/new-branch',
-            branchName: 'new-branch',
+            branchName: git.toBranchName('new-branch'),
             status: 'active',
             createdAt: new Date(),
-            metadata: { adopted: false },
+            metadata: {
+              provenance: 'created',
+              adopted: false,
+              creationId: '58e2e55c-b565-4cca-8786-4bc9b86d6fa8',
+              branchCreated: true,
+            },
           };
         },
       },
@@ -369,7 +530,10 @@ describe('IsolationResolver', () => {
       hints: {
         workflowType: 'task',
         workflowId: 'test-adapters',
-        fromBranch: 'feature/extract-adapters',
+        taskBranch: {
+          kind: 'new',
+          fromBranch: git.toBranchName('feature/extract-adapters'),
+        },
       },
       platformType: 'web',
     });
@@ -378,8 +542,101 @@ describe('IsolationResolver', () => {
       expect.objectContaining({
         workflowType: 'task',
         identifier: 'test-adapters',
-        fromBranch: 'feature/extract-adapters',
+        taskBranch: {
+          kind: 'new',
+          fromBranch: git.toBranchName('feature/extract-adapters'),
+        },
       })
+    );
+  });
+
+  test('passes exact existing-branch selection when adopting a task estate', async () => {
+    let capturedRequest: unknown;
+    const store = makeMockStore();
+    const create = mock(store.create);
+    const resolver = createResolver({
+      store: { ...store, create },
+      provider: {
+        ...makeMockProvider(),
+        create: async request => {
+          capturedRequest = request;
+          return {
+            id: '/worktrees/existing',
+            provider: 'worktree',
+            workingPath: '/worktrees/existing',
+            branchName: git.toBranchName('feature/live-pr'),
+            status: 'active',
+            createdAt: new Date(),
+            metadata: { provenance: 'adopted', adopted: true },
+          };
+        },
+      },
+    });
+
+    const result = await resolver.resolve({
+      existingEnvId: null,
+      codebase: defaultCodebase,
+      hints: {
+        workflowType: 'task',
+        workflowId: 'adopt-run-1',
+        taskBranch: {
+          kind: 'existing',
+          branch: git.toBranchName('feature/live-pr'),
+        },
+      },
+      platformType: 'web',
+    });
+
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(create.mock.calls[0][0].metadata).toMatchObject({
+      adopted: true,
+      worktree_creation_id: null,
+      worktree_branch_created: false,
+    });
+    expect(result.status).toBe('resolved');
+    if (result.status !== 'resolved') throw new Error('expected resolved adoption');
+    expect(result.method).toEqual({ type: 'provider_adoption' });
+    expect(capturedRequest).toEqual(
+      expect.objectContaining({
+        workflowType: 'task',
+        identifier: 'adopt-run-1',
+        taskBranch: { kind: 'existing', branch: 'feature/live-pr' },
+      })
+    );
+  });
+
+  describe.each(['create', 'canonical'] as const)('unclassified failures at the %s gate', gate => {
+    test.each(['timeout', 'permission denied', 'cannot adopt'])(
+      'unclassified git and Docker failures with %s crash with original evidence',
+      async text => {
+        for (const failure of [
+          new GitFailure(
+            'unclassified',
+            `git fetch failed: ${text}`,
+            Object.assign(new Error(text), { code: 128, stderr: text })
+          ),
+          new IsolationFailure('unclassified', `docker failed: ${text}`),
+          new TypeError(text),
+        ]) {
+          if (gate === 'canonical') getCanonicalSpy.mockRejectedValueOnce(failure);
+          const resolver = createResolver({
+            provider: {
+              ...makeMockProvider(),
+              create: async () => {
+                throw failure;
+              },
+            },
+          });
+          await expect(
+            resolver.resolve({
+              existingEnvId: null,
+              codebase: defaultCodebase,
+              platformType: 'web',
+              hints: { workflowType: 'issue', workflowId: '4271' },
+            })
+          ).rejects.toBe(failure);
+        }
+      }
     );
   });
 
@@ -388,7 +645,7 @@ describe('IsolationResolver', () => {
       provider: {
         ...makeMockProvider(),
         create: async () => {
-          throw new Error('permission denied');
+          throw new IsolationFailure('permission_denied', 'permission denied');
         },
       },
     });
@@ -407,18 +664,47 @@ describe('IsolationResolver', () => {
     }
   });
 
+  test('missing project directory — returns blocked with recovery guidance', async () => {
+    const failure = new MissingProjectDirectoryError('/repos/gone', 'acme/widgets');
+    const resolver = createResolver({
+      provider: {
+        ...makeMockProvider(),
+        create: async () => {
+          throw failure;
+        },
+      },
+    });
+
+    const result = await resolver.resolve({
+      existingEnvId: null,
+      codebase: { ...defaultCodebase, defaultCwd: '/repos/gone', name: 'acme/widgets' },
+      hints: { workflowType: 'issue', workflowId: '400' },
+      platformType: 'web',
+    });
+
+    expect(result.status).toBe('blocked');
+    if (result.status === 'blocked') {
+      expect(result.reason).toBe('creation_failed');
+      expect(result.userMessage).toContain(failure.message);
+      expect(result.userMessage).toContain('/repos/gone');
+      expect(result.userMessage).toContain('acme/widgets');
+      expect(result.userMessage).toContain('Restore');
+      expect(result.userMessage).toContain('re-register');
+    }
+  });
+
   // --- Edge-case tests for stale cleanup ---
 
   test('checkExisting marks stale DB record as destroyed', async () => {
     const env = makeEnvRow();
     worktreeExistsSpy.mockResolvedValue(false);
 
-    let updatedStatus: string | null = null;
+    const retired: IsolationEnvironmentRow[] = [];
     const resolver = createResolver({
       store: makeMockStore({
         getById: async () => env,
-        updateStatus: async (_id, status) => {
-          updatedStatus = status;
+        markWorktreeDestroyed: async observed => {
+          retired.push(observed);
         },
       }),
     });
@@ -429,7 +715,7 @@ describe('IsolationResolver', () => {
       platformType: 'web',
     });
 
-    expect(updatedStatus).toBe('destroyed');
+    expect(retired).toEqual([env]);
   });
 
   test('findReusable marks stale DB record as destroyed when worktree gone', async () => {
@@ -437,15 +723,13 @@ describe('IsolationResolver', () => {
     // worktreeExists returns false — worktree is gone
     worktreeExistsSpy.mockResolvedValue(false);
 
-    let updatedId: string | null = null;
-    let updatedStatus: string | null = null;
+    const retired: IsolationEnvironmentRow[] = [];
     const resolver = createResolver({
       store: makeMockStore({
         findActiveByWorkflow: async (_cid, wt, wid) =>
           wt === 'issue' && wid === '42' ? env : null,
-        updateStatus: async (id, status) => {
-          updatedId = id;
-          updatedStatus = status;
+        markWorktreeDestroyed: async observed => {
+          retired.push(observed);
         },
       }),
     });
@@ -458,8 +742,7 @@ describe('IsolationResolver', () => {
     });
 
     // Should have cleaned up the stale record and then created a new environment
-    expect(updatedId).toBe('env-1');
-    expect(updatedStatus).toBe('destroyed');
+    expect(retired).toEqual([env]);
     expect(result.status).toBe('resolved');
     if (result.status === 'resolved') {
       expect(result.method.type).toBe('created');
@@ -477,15 +760,13 @@ describe('IsolationResolver', () => {
     // worktreeExists returns false — worktree is gone
     worktreeExistsSpy.mockResolvedValue(false);
 
-    let updatedId: string | null = null;
-    let updatedStatus: string | null = null;
+    const retired: IsolationEnvironmentRow[] = [];
     const resolver = createResolver({
       store: makeMockStore({
         findActiveByWorkflow: async (_cid, wt, wid) =>
           wt === 'issue' && wid === '10' ? linkedEnv : null,
-        updateStatus: async (id, status) => {
-          updatedId = id;
-          updatedStatus = status;
+        markWorktreeDestroyed: async observed => {
+          retired.push(observed);
         },
       }),
     });
@@ -497,8 +778,7 @@ describe('IsolationResolver', () => {
       platformType: 'web',
     });
 
-    expect(updatedId).toBe('env-linked');
-    expect(updatedStatus).toBe('destroyed');
+    expect(retired).toEqual([linkedEnv]);
     // Should proceed to create new since linked env was stale
     expect(result.status).toBe('resolved');
     if (result.status === 'resolved') {
@@ -514,7 +794,7 @@ describe('IsolationResolver', () => {
       store: makeMockStore({
         findActiveByWorkflow: async (_cid, wt, wid) =>
           wt === 'issue' && wid === '42' ? env : null,
-        updateStatus: async () => {
+        markWorktreeDestroyed: async () => {
           throw new Error('DB connection lost');
         },
       }),
@@ -562,7 +842,7 @@ describe('IsolationResolver', () => {
       provider: {
         ...makeMockProvider(),
         create: async () => {
-          throw new Error('permission denied');
+          throw new IsolationFailure('permission_denied', 'permission denied');
         },
       },
     });
@@ -580,24 +860,98 @@ describe('IsolationResolver', () => {
     }
   });
 
-  test('store.create() failure triggers orphan worktree cleanup and rethrows', async () => {
-    let destroyCalled = false;
-    let destroyCalledWithForce = false;
+  for (const branchCreated of [true, false]) {
+    test(`store.create() failure removes the orphan worktree, ${branchCreated ? 'deleting' : 'keeping'} its branch, and rethrows`, async () => {
+      const destroyCalls: unknown[][] = [];
+      const provider = makeMockProvider();
+      const resolver = createResolver({
+        provider: {
+          ...provider,
+          create: async request => {
+            const env = await provider.create(request);
+            return { ...env, metadata: { ...env.metadata, branchCreated } };
+          },
+          destroy: async (...args) => {
+            destroyCalls.push(args);
+            return {
+              worktreeRemoved: true,
+              branchDeleted: null,
+              remoteBranchDeleted: null,
+              directoryClean: true,
+              warnings: [],
+            };
+          },
+        },
+        store: makeMockStore({
+          create: async () => {
+            throw new Error('DB constraint violation');
+          },
+        }),
+      });
 
+      await expect(
+        resolver.resolve({
+          existingEnvId: null,
+          codebase: defaultCodebase,
+          hints: { workflowType: 'issue', workflowId: '602' },
+          platformType: 'web',
+        })
+      ).rejects.toThrow('DB constraint violation');
+      expect(destroyCalls).toEqual([
+        [
+          '/worktrees/new-branch',
+          {
+            canonicalRepoPath: git.toRepoPath('/repos/myrepo'),
+            creationId: '58e2e55c-b565-4cca-8786-4bc9b86d6fa8',
+            ...(branchCreated ? { branchName: git.toBranchName('new-branch') } : {}),
+            force: true,
+          },
+        ],
+      ]);
+    });
+  }
+
+  test('a failed final registration recheck preserves the checkout and original insert error', async () => {
+    let attempted = false;
+    const insertError = new Error('insert failed');
+    const destroy = mock(makeMockProvider().destroy);
+    const resolver = createResolver({
+      provider: { ...makeMockProvider(), destroy },
+      store: makeMockStore({
+        create: async () => {
+          attempted = true;
+          throw insertError;
+        },
+        listActive: async () => {
+          if (attempted) throw new Error('lookup failed');
+          return [];
+        },
+      }),
+    });
+    await expect(
+      resolver.resolve({
+        existingEnvId: null,
+        codebase: defaultCodebase,
+        hints: { workflowType: 'issue', workflowId: '602' },
+        platformType: 'web',
+      })
+    ).rejects.toBe(insertError);
+    expect(destroy).not.toHaveBeenCalled();
+  });
+
+  test('incomplete rollback reports the leftover without masking the store failure', async () => {
+    mockCleanupError.mockClear();
+    mockCleanupInfo.mockClear();
     const resolver = createResolver({
       provider: {
         ...makeMockProvider(),
-        destroy: async (_envId, options) => {
-          destroyCalled = true;
-          destroyCalledWithForce = options?.force === true;
-          return {
-            worktreeRemoved: true,
-            branchDeleted: null,
-            remoteBranchDeleted: null,
-            directoryClean: true,
-            warnings: [],
-          };
-        },
+        destroy: async () => ({
+          worktreeRemoved: true,
+          directoryClean: false,
+          branchDeleted: null,
+          remoteBranchDeleted: null,
+          warnings: ['Retained directory'],
+        }),
       },
       store: makeMockStore({
         create: async () => {
@@ -605,7 +959,6 @@ describe('IsolationResolver', () => {
         },
       }),
     });
-
     await expect(
       resolver.resolve({
         existingEnvId: null,
@@ -614,9 +967,15 @@ describe('IsolationResolver', () => {
         platformType: 'web',
       })
     ).rejects.toThrow('DB constraint violation');
-
-    expect(destroyCalled).toBe(true);
-    expect(destroyCalledWithForce).toBe(true);
+    expect(mockCleanupError.mock.calls).toContainEqual([
+      expect.objectContaining({
+        err: expect.objectContaining({ message: expect.stringContaining('Retained directory') }),
+      }),
+      'isolation_orphan_cleanup_failed',
+    ]);
+    expect(
+      mockCleanupInfo.mock.calls.some(args => args[1] === 'isolation_orphan_cleanup_completed')
+    ).toBe(false);
   });
 
   test('store.create() failure still rethrows when orphan cleanup also fails', async () => {
@@ -645,20 +1004,207 @@ describe('IsolationResolver', () => {
     ).rejects.toThrow('DB constraint violation');
   });
 
+  describe('releaseUnlinked', () => {
+    const canonicalRepoPath = git.toRepoPath('/repos/myrepo');
+    const creationId = '58e2e55c-b565-4cca-8786-4bc9b86d6fa8';
+    const created = {
+      status: 'resolved' as const,
+      env: makeEnvRow(),
+      cwd: '/worktrees/issue-42',
+      method: {
+        type: 'created' as const,
+        creationId,
+        canonicalRepoPath,
+        branchCreated: false,
+      },
+    };
+
+    function releaseHarness(
+      destroy: () => Promise<DestroyResult>,
+      storeOverrides?: Partial<IIsolationStore>
+    ): {
+      resolver: IsolationResolver;
+      destroyCalls: unknown[][];
+      statusUpdates: unknown[][];
+    } {
+      const destroyCalls: unknown[][] = [];
+      const statusUpdates: unknown[][] = [];
+      const resolver = createResolver({
+        provider: {
+          ...makeMockProvider(),
+          destroy: async (...args) => {
+            destroyCalls.push(args);
+            return destroy();
+          },
+        },
+        store: makeMockStore({
+          updateStatus: async (...args) => {
+            statusUpdates.push(args);
+          },
+          markWorktreeDestroyed: async observed => {
+            statusUpdates.push([observed.id, 'destroyed']);
+          },
+          ...storeOverrides,
+        }),
+      });
+      return { resolver, destroyCalls, statusUpdates };
+    }
+
+    const removed: DestroyResult = {
+      worktreeRemoved: true,
+      branchDeleted: true,
+      remoteBranchDeleted: null,
+      directoryClean: true,
+      warnings: [],
+    };
+
+    const notCreated: ResolutionMethod[] = [
+      { type: 'existing' },
+      { type: 'workflow_reuse' },
+      { type: 'linked_issue_reuse', issueNumber: 42 },
+      { type: 'branch_adoption', branch: 'issue-42' },
+      { type: 'provider_adoption' },
+    ];
+    for (const method of notCreated) {
+      test(`leaves a ${method.type} environment untouched`, async () => {
+        const { resolver, destroyCalls, statusUpdates } = releaseHarness(async () => removed);
+        await resolver.releaseUnlinked({ ...created, method });
+        expect(destroyCalls).toEqual([]);
+        expect(statusUpdates).toEqual([]);
+      });
+    }
+
+    test('removes a created worktree and marks it destroyed once removal is verified', async () => {
+      const { resolver, destroyCalls, statusUpdates } = releaseHarness(async () => removed);
+      await resolver.releaseUnlinked(created);
+      expect(destroyCalls).toEqual([
+        ['/worktrees/issue-42', { canonicalRepoPath, creationId, force: true }],
+      ]);
+      expect(statusUpdates).toEqual([['env-1', 'destroyed']]);
+    });
+
+    for (const claim of ['same-row', 'other-workflow'] as const) {
+      test(`preserves a created checkout adopted by ${claim} before unlink rollback`, async () => {
+        const adopted = makeEnvRow({
+          ...(claim === 'other-workflow' ? { id: 'env-2', workflow_id: 'other' } : {}),
+          metadata: { worktree_registration_id: 'adopted-registration' },
+        });
+        const { resolver, destroyCalls, statusUpdates } = releaseHarness(async () => removed, {
+          listActive: async () => [adopted],
+        });
+        mockWarn.mockClear();
+        await resolver.releaseUnlinked(created);
+        expect(destroyCalls).toEqual([]);
+        expect(statusUpdates).toEqual([]);
+        expect(mockWarn).toHaveBeenCalledWith(
+          { isolationEnvId: created.env.id, worktreePath: created.env.working_path },
+          'isolation_rollback_skipped_registered'
+        );
+      });
+    }
+
+    test('keeps a created checkout when its final registration lookup fails', async () => {
+      const failure = new Error('store unavailable');
+      const { resolver, destroyCalls, statusUpdates } = releaseHarness(async () => removed, {
+        listActive: async () => {
+          throw failure;
+        },
+      });
+      mockCleanupError.mockClear();
+      await resolver.releaseUnlinked(created);
+      expect(destroyCalls).toEqual([]);
+      expect(statusUpdates).toEqual([]);
+      expect(mockCleanupError).toHaveBeenCalledWith(
+        { err: failure, isolationEnvId: created.env.id },
+        'isolation_rollback_failed'
+      );
+    });
+
+    test('removes a created checkout still held by its original registration', async () => {
+      const { resolver, destroyCalls, statusUpdates } = releaseHarness(async () => removed, {
+        listActive: async () => [created.env],
+      });
+      await resolver.releaseUnlinked(created);
+      expect(destroyCalls).toHaveLength(1);
+      expect(statusUpdates).toEqual([['env-1', 'destroyed']]);
+    });
+
+    // `cutFromCommit` does not track branch ownership: PR checkouts create a branch
+    // without one, and a reset pre-existing branch has one.
+    const branchCases: [string, ResolutionMethod & { type: 'created' }, boolean][] = [
+      [
+        'a new branch it cut',
+        { ...created.method, branchCreated: true, cutFromCommit: 'abc123' },
+        true,
+      ],
+      ['a PR branch it created', { ...created.method, branchCreated: true }, true],
+      [
+        'a pre-existing branch it reset',
+        { ...created.method, branchCreated: false, cutFromCommit: 'abc123' },
+        false,
+      ],
+    ];
+    for (const [shape, method, deletesBranch] of branchCases) {
+      test(`${deletesBranch ? 'deletes' : 'keeps'} ${shape}`, async () => {
+        const { resolver, destroyCalls } = releaseHarness(async () => removed);
+        await resolver.releaseUnlinked({ ...created, method });
+        expect(destroyCalls).toEqual([
+          [
+            '/worktrees/issue-42',
+            {
+              canonicalRepoPath,
+              creationId,
+              ...(deletesBranch ? { branchName: git.toBranchName('issue-42') } : {}),
+              force: true,
+            },
+          ],
+        ]);
+      });
+    }
+
+    const unverified: [string, () => Promise<DestroyResult>][] = [
+      ['the worktree is still registered', async () => ({ ...removed, worktreeRemoved: false })],
+      ['the directory is still on disk', async () => ({ ...removed, directoryClean: false })],
+      [
+        'the provider refuses',
+        async () => {
+          throw new Error('Cannot verify worktree ownership');
+        },
+      ],
+    ];
+    for (const [condition, destroy] of unverified) {
+      test(`keeps a created row active when ${condition}`, async () => {
+        mockCleanupError.mockClear();
+        const { resolver, destroyCalls, statusUpdates } = releaseHarness(destroy);
+        await resolver.releaseUnlinked(created);
+        expect(destroyCalls).toHaveLength(1);
+        expect(statusUpdates).toEqual([]);
+        expect(mockCleanupError.mock.calls.map(args => args[1])).toContain(
+          'isolation_orphan_cleanup_failed'
+        );
+      });
+    }
+  });
+
   // --- Warnings propagation tests ---
 
   test('warnings from provider.create() are propagated in resolved result', async () => {
     const resolver = createResolver({
       provider: {
         ...makeMockProvider(),
-        create: async (): Promise<IsolatedEnvironment> => ({
+        create: async (): Promise<WorktreeCreationEnvironment> => ({
           id: '/worktrees/new-branch',
           provider: 'worktree',
           workingPath: '/worktrees/new-branch',
-          branchName: 'new-branch',
+          branchName: git.toBranchName('new-branch'),
           status: 'active',
           createdAt: new Date(),
-          metadata: { adopted: false },
+          metadata: {
+            provenance: 'created',
+            adopted: false,
+            creationId: '58e2e55c-b565-4cca-8786-4bc9b86d6fa8',
+            branchCreated: true,
+          },
           warnings: ['Config file could not be loaded — copyFiles not applied.'],
         }),
       },
@@ -700,16 +1246,21 @@ describe('IsolationResolver', () => {
     const resolver = createResolver({
       provider: {
         ...makeMockProvider(),
-        create: async (request: unknown) => {
+        create: async (request: IsolationRequest): Promise<WorktreeCreationEnvironment> => {
           capturedRequests.push(request);
           return {
             id: '/worktrees/new-branch',
             provider: 'worktree' as const,
             workingPath: '/worktrees/new-branch',
-            branchName: 'new-branch',
+            branchName: git.toBranchName('new-branch'),
             status: 'active' as const,
             createdAt: new Date(),
-            metadata: { adopted: false },
+            metadata: {
+              provenance: 'created',
+              adopted: false,
+              creationId: '58e2e55c-b565-4cca-8786-4bc9b86d6fa8',
+              branchCreated: true,
+            },
           };
         },
       },
@@ -735,16 +1286,21 @@ describe('IsolationResolver', () => {
     const resolver = createResolver({
       provider: {
         ...makeMockProvider(),
-        create: async (request: unknown) => {
+        create: async (request: IsolationRequest): Promise<WorktreeCreationEnvironment> => {
           capturedRequests.push(request);
           return {
             id: '/worktrees/new-branch',
             provider: 'worktree' as const,
             workingPath: '/worktrees/new-branch',
-            branchName: 'new-branch',
+            branchName: git.toBranchName('new-branch'),
             status: 'active' as const,
             createdAt: new Date(),
-            metadata: { adopted: false },
+            metadata: {
+              provenance: 'created',
+              adopted: false,
+              creationId: '58e2e55c-b565-4cca-8786-4bc9b86d6fa8',
+              branchCreated: true,
+            },
           };
         },
       },
@@ -773,16 +1329,21 @@ describe('IsolationResolver', () => {
     const resolver = createResolver({
       provider: {
         ...makeMockProvider(),
-        create: async (request: unknown) => {
+        create: async (request: IsolationRequest): Promise<WorktreeCreationEnvironment> => {
           capturedRequests.push(request);
           return {
             id: '/worktrees/new-branch',
             provider: 'worktree' as const,
             workingPath: '/worktrees/new-branch',
-            branchName: 'new-branch',
+            branchName: git.toBranchName('new-branch'),
             status: 'active' as const,
             createdAt: new Date(),
-            metadata: { adopted: false },
+            metadata: {
+              provenance: 'created',
+              adopted: false,
+              creationId: '58e2e55c-b565-4cca-8786-4bc9b86d6fa8',
+              branchCreated: true,
+            },
           };
         },
       },
@@ -811,7 +1372,7 @@ describe('IsolationResolver', () => {
     const resolver = createResolver({
       provider: {
         ...makeMockProvider(),
-        create: async (request: unknown): Promise<IsolatedEnvironment> => {
+        create: async (request: IsolationRequest): Promise<WorktreeCreationEnvironment> => {
           capturedRequests.push(request);
           throw new Error('provider.create must not be called for folder projects');
         },
@@ -1161,6 +1722,45 @@ describe('IsolationResolver', () => {
   // become a `blocked` result; unknown errors propagate as crashes.
   // -------------------------------------------------------------------------
   describe('canonical path resolution failure handling', () => {
+    test('uses an exact registered external-git-dir checkout as the worktree anchor', async () => {
+      const defaultCwd = '/workspace/external-linked';
+      getCanonicalSpy.mockRejectedValue(
+        new git.CanonicalRepoPathUnavailableError(defaultCwd, '/metadata/repository')
+      );
+      const createSpy = mock(
+        async (_request: IsolationRequest): Promise<WorktreeCreationEnvironment> => ({
+          id: '/worktrees/new-branch',
+          provider: 'worktree',
+          workingPath: '/worktrees/new-branch',
+          branchName: git.toBranchName('new-branch'),
+          status: 'active',
+          createdAt: new Date(),
+          metadata: {
+            provenance: 'created',
+            adopted: false,
+            creationId: '58e2e55c-b565-4cca-8786-4bc9b86d6fa8',
+            branchCreated: true,
+          },
+        })
+      );
+      const resolver = createResolver({
+        provider: { ...makeMockProvider(), create: createSpy },
+      });
+
+      const result = await resolver.resolve({
+        existingEnvId: null,
+        codebase: { ...defaultCodebase, defaultCwd },
+        hints: { workflowType: 'issue', workflowId: '42' },
+        platformType: 'web',
+      });
+
+      expect(result.status).toBe('resolved');
+      expect(createSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ canonicalRepoPath: defaultCwd }),
+        undefined
+      );
+    });
+
     test('known infrastructure error returns blocked with classified user message', async () => {
       const eaccesError = new Error('EACCES: permission denied') as NodeJS.ErrnoException;
       eaccesError.code = 'EACCES';

@@ -6,17 +6,16 @@
  * enables future strategies (containers, VMs).
  */
 
+import { isDeepStrictEqual } from 'node:util';
 import type { RepoPath, BranchName } from '@archon/git';
+import type { ExecutionContext } from '@archon/provider-contract';
 import type {
-  ExecutionContext,
+  OverlayMode,
   WriteBackFinalizeResult,
   WriteBackApplySummary,
-} from '@archon/providers/types';
+} from '@archon/workflows/container-context';
 
-// Re-exported so isolation consumers can source the execution-context contract
-// (and the write-back result shapes) from `@archon/isolation` alongside the
-// backend types that produce them, without reaching into
-// `@archon/providers/types` directly.
+// Isolation backends implement the engine-owned write-back port.
 export type { ExecutionContext, WriteBackFinalizeResult, WriteBackApplySummary };
 
 // --- Provider Types ---
@@ -41,15 +40,17 @@ interface IsolationRequestBase {
   codebaseName?: string;
 
   /**
-   * Absolute, resolved filesystem path to the main repository checkout.
+   * Absolute, resolved filesystem path to a registered repository checkout.
    *
    * "Canonical" means the real path with symlinks resolved and `~` expanded
    * (e.g., `/home/user/.archon/workspaces/owner/repo/source`). This must
-   * point to the primary git checkout, not a worktree, because git worktree
-   * operations (add, remove, list) must be executed from the main repo.
+   * This normally points to the primary checkout. A repository created with
+   * `--separate-git-dir` does not record a reverse primary-checkout path, so an
+   * exactly registered linked checkout is also a valid Git worktree-operation
+   * anchor.
    *
-   * Use `getCanonicalRepoPath()` to resolve any path (including worktree
-   * paths) back to the canonical repo path.
+   * Use `getCanonicalRepoPath()` when Git can resolve a primary checkout; keep
+   * an exact registered checkout when it returns its typed unavailable result.
    */
   canonicalRepoPath: RepoPath;
 
@@ -75,15 +76,6 @@ interface IsolationRequestBase {
   baseOverride?: BranchName;
 
   description?: string;
-
-  /**
-   * Optional git author identity to stamp on the new worktree (`git config
-   * user.email`/`user.name`). Populated from the originating user's connected
-   * GitHub no-reply email so workflow commits attribute to the human. Absent in
-   * solo installs and for unconnected users — the worktree then inherits the
-   * ambient git identity (unchanged behavior).
-   */
-  gitIdentity?: { email: string; name?: string };
 }
 
 export interface IssueIsolationRequest extends IsolationRequestBase {
@@ -113,12 +105,16 @@ export interface ThreadIsolationRequest extends IsolationRequestBase {
   identifier: string;
 }
 
+export type TaskBranchSelection =
+  | { kind: 'new'; branch?: BranchName; fromBranch?: BranchName }
+  | { kind: 'existing'; branch: BranchName };
+
 export interface TaskIsolationRequest extends IsolationRequestBase {
   workflowType: 'task';
-  /** Task identifier (will be slugified for branch name, max 50 chars) */
+  /** Task identifier (will be slugified for branch name unless a branch is specified). */
   identifier: string;
-  /** Optional branch to use as start point for new task branch creation */
-  fromBranch?: BranchName;
+  /** Whether this task creates a branch or continues an exact existing branch. */
+  taskBranch?: TaskBranchSelection;
 }
 
 export type IsolationRequest =
@@ -131,17 +127,37 @@ export type IsolationRequest =
 // --- Isolated Environment Types ---
 
 export interface AdoptedWorktreeMetadata {
+  provenance: 'adopted';
   adopted: true;
   adoptedFrom?: 'path' | 'branch';
   request?: IsolationRequest;
 }
 
 export interface CreatedWorktreeMetadata {
+  provenance: 'created';
   adopted: false;
+  creationId: string;
+  /**
+   * True only when this creation made the checked-out branch. False when an existing
+   * local branch was checked out, since it may hold work this creation does not own.
+   */
+  branchCreated: boolean;
   request?: IsolationRequest;
+  /**
+   * The commit the branch was cut from; absent when an existing branch was checked out.
+   */
+  cutFromCommit?: string;
 }
 
-export type WorktreeMetadata = AdoptedWorktreeMetadata | CreatedWorktreeMetadata;
+export interface ObservedWorktreeMetadata {
+  provenance: 'observed';
+  adopted: false;
+}
+
+export type WorktreeMetadata =
+  | AdoptedWorktreeMetadata
+  | CreatedWorktreeMetadata
+  | ObservedWorktreeMetadata;
 
 interface IsolatedEnvironmentBase {
   /** For worktrees, this is the filesystem path */
@@ -157,13 +173,55 @@ interface IsolatedEnvironmentBase {
   warnings?: string[];
 }
 
-export interface WorktreeEnvironment extends IsolatedEnvironmentBase {
+export interface WorktreeEnvironment<Metadata extends WorktreeMetadata = WorktreeMetadata>
+  extends IsolatedEnvironmentBase {
   provider: 'worktree';
   branchName: BranchName;
-  metadata: WorktreeMetadata;
+  metadata: Metadata;
 }
 
 export type IsolatedEnvironment = WorktreeEnvironment;
+export type WorktreeCreationEnvironment = WorktreeEnvironment<
+  CreatedWorktreeMetadata | AdoptedWorktreeMetadata
+>;
+
+/**
+ * Isolation-record metadata carrying a worktree's creation proof (null when adopted)
+ * and whether that creation made the checked-out branch.
+ */
+export interface WorktreeRegistrationMetadata {
+  adopted: boolean;
+  worktree_creation_id: string | null;
+  worktree_branch_created: boolean;
+}
+
+/** The one encoding of creation provenance every isolation-record writer persists. */
+export function worktreeRegistrationMetadata(
+  metadata: WorktreeCreationEnvironment['metadata']
+): WorktreeRegistrationMetadata {
+  return metadata.provenance === 'created'
+    ? {
+        adopted: metadata.adopted,
+        worktree_creation_id: metadata.creationId,
+        worktree_branch_created: metadata.branchCreated,
+      }
+    : { adopted: metadata.adopted, worktree_creation_id: null, worktree_branch_created: false };
+}
+
+/** Read the creation proof that worktreeRegistrationMetadata persisted. */
+export function readWorktreeCreationId(metadata: Record<string, unknown>): string | null {
+  const id = (metadata as Partial<WorktreeRegistrationMetadata>).worktree_creation_id;
+  return typeof id === 'string' ? id : null;
+}
+
+/**
+ * Whether the record's creation made its branch. A record written before this was
+ * persisted reads as not created: its branch may hold work nobody else has, and a
+ * kept branch costs a `git branch -D` while a deleted one may cost the work.
+ */
+export function readWorktreeBranchCreated(metadata: Record<string, unknown>): boolean {
+  return (metadata as Partial<WorktreeRegistrationMetadata>).worktree_branch_created === true;
+}
 
 // --- Provider Interface ---
 
@@ -172,8 +230,22 @@ export interface DestroyOptions {
 }
 
 export interface WorktreeDestroyOptions extends DestroyOptions {
+  /** Expected creation proof; required to remove a present checkout outside guarded release. */
+  creationId?: string;
+  /**
+   * Remove a checkout Archon created, with force, after proving its creation ID.
+   * `beforeRemove` runs while the checkout is locked against adoption; throwing
+   * refuses the removal and drops the lock.
+   */
+  guardedRemoval?: { creationId: string; beforeRemove: () => Promise<void> };
   branchName?: BranchName;
-  /** Required for branch cleanup if worktree path doesn't exist */
+  /**
+   * Remove the worktree even while it is locked. Implies `force`: `git worktree
+   * remove` refuses a locked worktree unless forced twice. Only the call holding
+   * the lock may pass this — for anyone else, a lock means "not yours".
+   */
+  removeLocked?: boolean;
+  /** Expected repository; required for present-checkout removal and absent-path branch cleanup. */
   canonicalRepoPath?: RepoPath;
   /** Delete the remote branch (best-effort, e.g., after PR merge) */
   deleteRemoteBranch?: boolean;
@@ -211,7 +283,10 @@ export interface DestroyResult {
 export interface IIsolationProvider {
   readonly providerType: IsolationProviderType;
 
-  create(request: IsolationRequest): Promise<IsolatedEnvironment>;
+  create(
+    request: IsolationRequest,
+    setupExecutor?: WorktreeSetupExecutor
+  ): Promise<WorktreeCreationEnvironment>;
 
   /**
    * Best-effort cleanup. Throws only for unexpected errors (permissions, git failures).
@@ -248,8 +323,8 @@ export interface IsolationHints {
   prFetchFailed?: boolean;
 
   // Task-specific
-  /** Start-point branch for new task worktree creation. Only consumed when workflowType === 'task'. */
-  fromBranch?: BranchName;
+  /** Branch ownership for task isolation. Only consumed when workflowType === 'task'. */
+  taskBranch?: TaskBranchSelection;
 
   /** Expected base branch for this workflow. When set, reused worktrees are validated with merge-base. */
   baseBranch?: BranchName;
@@ -265,6 +340,9 @@ export interface IsolationHints {
 export type IsolationBlockReason = 'creation_failed';
 
 // --- Database Types ---
+
+// An upsert can preserve the checkout and row id while replacing the registration.
+export const WORKTREE_REGISTRATION_ID = 'worktree_registration_id';
 
 export interface IsolationEnvironmentRow {
   id: string;
@@ -282,9 +360,49 @@ export interface IsolationEnvironmentRow {
   metadata: Record<string, unknown>;
 }
 
+/**
+ * The isolation record no longer holds the worktree registration a cleanup observed:
+ * it was re-registered (an upsert keeps the row id). The cleanup leaves the current
+ * registration as it is rather than retire one it did not destroy.
+ */
+export class WorktreeRegistrationChangedError extends Error {
+  constructor(readonly environmentId: string) {
+    super(
+      `Worktree ${environmentId} changed during cleanup; its current registration was left as is. Inspect it and retry.`
+    );
+    this.name = 'WorktreeRegistrationChangedError';
+  }
+}
+
+export function sameWorktreeRegistration(
+  current: IsolationEnvironmentRow,
+  observed: IsolationEnvironmentRow
+): boolean {
+  if (current.provider !== 'worktree') return false;
+  const token = observed.metadata[WORKTREE_REGISTRATION_ID];
+  return typeof token === 'string'
+    ? current.id === observed.id &&
+        current.working_path === observed.working_path &&
+        current.metadata[WORKTREE_REGISTRATION_ID] === token
+    : isDeepStrictEqual({ ...current, status: observed.status }, observed);
+}
+
 // --- Config Injection ---
 
+export interface WorktreeSetupInput {
+  workingPath: string;
+  canonicalRepoPath: string;
+  codebaseId: string;
+  commands: readonly string[];
+  timeout: number;
+}
+
+export type WorktreeSetupExecutor = (input: WorktreeSetupInput) => Promise<void>;
+
 export interface WorktreeCreateConfig {
+  postCreate?: string[];
+  /** Per-command timeout in milliseconds; defaults to 300000. */
+  postCreateTimeout?: number;
   baseBranch?: string;
   copyFiles?: string[];
   /**
@@ -340,7 +458,7 @@ export interface WorktreeStatusBreakdown {
   active: number;
   mergedEnvs: { id: string; branchName: string }[];
   staleEnvs: { id: string; branchName: string; daysInactive: number }[];
-  activeEnvs: { id: string; branchName: string }[];
+  activeEnvs: { id: string; branchName: string; reason?: string }[];
 }
 
 // --- Store Types ---
@@ -361,6 +479,7 @@ export interface CreateEnvironmentParams {
 // --- Resolver Types ---
 
 export interface ResolveRequest {
+  setupExecutor?: WorktreeSetupExecutor;
   existingEnvId: string | null;
   codebase: {
     id: string;
@@ -383,12 +502,6 @@ export interface ResolveRequest {
   platformType: string;
   /** Archon user UUID; populated by chat/forge adapter handlers. */
   userId?: string;
-  /**
-   * Git author identity to stamp on a newly-created worktree (no-reply email of
-   * the originating user's connected GitHub account). Forwarded into the
-   * IsolationRequest passed to the provider. Absent → ambient git identity.
-   */
-  gitIdentity?: { email: string; name?: string };
 }
 
 export type ResolutionMethod =
@@ -396,7 +509,18 @@ export type ResolutionMethod =
   | { type: 'workflow_reuse' }
   | { type: 'linked_issue_reuse'; issueNumber: number }
   | { type: 'branch_adoption'; branch: string }
-  | { type: 'created'; autoCleanedCount?: number };
+  | { type: 'provider_adoption' }
+  | {
+      type: 'created';
+      creationId: string;
+      /** The repository the worktree was created from; part of its removal proof. */
+      canonicalRepoPath: RepoPath;
+      /** Whether this resolution created the branch, so undoing it may delete the branch. */
+      branchCreated: boolean;
+      autoCleanedCount?: number;
+      /** The commit the branch was cut from, when this resolution cut it. */
+      cutFromCommit?: string;
+    };
 
 export type IsolationResolution =
   | {
@@ -409,6 +533,8 @@ export type IsolationResolution =
   | { status: 'stale_cleaned'; previousEnvId: string }
   | { status: 'none'; cwd: string }
   | { status: 'blocked'; reason: IsolationBlockReason; userMessage: string };
+
+export type ResolvedIsolation = Extract<IsolationResolution, { status: 'resolved' }>;
 
 // --- Isolation Backend Seam (folder projects only) ---
 //
@@ -431,6 +557,27 @@ export interface BackendPrepareRequest {
     name: string;
     kind: 'repo' | 'folder';
   };
+  /**
+   * Host path of the run's frozen workflow source, to bind read-only at the SAME
+   * absolute path inside the environment.
+   *
+   * ENGINE-INTERNAL. There is deliberately no YAML or `archon.config` surface for this:
+   * it is one Archon-owned path the engine already knows, not a general mount facility.
+   * Backends that do not isolate the filesystem (in-place) ignore it — the path is
+   * already reachable there.
+   */
+  sourceMount?: string;
+  /**
+   * Host path of the run's artifacts directory (`$ARTIFACTS_DIR`), to bind READ-WRITE at
+   * the SAME absolute path inside the environment.
+   *
+   * `$ARTIFACTS_DIR` is the run's output channel: screenshots, reports, the evidence
+   * marker. A node writes there on both sides of the boundary, so the container gets
+   * the host directory itself rather than a container-local copy the host never sees.
+   * Same ownership rules as `sourceMount`: engine-internal, Archon-owned, ignored by
+   * backends that do not isolate the filesystem.
+   */
+  artifactsMount?: string;
 }
 
 /**
@@ -450,7 +597,7 @@ export interface PreparedEnv {
    * read-write — i.e. the agent could bypass the write-back gate. The engine warns
    * loudly at run start when this is `native` (see SECURITY.md). Absent for in-place.
    */
-  overlayMode?: 'fuse' | 'native';
+  overlayMode?: OverlayMode;
 }
 
 /**

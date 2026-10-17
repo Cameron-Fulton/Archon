@@ -8,7 +8,16 @@
  * type-safe for `toDag` (the data type cannot be correlated with the variant key
  * once destructured). The helpers recover that correlation without `any`.
  */
-import type { BuilderNode, VariantData, VariantDataMap, VariantId, WireDagNode } from '../types';
+import type {
+  BuilderDagFragment,
+  BuilderNode,
+  OpaqueKind,
+  VariantData,
+  VariantDataMap,
+  VariantId,
+  WireDagNode,
+  WireVariantKey,
+} from '../types';
 import { VARIANT_CAPABILITIES, type VariantCapabilities } from './capabilities';
 import { defaultLoopData, loopFromDag, loopToDag } from './loop';
 import { approvalFromDag, approvalToDag, defaultApprovalData } from './approval';
@@ -17,8 +26,9 @@ import { defaultScriptData, scriptFromDag, scriptToDag } from './script';
 import { commandFromDag, commandToDag, defaultCommandData } from './command';
 import { defaultPromptData, promptFromDag, promptToDag } from './prompt';
 import { bashFromDag, bashToDag, defaultBashData } from './bash';
+import { defaultWaitData, waitFromDag, waitToDag } from './wait';
 
-/** Canonical variant order (three existing kinds, then the four new variants). */
+/** Canonical palette and registry order. */
 export const VARIANTS: readonly VariantId[] = [
   'prompt',
   'command',
@@ -26,6 +36,7 @@ export const VARIANTS: readonly VariantId[] = [
   'script',
   'loop',
   'approval',
+  'wait',
   'cancel',
 ];
 
@@ -41,16 +52,16 @@ export interface VariantRegistryEntry<K extends VariantId> {
   label: string;
   defaultData: () => VariantDataMap[K];
   fromDag: (variantSpecific: Partial<WireDagNode>) => VariantDataMap[K];
-  toDag: (data: VariantDataMap[K]) => Partial<WireDagNode>;
+  toDag: (data: VariantDataMap[K]) => BuilderDagFragment;
   capabilities: VariantCapabilities;
   /**
    * The wire keys this variant's converters consume from `variantSpecific`.
    * The importer warns about (and drops) any other key that lands there, so a
    * field the round-trip cannot carry is never lost silently. Typed as
-   * `keyof WireDagNode` so a typo or a renamed wire field fails to compile
-   * rather than silently classifying every key as unsupported.
+   * `WireVariantKey` so a typo, a renamed wire field or a base key fails to
+   * compile rather than silently classifying every key as unsupported.
    */
-  wireKeys: readonly (keyof WireDagNode)[];
+  wireKeys: readonly WireVariantKey[];
 }
 
 /** Per-variant registry. Strongly typed per key. */
@@ -68,7 +79,7 @@ export const VARIANT_REGISTRY: { [K in VariantId]: VariantRegistryEntry<K> } = {
     defaultData: defaultCommandData,
     fromDag: commandFromDag,
     toDag: commandToDag,
-    wireKeys: ['command'],
+    wireKeys: ['command', 'with'],
     capabilities: VARIANT_CAPABILITIES.command,
   },
   bash: {
@@ -76,7 +87,7 @@ export const VARIANT_REGISTRY: { [K in VariantId]: VariantRegistryEntry<K> } = {
     defaultData: defaultBashData,
     fromDag: bashFromDag,
     toDag: bashToDag,
-    wireKeys: ['bash', 'timeout'],
+    wireKeys: ['bash', 'timeout', 'on_timeout'],
     capabilities: VARIANT_CAPABILITIES.bash,
   },
   script: {
@@ -84,7 +95,7 @@ export const VARIANT_REGISTRY: { [K in VariantId]: VariantRegistryEntry<K> } = {
     defaultData: defaultScriptData,
     fromDag: scriptFromDag,
     toDag: scriptToDag,
-    wireKeys: ['script', 'runtime', 'deps', 'timeout'],
+    wireKeys: ['script', 'runtime', 'deps', 'timeout', 'on_timeout', 'with'],
     capabilities: VARIANT_CAPABILITIES.script,
   },
   loop: {
@@ -92,7 +103,7 @@ export const VARIANT_REGISTRY: { [K in VariantId]: VariantRegistryEntry<K> } = {
     defaultData: defaultLoopData,
     fromDag: loopFromDag,
     toDag: loopToDag,
-    wireKeys: ['loop'],
+    wireKeys: ['loop', 'timeout'],
     capabilities: VARIANT_CAPABILITIES.loop,
   },
   approval: {
@@ -103,6 +114,14 @@ export const VARIANT_REGISTRY: { [K in VariantId]: VariantRegistryEntry<K> } = {
     wireKeys: ['approval'],
     capabilities: VARIANT_CAPABILITIES.approval,
   },
+  wait: {
+    label: 'Wait',
+    defaultData: defaultWaitData,
+    fromDag: waitFromDag,
+    toDag: waitToDag,
+    wireKeys: ['wait'],
+    capabilities: VARIANT_CAPABILITIES.wait,
+  },
   cancel: {
     label: 'Cancel',
     defaultData: defaultCancelData,
@@ -112,6 +131,28 @@ export const VARIANT_REGISTRY: { [K in VariantId]: VariantRegistryEntry<K> } = {
     capabilities: VARIANT_CAPABILITIES.cancel,
   },
 };
+
+const OPAQUE_LABELS: Record<OpaqueKind, string> = {
+  loop_group: 'Loop group',
+  workflow: 'Workflow',
+  include: 'Include',
+};
+
+const OPAQUE_CAPABILITIES: VariantCapabilities = { honorsAiFields: false };
+
+/** Badge label for any builder node, read-only ones included. */
+export function nodeLabel(node: BuilderNode): string {
+  return node.variant === 'opaque'
+    ? OPAQUE_LABELS[node.data.kind]
+    : VARIANT_REGISTRY[node.variant].label;
+}
+
+/** Capability flags for any builder node, read-only ones included. */
+export function nodeCapabilities(node: BuilderNode): VariantCapabilities {
+  return node.variant === 'opaque'
+    ? OPAQUE_CAPABILITIES
+    : VARIANT_REGISTRY[node.variant].capabilities;
+}
 
 /**
  * Build the variant-specific data for a given variant from a partitioned wire
@@ -130,12 +171,16 @@ export function variantDataFromDag(
  * on the discriminant lets `node.data` narrow to the matching `toDag` parameter
  * type — no casts, no `any`.
  */
-export function nodeDataToDag(node: BuilderNode): Partial<WireDagNode> {
+export function nodeDataToDag(node: BuilderNode): BuilderDagFragment {
   switch (node.variant) {
+    case 'opaque':
+      return node.data.fields;
     case 'loop':
       return loopToDag(node.data);
     case 'approval':
       return approvalToDag(node.data);
+    case 'wait':
+      return waitToDag(node.data);
     case 'cancel':
       return cancelToDag(node.data);
     case 'script':

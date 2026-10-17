@@ -1,0 +1,236 @@
+---
+title: Build a community provider
+description: Publish an agent provider as an independently installed process plugin.
+---
+
+Community providers ship from their authors' repositories as optional plugins. They
+attach through the provider contract without an import in Archon's registry. Claude,
+Codex, and Pi remain maintained in this repository. The bundled OpenCode and Copilot
+providers remain deprecated until community owners publish replacements.
+
+## Implement the provider contract
+
+Implement `IAgentProvider` from `@archon/provider-contract`. Its source and
+[contract README](https://github.com/coleam00/Archon/blob/dev/packages/provider-contract/README.md)
+own the interface and stream rules. A provider supplies its id, capabilities, a
+`sendQuery` stream, and `checkCredential`; `resolveCredentialModel` is optional.
+Preserve the runtime's native user settings, authentication, and project guidance.
+
+A successful stream yields provider events, a `result`, then `settled` only after all
+observed work ends. Report usage once. Include the native session id when declaring
+session resume. Carry failures through the typed failure class; do not classify free
+prose with keyword matching. Cancellation must stop the provider's own work and must
+not manufacture `settled`.
+
+Capabilities are promises. Declare only what the implementation enforces. A node
+naming unsupported skills, plugins, or MCP servers fails before spend. A provider that
+supports those capabilities must suppress ambient capabilities and load exactly the
+ones the node names, while preserving unrelated native configuration and guidance.
+`backgroundWork: 'reported'` requires observable task lifecycles; `none` means verified
+absence, and `unobserved` means work may exist without lifecycle visibility.
+
+A provider that loads named skills only from its own directories declares them in the
+descriptor's optional `skillDiscovery`: `project` roots relative to the working
+directory, `user` roots relative to the user directory, and an optional
+`userDirectory: { env, home }` naming the environment variable that overrides it and
+its home-relative fallback. Such a provider must refuse a named skill whose directory
+exists but is not loadable from its enabled roots, and workflow validation reports that
+case as an error. With the `settingSources` capability, the `project` and `user` setting
+sources gate those roots. A provider without `skillDiscovery` is validated against
+Archon's shared skill roots, and a missing skill is only a warning.
+
+A request's `systemPrompt` uses the provider's native system-instruction behavior (Copilot appends to its foundation prompt). Its
+`appendSystemPrompt` adds instructions to that prompt; a provider that cannot extend
+its prompt uses them as its system prompt, and a `systemPrompt` takes precedence.
+
+## Streaming event mapping
+
+Each runtime reports its own event types, and the provider maps them to the contract's chunks. The maintained providers own the full mapping, including interrupted tool calls, subtasks, hooks, MCP status and tool-output limits.
+
+**Claude Code SDK** ([`packages/providers/src/claude/provider.ts`](https://github.com/coleam00/Archon/blob/dev/packages/providers/src/claude/provider.ts)):
+
+Assistant text becomes `agent_message_chunk`; tool use becomes `tool_call`. The provider reports the turn's `result` separately from completion of background work. It tracks visible tasks and live background tasks from the SDK's lifecycle events. An idle notification ends the turn only after a result has been observed and both task sets are empty. A running notification resets the result condition for the next turn.
+
+If the stream closes while observed work remains, or before reaching idle after background work was observed, it ends without `settled`. Once those settlement conditions hold, a stream that closes without a result produces a failure result (`stream_ended_without_result`), then `settled`. An early idle notification alone produces neither completion nor failure.
+
+**Codex app-server** ([`packages/providers/src/codex/provider.ts`](https://github.com/coleam00/Archon/blob/dev/packages/providers/src/codex/provider.ts)): Archon speaks Codex's JSON-RPC protocol over stdio, one `codex app-server` process per turn.
+
+`streamTurn` maps parent-thread messages and foreground tools to provider events. The parent's `turn/completed` notification produces its successful `result`, but background work can still be live. Failure results wait until observed background work drains because the executor stops reading on failure; failure classification uses the typed `codexErrorInfo`.
+
+Subagents and unified-exec processes report separate `subtask` lifecycles. The provider tracks starts for the parent thread and turn, registers subagent threads, and tracks further subagents and processes on those recognized descendant threads. Child replies do not replace the parent result.
+
+While any observed task remains live, the provider keeps accepting background starts, including root subagents and unified-exec processes first observed after parent completion. Nested work is also drained, even after its direct parent task ends. Notification arrival order does not establish when the work began.
+
+Once the parent has completed and the observed task set is empty, the provider stops reading notifications and shuts down the app-server. This can happen immediately at parent completion if no background work was observed. Starts beyond that observation boundary are not guaranteed to be consumed; the boundary does not establish that Codex cannot report another start later.
+
+`sendQuery` emits `settled` only after a clean app-server shutdown and without lost observation. A late start observed while draining can therefore extend the wait. If the connection closes before observed work drains, the turn does not settle: before a result, the provider reports a failure result; after a result, it logs the connection failure and ends without `settled`.
+
+## Serve it over stdio
+
+Wrap the implementation with the contract's plugin entrypoint:
+
+```ts
+import { serveProvider, PROVIDER_PLUGIN_PROTOCOL, type ProviderPluginDescriptor } from '@archon/provider-contract/plugin';
+import { ExampleProvider } from './provider';
+import { capabilities } from './capabilities';
+
+const descriptor: ProviderPluginDescriptor = {
+  protocol: PROVIDER_PLUGIN_PROTOCOL,
+  id: 'example',
+  displayName: 'Example provider',
+  version: '1.0.0',
+  capabilities,
+  credentials: { kind: 'static', specs: [] },
+  configSchema: {
+    type: 'object',
+    properties: { model: { type: 'string' } },
+    additionalProperties: false,
+  },
+};
+
+await serveProvider({ descriptor, create: () => new ExampleProvider() });
+```
+
+`capabilities` must provide the full `ProviderCapabilities` shape. The descriptor's
+`configSchema` is the fallback for all configuration scopes within protocol 2. Protocol-1
+plugins and hosts must update to protocol 2 before they can initialize together.
+Runtime discovery reports and skips incompatible or unusable installed receipts,
+including providers with mismatched executable identities or missing executable ownership,
+leaving other plugins available. Use `archon plugin update <id>` or `archon plugin remove <id>` to
+repair the install. A provider can
+add `config: { install, run, snapshot, stripUnknownKeys? }` to use separate JSON
+Schemas for install defaults, per-run settings, and persisted snapshots. Newer hosts
+prefer `config`. Generate these schemas from the same schemas used by the in-process
+parser, using `z.toJSONSchema(schema, { io: 'input' })` for Zod schemas. Set
+`stripUnknownKeys: true` to strip undeclared fields recursively where object member
+rules omit `additionalProperties`. Unconstrained schemas such as `{}` preserve object
+contents. Explicit `additionalProperties: false` still rejects
+unknown fields; `true` or a schema preserves allowed fields, including record keys.
+Snapshot projection retains fields declared by the snapshot schema, including
+referenced schemas, all `allOf` conjuncts, the selected `anyOf` or `oneOf` alternative,
+and matching `patternProperties`.
+An explicit `additionalProperties: false` also rejects unknown snapshot fields.
+For snapshots that validate install settings before excluding them, use
+`snapshotConfigSchema(portableFields, localFields)` from `@archon/provider-contract`.
+It generates a strict input schema and marks the local fields `writeOnly: true`;
+newer hosts validate those fields before omitting them from the snapshot output.
+
+JSON Schema does not encode Zod string transforms. Use
+`normalizedConfigString(stringSchema, 'trim')` to trim a config string or
+`normalizedConfigString(stringSchema, 'slash-separated')` to trim the two sides of
+the first slash in a structured reference. These helpers generate the
+`x-archon-normalize` annotation and the matching in-process transform from one
+owner. Scoped process registration applies normalization after validation. Credential lookup has only a model: alternative run branches must agree on its normalization, or lookup returns no vendor.
+
+
+Keep `configSchema` as the fallback schema for install, run, and snapshot when
+`config` is omitted. This fallback is part of protocol 2; it does not provide
+compatibility with protocol-1 peers. Providers that need scoped snapshot exclusion,
+recursive stripping, or normalization annotations must declare scoped `config`
+schemas and require a host version that supports those semantics.
+
+Credentials are a static
+list of vendor specs; declare only vendors the provider consumes. API-key vendors must
+have an existing Archon delivery rule. With one vendor, all models use it. With several,
+model-only lookup uses the `model` field rule from the descriptor's run schema
+(`config.run`, else `configSchema`), following root references and composition. It validates
+and normalizes that field without validating unrelated run fields or root constraints.
+The text before the first `/` selects a declared vendor after credential alias
+normalization; a model rejected by its field rule selects none. An empty list uses native auth.
+`checkCredential` returns `CredentialStatus` for doctor and run preflight, and receives
+its environment and abort signal from Archon. Return `not_checked` when the runtime
+cannot check without spending on a session.
+
+Optional `IAgentProvider.diagnose({ assistantConfig, signal })` and `listModels({ signal })` hooks
+serve information to hosts through `_archon/diagnose` and `_archon/list_models`.
+Diagnostics return `{ checks: [{ id, label, status, message, remedy? }] }`, with
+`status` one of `ok`, `warn`, `fail`, or `skip`. Model lists return
+`{ models: [{ id, label? }] }`. These hooks do not prompt or change configuration. The caller owns the deadline; both hooks receive an abort signal. A process-backed call stops its plugin process on cancellation.
+An unsupported hook returns JSON-RPC `-32601`; it does not report an empty successful
+result. Diagnostic messages and remedies must never include credentials, tokens, or
+user message text. The host withholds plugin stderr and plugin-controlled errors.
+
+The wire uses ACP v1's `initialize`, `session/new`, `session/prompt`, and
+`session/cancel` lifecycle, with unchanged `ProviderChunk` values in `_archon/chunk`
+notifications. Stdout is exclusively newline-delimited JSON-RPC. Native tool specifications
+travel in the session request; `_archon/tool_call` invokes the host handler and returns
+its text result. Calls require a live, unsettled session. Dynamic credential catalogs
+and mid-run permission requests remain unsupported. A dynamic catalog is rejected.
+`_archon/log` carries structured metadata logs (`level`, `msg`, JSON `bindings`).
+`serveProvider` supplies an awaitable log sink to `create(log)`; `connectProvider` accepts
+an `onLog` callback. Log metadata only, never credentials, tokens, or message text.
+The process host logs a fixed `provider.plugin.log` event at the supplied severity
+through `provider.<id>`, using its own descriptor id. The only plugin value it forwards
+is `bindings.failureClass`, and only when it is one of the contract's failure classes;
+the host drops a record without one. Plugin `msg`, module identity, and all other
+bindings are withheld: any plugin-chosen string, even one that looks like a machine
+token, can carry a credential.
+Container requests carry their optional `env` bag as session data while the plugin
+process retains the host environment.
+This is an Archon provider protocol, not a generic plain-ACP adapter.
+
+The language-neutral definitions are in
+[`packages/provider-contract/schema/provider-contract.schema.json`](https://github.com/coleam00/Archon/blob/dev/packages/provider-contract/schema/provider-contract.schema.json).
+They include the descriptor, lifecycle, request, and chunk schemas. Non-TypeScript
+authors can implement that wire directly. npm publication waits for the versioned SDK;
+until then, vendor the contract package or implement the generated schema.
+
+## Prove conformance
+
+Use `runProviderConformance` from `@archon/provider-contract/conformance` with fixture
+turns and the declared capabilities. Include typed failure cases, structured output,
+session handoff, and observable background cases for every capability claimed. Use
+`checkCredentialStatuses` to exercise native credential states.
+
+Run the same suite in process and against the executable. A binary connection uses
+`connectProvider` with the child's stdio streams:
+
+```ts
+import { spawn } from 'node:child_process';
+import { Readable, Writable } from 'node:stream';
+import { connectProvider } from '@archon/provider-contract/plugin';
+import { runProviderConformance } from '@archon/provider-contract/conformance';
+
+const child = spawn('/absolute/path/archon-provider-example', [], {
+  stdio: ['pipe', 'pipe', 'inherit'],
+});
+const closed = new Promise(resolve => child.once('close', resolve));
+const client = await connectProvider({
+  readable: Readable.toWeb(child.stdout),
+  writable: Writable.toWeb(child.stdin),
+});
+try {
+  const failures = await runProviderConformance({
+    capabilities: client.getCapabilities(),
+    turns: [{ name: 'turn', run: () => client.sendQuery('hello', process.cwd()) }],
+    failureCases: [
+      {
+        name: 'auth',
+        expected: 'auth',
+        // Vendor text the typed failure's evidence must keep.
+        evidence: 'HTTP 401',
+        // A fixture prompt your executable answers with a vendor auth failure.
+        run: () => client.sendQuery('failure', process.cwd()),
+      },
+    ],
+  });
+  if (failures.length) throw new Error(failures.join('\n'));
+} finally {
+  await client.close();
+  await closed;
+}
+```
+
+Add the capability-specific fixtures your implementation needs. Compare the chunks
+with in-process output, and test cancellation with real descendants. Keep credentials
+and user-message contents out of diagnostics. See the deterministic test provider in
+`packages/provider-contract/src/fixtures/test-provider/` for the basic transport proof.
+
+## Publish and install
+
+Follow [Publish a plugin](/guides/publishing-plugins/#provider-plugins) for the manifest,
+release assets, checksums, environment policy, and install commands. The manifest
+executable must be `archon-provider-<descriptor id>`. Installation is the trust boundary:
+the plugin runs as the operator's user with the same environment policy as in-process
+providers. After installation, set `provider: <id>` in the workflow. Restart a running
+server to load changed receipts; hot registration is outside this contract.

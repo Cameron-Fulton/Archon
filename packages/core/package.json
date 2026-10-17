@@ -1,11 +1,16 @@
 {
   "name": "@archon/core",
-  "version": "0.9.0",
+  "version": "0.12.1",
   "type": "module",
   "main": "./src/index.ts",
   "types": "./src/index.ts",
   "exports": {
     ".": "./src/index.ts",
+    "./providers/register-host-providers": "./src/providers/register-host-providers.ts",
+    "./providers/load-provider-plugins": "./src/providers/load-provider-plugins.ts",
+    "./providers/inspect-provider-plugin": "./src/providers/inspect-provider-plugin.ts",
+    "./providers/process-registration": "./src/providers/process-registration.ts",
+    "./effort": "./src/effort.ts",
     "./types": "./src/types/index.ts",
     "./db": "./src/db/index.ts",
     "./db/*": "./src/db/*.ts",
@@ -17,29 +22,40 @@
     "./orchestrator": "./src/orchestrator/orchestrator.ts",
     "./handlers": "./src/handlers/command-handler.ts",
     "./config": "./src/config/index.ts",
-    "./config/resolve-assistant": "./src/config/resolve-assistant.ts",
+    "./config/run-config-handoff": "./src/config/run-config-handoff.ts",
     "./utils/*": "./src/utils/*.ts",
     "./services/*": "./src/services/*.ts",
     "./state/*": "./src/state/*.ts",
     "./schemas": "./src/schemas/index.ts",
-    "./schemas/*": "./src/schemas/*.ts"
+    "./schemas/*": "./src/schemas/*.ts",
+    "./platforms/chat-plugins": "./src/platforms/chat-plugins.ts",
+    "./platforms/registry": "./src/platforms/registry.ts",
+    "./platforms/types": "./src/platforms/types.ts",
+    "./github-auth/config": "./src/github-auth/config.ts",
+    "./handlers/clone": "./src/handlers/clone.ts",
+    "./config/config-loader": "./src/config/config-loader.ts",
+    "./config/store-selection": "./src/config/store-selection.ts"
   },
   "scripts": {
-    "test": "bun test src/handlers/command-handler.test.ts && bun test src/handlers/clone.test.ts && bun test src/db/adapters/postgres.test.ts && bun test src/db/bundled-schema.test.ts && bun test src/db/connection.test.ts && bun test src/db/migration-statement-order.test.ts src/db/adapters/sqlite.test.ts src/db/codebases.test.ts src/db/conversations.test.ts src/db/env-vars.test.ts src/db/isolation-environments.test.ts src/db/messages.test.ts src/db/sessions.test.ts src/db/users.test.ts src/db/workflow-events.test.ts src/db/workflow-node-sessions.test.ts src/db/workflows.test.ts src/utils/defaults-copy.test.ts src/utils/worktree-sync.test.ts src/utils/conversation-lock.test.ts src/utils/delivery-dedup.test.ts src/utils/credential-sanitizer.test.ts src/utils/port-allocation.test.ts src/utils/error.test.ts src/utils/error-formatter.test.ts src/utils/github-graphql.test.ts src/config/ src/state/ && bun test src/utils/token-crypto.test.ts && bun test src/db/workflows.resume-cas.integration.test.ts && bun test src/db/workflow-events.since.integration.test.ts && bun test src/db/messages.order.integration.test.ts && bun test src/db/isolation-environments.metadata.integration.test.ts && bun test src/utils/path-validation.test.ts && bun test src/services/cleanup-service.test.ts && bun test src/services/title-generator.test.ts && bun test src/workflows/ && bun test src/operations/workflow-operations.test.ts && bun test src/operations/isolation-operations.test.ts && bun test src/orchestrator/manage-run-tool.test.ts && bun test src/orchestrator/orchestrator.test.ts && bun test src/orchestrator/orchestrator-agent.test.ts && bun test src/orchestrator/post-message-reminder.test.ts && bun test src/orchestrator/orchestrator-isolation.test.ts && bun test src/github-auth/auth.test.ts && bun test src/db/user-github-token-store.test.ts && bun test src/github-auth/device-flow.test.ts && bun test src/github-auth/config.test.ts && bun test src/github-auth/connect-service.test.ts && bun test src/github-auth/credential-helper-install.test.ts && bun test src/db/user-provider-key-store.test.ts && bun test src/db/user-ai-prefs-store.test.ts && bun test src/credentials/connect-service.test.ts && bun test src/credentials/oauth-bridge.test.ts && bun test src/credentials/config.test.ts src/credentials/delivery.test.ts src/credentials/openai-oauth.test.ts src/credentials/catalog.test.ts",
+    "test": "bun run ../../scripts/package-tests.ts",
     "type-check": "bun x tsc --noEmit",
     "build": "echo 'No build needed - Bun runs TypeScript directly'"
   },
+  "testConcurrency": 2,
   "dependencies": {
+    "@archon/plugin-manifest": "workspace:*",
     "@archon/git": "workspace:*",
     "@archon/isolation": "workspace:*",
     "@archon/paths": "workspace:*",
+    "@archon/provider-contract": "workspace:*",
     "@archon/providers": "workspace:*",
     "@archon/workflows": "workspace:*",
     "@hono/zod-openapi": "^1.4.0",
     "@octokit/auth-app": "^8.0.0",
     "@octokit/rest": "^22.0.0",
     "pg": "^8.11.0",
-    "zod": "^4.4.3"
+    "zod": "^4.4.3",
+    "@archon/chat-contract": "workspace:*"
   },
   "devDependencies": {
     "@types/pg": "^8.11.0",

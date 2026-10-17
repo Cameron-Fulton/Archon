@@ -1,0 +1,413 @@
+/**
+ * Independently enumerate expected tests so omissions in declarations or discovery fail.
+ * Bun module mocks are process-global; execution and inventory share one group resolver.
+ */
+import { describe, test } from 'bun:test';
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { join, relative, resolve } from 'node:path';
+import ts from 'typescript';
+import { resolvePackageTestGroups } from './package-test-groups';
+import { ROOT_TEST_PLAN } from './repo-tests';
+
+interface InventoryMismatch {
+  packageName: string;
+  manifestPath: string;
+  missingTests: string[];
+  staleSelectors: string[];
+  unsupportedDeclarations: string[];
+}
+
+interface SelectorParseResult {
+  selectors: string[];
+  unsupportedDeclarations: string[];
+}
+
+const REPO_ROOT = join(import.meta.dir, '..');
+const PACKAGES_DIR = join(REPO_ROOT, 'packages');
+/** Every workspace sits at `packages/<name>`, so the runner path is the same for all of them. */
+const PACKAGE_TEST_RUNNER = 'bun run ../../scripts/package-tests.ts';
+/** The root script must be the runner that walks `ROOT_TEST_PLAN`, or this guard reads a plan nothing executes. */
+const ROOT_TEST_RUNNER = 'bun run scripts/repo-tests.ts';
+const TEST_FILE_PATTERN = /\.(?:test|spec)\.tsx?$/;
+const TRACKED_TEST_PATTERNS = ['*.test.ts', '*.spec.ts', '*.test.tsx', '*.spec.tsx'];
+
+function normalizePath(path: string): string {
+  return path.replaceAll('\\', '/');
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function listFiles(directory: string): string[] {
+  return readdirSync(directory, { withFileTypes: true })
+    .flatMap((entry): string[] => {
+      const path = join(directory, entry.name);
+      return entry.isDirectory() ? listFiles(path) : [path];
+    })
+    .sort();
+}
+
+function readPackageManifest(manifestPath: string): {
+  name: string | undefined;
+  testScript: string | undefined;
+  testGroups: unknown;
+  workspaces: string[] | undefined;
+} {
+  const parsed: unknown = JSON.parse(readFileSync(manifestPath, 'utf8'));
+  if (!isRecord(parsed)) {
+    throw new Error(`${normalizePath(relative(REPO_ROOT, manifestPath))} is not a JSON object`);
+  }
+
+  const scripts = isRecord(parsed.scripts) ? parsed.scripts : undefined;
+  return {
+    name: typeof parsed.name === 'string' ? parsed.name : undefined,
+    testScript: typeof scripts?.test === 'string' ? scripts.test : undefined,
+    testGroups: parsed.testGroups,
+    workspaces:
+      Array.isArray(parsed.workspaces) &&
+      parsed.workspaces.every(value => typeof value === 'string')
+        ? parsed.workspaces
+        : undefined,
+  };
+}
+
+function readRootWorkspaces(): string[] {
+  const manifest = readPackageManifest(join(REPO_ROOT, 'package.json'));
+  if (manifest.testScript?.trim() !== ROOT_TEST_RUNNER) {
+    throw new Error(
+      `The root package.json must set scripts.test to "${ROOT_TEST_RUNNER}" so ROOT_TEST_PLAN is what runs`
+    );
+  }
+  if (manifest.workspaces === undefined) {
+    throw new Error('The root package.json does not define string-array workspaces');
+  }
+  return manifest.workspaces;
+}
+
+function sourceSelectors(testScript: string | undefined): SelectorParseResult {
+  if (testScript === undefined) return { selectors: [], unsupportedDeclarations: [] };
+
+  const selectors: string[] = [];
+  const unsupportedDeclarations: string[] = [];
+  for (const command of testScript.split('&&')) {
+    const trimmedCommand = command.trim();
+    const tokens = trimmedCommand.split(/\s+/);
+    if (tokens[0] !== 'bun' || tokens[1] !== 'test') {
+      unsupportedDeclarations.push(trimmedCommand);
+      continue;
+    }
+
+    const args = tokens.slice(2);
+    const firstUnsupported = args.findIndex((token): boolean => !token.startsWith('src/'));
+    const supportedSelectors = firstUnsupported === -1 ? args : args.slice(0, firstUnsupported);
+    selectors.push(...supportedSelectors);
+
+    if (args.length === 0 || firstUnsupported !== -1) {
+      unsupportedDeclarations.push(trimmedCommand);
+    }
+  }
+
+  return {
+    selectors: selectors.sort(),
+    unsupportedDeclarations,
+  };
+}
+
+function packageTestSelectors(
+  manifest: { testScript: string | undefined; testGroups: unknown },
+  packageDirectory: string
+): SelectorParseResult {
+  const runsSharedRunner = manifest.testScript?.trim() === PACKAGE_TEST_RUNNER;
+  if (runsSharedRunner) {
+    try {
+      const selectors = resolvePackageTestGroups(packageDirectory, manifest).flat();
+      return {
+        selectors: selectors.filter(selector => selector.startsWith('src/')),
+        unsupportedDeclarations: selectors.filter(selector => !selector.startsWith('src/')),
+      };
+    } catch (error) {
+      return { selectors: [], unsupportedDeclarations: [String(error)] };
+    }
+  }
+  if (manifest.testGroups !== undefined) {
+    return {
+      selectors: [],
+      unsupportedDeclarations: [
+        `declares testGroups but scripts.test is not "${PACKAGE_TEST_RUNNER}"`,
+      ],
+    };
+  }
+  return sourceSelectors(manifest.testScript);
+}
+
+/** Paths the root plan tests itself, rather than delegating to a workspace. */
+const ROOT_TEST_SELECTORS = ROOT_TEST_PLAN.flatMap((step): readonly string[] =>
+  step.kind === 'root' ? step.selectors : []
+);
+/** The `workspaces` step runs every package the `workspace` steps do not, so together they run all. */
+const ROOT_PLAN_RUNS_WORKSPACE_TESTS = ROOT_TEST_PLAN.some(
+  (step): boolean => step.kind === 'workspaces'
+);
+
+function selectorCollects(selector: string, testPath: string, baseDirectory: string): boolean {
+  const selectorPath = normalizePath(
+    relative(REPO_ROOT, resolve(baseDirectory, selector.replace(/^\.\//, '')))
+  ).replace(/\/$/, '');
+  return testPath === selectorPath || testPath.startsWith(`${selectorPath}/`);
+}
+
+function trackedTests(): string[] {
+  const result = Bun.spawnSync(['git', 'ls-files', '-z', '--', ...TRACKED_TEST_PATTERNS], {
+    cwd: REPO_ROOT,
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  if (result.exitCode !== 0) {
+    throw new Error(`Could not list tracked tests:\n${result.stderr.toString()}`);
+  }
+  return result.stdout
+    .toString()
+    .split('\0')
+    .filter((path): boolean => path.length > 0)
+    .map(normalizePath)
+    .sort();
+}
+
+function matchesWorkspacePattern(directory: string, pattern: string): boolean {
+  const directorySegments = normalizePath(directory).split('/');
+  const patternSegments = normalizePath(pattern).replace(/^\.\//, '').split('/');
+  return (
+    directorySegments.length === patternSegments.length &&
+    patternSegments.every(
+      (segment, index): boolean => segment === '*' || segment === directorySegments[index]
+    )
+  );
+}
+
+function packageDirectoryForTest(
+  testPath: string,
+  workspacePatterns: string[]
+): string | undefined {
+  const [directory, packageName] = testPath.split('/');
+  if (directory !== 'packages' || packageName === undefined) return undefined;
+
+  const workspaceDirectory = `${directory}/${packageName}`;
+  if (!workspacePatterns.some(pattern => matchesWorkspacePattern(workspaceDirectory, pattern))) {
+    return undefined;
+  }
+
+  const packageDirectory = join(PACKAGES_DIR, packageName);
+  return existsSync(join(packageDirectory, 'package.json')) ? packageDirectory : undefined;
+}
+
+export function isCollectedByRepositoryTest(
+  testPath: string,
+  rootSelectors: readonly string[],
+  workspacePatterns: string[],
+  workspaceTestsRun: boolean,
+  packageSelectors: Map<string, string[]>
+): boolean {
+  if (rootSelectors.some((selector): boolean => selectorCollects(selector, testPath, REPO_ROOT))) {
+    return true;
+  }
+  if (!workspaceTestsRun) return false;
+
+  const packageDirectory = packageDirectoryForTest(testPath, workspacePatterns);
+  if (packageDirectory === undefined) return false;
+
+  let selectors = packageSelectors.get(packageDirectory);
+  if (selectors === undefined) {
+    selectors = packageTestSelectors(
+      readPackageManifest(join(packageDirectory, 'package.json')),
+      packageDirectory
+    ).selectors;
+    packageSelectors.set(packageDirectory, selectors);
+  }
+  return selectors.some((selector): boolean =>
+    selectorCollects(selector, testPath, packageDirectory)
+  );
+}
+
+export function inspectPackage(packageDirectory: string): InventoryMismatch | undefined {
+  const manifestPath = join(packageDirectory, 'package.json');
+  const sourceDirectory = join(packageDirectory, 'src');
+  if (!existsSync(manifestPath)) return undefined;
+
+  const tests = existsSync(sourceDirectory)
+    ? listFiles(sourceDirectory)
+        .filter((path): boolean => TEST_FILE_PATTERN.test(path))
+        .map((path): string => normalizePath(relative(packageDirectory, path)))
+    : [];
+
+  const manifest = readPackageManifest(manifestPath);
+  const { selectors, unsupportedDeclarations } = packageTestSelectors(manifest, packageDirectory);
+  const selectedTests = new Set<string>();
+  const staleSelectors: string[] = [];
+
+  for (const selector of selectors) {
+    const absoluteSelector = resolve(packageDirectory, selector);
+    if (!existsSync(absoluteSelector)) {
+      staleSelectors.push(selector);
+      continue;
+    }
+
+    if (statSync(absoluteSelector).isDirectory()) {
+      const directoryPrefix = `${normalizePath(relative(packageDirectory, absoluteSelector))}/`;
+      for (const testPath of tests) {
+        if (testPath.startsWith(directoryPrefix)) selectedTests.add(testPath);
+      }
+    } else if (TEST_FILE_PATTERN.test(selector)) {
+      selectedTests.add(normalizePath(selector));
+    }
+  }
+
+  const missingTests = tests.filter((path): boolean => !selectedTests.has(path));
+  if (
+    missingTests.length === 0 &&
+    staleSelectors.length === 0 &&
+    unsupportedDeclarations.length === 0
+  ) {
+    return undefined;
+  }
+
+  return {
+    packageName: manifest.name ?? relative(PACKAGES_DIR, packageDirectory),
+    manifestPath: normalizePath(relative(REPO_ROOT, manifestPath)),
+    missingTests,
+    staleSelectors,
+    unsupportedDeclarations,
+  };
+}
+
+function formatMismatches(mismatches: InventoryMismatch[]): string {
+  const details = mismatches.flatMap((mismatch): string[] => {
+    const lines = [`${mismatch.packageName} (${mismatch.manifestPath})`];
+    if (mismatch.missingTests.length > 0) {
+      lines.push('  Tests missing from scripts.test:');
+      lines.push(...mismatch.missingTests.map((path): string => `    - ${path}`));
+    }
+    if (mismatch.staleSelectors.length > 0) {
+      lines.push('  selectors that do not exist:');
+      lines.push(...mismatch.staleSelectors.map((path): string => `    - ${path}`));
+    }
+    if (mismatch.unsupportedDeclarations.length > 0) {
+      lines.push('  test declarations this inventory cannot read:');
+      lines.push(...mismatch.unsupportedDeclarations.map((entry): string => `    - ${entry}`));
+    }
+    return lines;
+  });
+
+  return [
+    'Package test inventory is out of sync.',
+    ...details,
+    'Add each test to a compatible Bun batch or cover it with a directory selector; remove stale selectors.',
+    `Declare package tests either as an explicit \`bun test <src selectors>\` chain in scripts.test, or with scripts.test set to "${PACKAGE_TEST_RUNNER}", with optional legacy testGroups; otherwise src tests are discovered, so execution and inventory agree.`,
+    'Keep separate `bun test` invocations where `mock.module()` factories conflict.',
+  ].join('\n');
+}
+
+describe('package test inventory', () => {
+  test('every TypeScript test is selected by its package test script', () => {
+    const mismatches = readdirSync(PACKAGES_DIR, { withFileTypes: true })
+      .filter((entry): boolean => entry.isDirectory())
+      .sort((left, right): number => left.name.localeCompare(right.name))
+      .map((entry): InventoryMismatch | undefined => inspectPackage(join(PACKAGES_DIR, entry.name)))
+      .filter((mismatch): mismatch is InventoryMismatch => mismatch !== undefined);
+
+    if (mismatches.length > 0) throw new Error(formatMismatches(mismatches));
+  });
+});
+
+describe('repository test inventory', () => {
+  test('every tracked TypeScript test is selected by bun run test', () => {
+    const workspaces = readRootWorkspaces();
+    const packageSelectors = new Map<string, string[]>();
+    const uncollectedTests = trackedTests().filter(
+      (testPath): boolean =>
+        !isCollectedByRepositoryTest(
+          testPath,
+          ROOT_TEST_SELECTORS,
+          workspaces,
+          ROOT_PLAN_RUNS_WORKSPACE_TESTS,
+          packageSelectors
+        )
+    );
+
+    if (uncollectedTests.length > 0) {
+      throw new Error(
+        [
+          'Tracked TypeScript tests are not collected by bun run test:',
+          ...uncollectedTests.map((path): string => `  - ${path}`),
+          'Add each path to a repository test command.',
+        ].join('\n')
+      );
+    }
+  });
+});
+
+describe('compiler test inventory', () => {
+  /**
+   * Resolves the project's root files the way `tsc` does, in process. Every expected file
+   * reaches the program through the project's `include`, so the resolved root set answers
+   * the question without spawning `tsc` to parse the whole program, a cold run a loaded
+   * Windows runner could not finish inside the test budget.
+   */
+  function expectProgramToInclude(packageName: string, expectedFiles: string[]): void {
+    const projectPath = join(REPO_ROOT, 'packages', packageName, 'tsconfig.json');
+    const configErrors: ts.Diagnostic[] = [];
+    const parsed = ts.getParsedCommandLineOfConfigFile(projectPath, undefined, {
+      ...ts.sys,
+      onUnRecoverableConfigFileDiagnostic: diagnostic => configErrors.push(diagnostic),
+    });
+    const errors = [...configErrors, ...(parsed?.errors ?? [])];
+    if (parsed === undefined || errors.length > 0) {
+      throw new Error(
+        `Could not read the ${packageName} TypeScript project:\n${errors
+          .map(error => ts.flattenDiagnosticMessageText(error.messageText, '\n'))
+          .join('\n')}`
+      );
+    }
+
+    const programFiles = new Set(parsed.fileNames.map(normalizePath));
+    const missingFiles = expectedFiles.filter(
+      (expectedFile): boolean => !programFiles.has(normalizePath(expectedFile))
+    );
+
+    if (missingFiles.length > 0) {
+      throw new Error(
+        `The normal ${packageName} TypeScript project did not include:\n${missingFiles.join('\n')}`
+      );
+    }
+  }
+
+  test("core's normal TypeScript project includes test files", () => {
+    expectProgramToInclude('core', [
+      join(REPO_ROOT, 'packages', 'core', 'src', 'utils', 'conversation-lock.test.ts'),
+    ]);
+  });
+
+  test("adapters' normal TypeScript project includes its own and imported core test files", () => {
+    expectProgramToInclude('adapters', [
+      join(REPO_ROOT, 'packages', 'adapters', 'src', 'forge', 'github', 'adapter.test.ts'),
+      join(REPO_ROOT, 'packages', 'core', 'src', 'utils', 'conversation-lock.test.ts'),
+    ]);
+  });
+
+  test("server's normal TypeScript project includes its own, core, and adapter test files", () => {
+    expectProgramToInclude('server', [
+      join(REPO_ROOT, 'packages', 'server', 'src', 'routes', 'api.health.test.ts'),
+      join(REPO_ROOT, 'packages', 'core', 'src', 'utils', 'conversation-lock.test.ts'),
+      join(REPO_ROOT, 'packages', 'adapters', 'src', 'forge', 'github', 'adapter.test.ts'),
+    ]);
+  });
+
+  test("cli's normal TypeScript project includes its own, core, adapter, and server test files", () => {
+    expectProgramToInclude('cli', [
+      join(REPO_ROOT, 'packages', 'cli', 'src', 'cli.test.ts'),
+      join(REPO_ROOT, 'packages', 'core', 'src', 'utils', 'conversation-lock.test.ts'),
+      join(REPO_ROOT, 'packages', 'adapters', 'src', 'forge', 'github', 'adapter.test.ts'),
+      join(REPO_ROOT, 'packages', 'server', 'src', 'routes', 'api.health.test.ts'),
+    ]);
+  });
+});

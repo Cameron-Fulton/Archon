@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 
-import { parsePiConfig, resolvePiExtensionSettings } from './config';
+import { InvalidProviderRunConfigError } from '@archon/provider-contract';
+import { parsePiConfig, parsePiConfigStrict, resolvePiExtensionSettings } from './config';
 
 describe('parsePiConfig', () => {
   test('parses valid model string', () => {
@@ -95,8 +96,10 @@ describe('parsePiConfig', () => {
     ).toEqual({ extensionFlags: { plan: true } });
   });
 
-  test('drops extensionFlags when all entries are invalid', () => {
-    expect(parsePiConfig({ extensionFlags: { bogus: 42, nested: {} } })).toEqual({});
+  test('drops every invalid extensionFlags entry', () => {
+    expect(parsePiConfig({ extensionFlags: { bogus: 42, nested: {} } })).toEqual({
+      extensionFlags: {},
+    });
   });
 
   test('drops non-object extensionFlags silently', () => {
@@ -133,8 +136,8 @@ describe('parsePiConfig', () => {
     ).toEqual({ env: { GOOD: 'yes' } });
   });
 
-  test('drops env when all entries are invalid', () => {
-    expect(parsePiConfig({ env: { NUM: 42, NESTED: {} } })).toEqual({});
+  test('drops every invalid env entry', () => {
+    expect(parsePiConfig({ env: { NUM: 42, NESTED: {} } })).toEqual({ env: {} });
   });
 
   test('drops non-object env silently', () => {
@@ -220,7 +223,7 @@ describe('parsePiConfig', () => {
     ).toEqual({ nodes: { implement: { extensionFlags: { plan: false } } } });
   });
 
-  test('drops node entries with nothing valid and non-object entries', () => {
+  test('drops invalid node fields and non-object node entries', () => {
     expect(
       parsePiConfig({
         nodes: {
@@ -231,13 +234,42 @@ describe('parsePiConfig', () => {
           nullish: null,
         },
       })
-    ).toEqual({});
+    ).toEqual({ nodes: { empty: {}, allInvalid: {} } });
   });
 
   test('drops non-object nodes silently', () => {
     expect(parsePiConfig({ nodes: 'implement' })).toEqual({});
     expect(parsePiConfig({ nodes: ['implement'] })).toEqual({});
     expect(parsePiConfig({ nodes: null })).toEqual({});
+  });
+});
+
+describe('parsePiConfigStrict', () => {
+  test('explains that invalid models need a Pi vendor prefix', () => {
+    expect(() => parsePiConfigStrict({ model: 'minimax-m3' }, 'run')).toThrow(
+      "expected a Pi vendor/model reference such as 'minimax/minimax-m3'"
+    );
+  });
+
+  test.each([
+    ['env', { TOKEN: 'secret' }],
+    ['maxConcurrent', 2],
+  ] as const)('accepts process-scoped %s from config.yaml and refuses it per run', (key, value) => {
+    expect(parsePiConfigStrict({ [key]: value }, 'install')).toEqual({ [key]: value });
+    expect(() => parsePiConfigStrict({ [key]: value }, 'run')).toThrow(/process/);
+  });
+
+  test.each([
+    ['env', { TOKEN: 1 }, 'env.TOKEN'],
+    ['maxConcurrent', 0, 'maxConcurrent'],
+    ['maxConcurrent', 1.5, 'maxConcurrent'],
+  ] as const)('rejects a malformed %s in config.yaml', (key, value, field) => {
+    try {
+      parsePiConfigStrict({ [key]: value }, 'install');
+      throw new Error('expected a rejection');
+    } catch (error) {
+      expect((error as InvalidProviderRunConfigError).fieldPath).toBe(field);
+    }
   });
 });
 
@@ -444,4 +476,19 @@ describe('resolvePiExtensionSettings', () => {
       extensionFlags: { plan: true },
     });
   });
+});
+
+test('snapshot scope validates portable settings and excludes process environment and concurrency', () => {
+  const raw = {
+    model: 'openai/gpt',
+    env: { API_KEY: 'secret' },
+    maxConcurrent: 3,
+    enableExtensions: false,
+  };
+  expect(parsePiConfigStrict(raw, 'snapshot')).toEqual({
+    model: 'openai/gpt',
+    enableExtensions: false,
+  });
+  expect(() => parsePiConfigStrict({ env: { API_KEY: 1 } }, 'snapshot')).toThrow();
+  expect(() => parsePiConfigStrict({ model: 'missing-vendor' }, 'snapshot')).toThrow();
 });

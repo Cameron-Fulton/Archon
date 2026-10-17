@@ -1,4 +1,5 @@
-import { describe, it, expect, mock } from 'bun:test';
+import { providerFailureClassSchema } from '@archon/provider-contract';
+import { describe, it, expect, mock, type Mock } from 'bun:test';
 
 // Mock logger before importing module under test
 const mockLogFn = mock(() => {});
@@ -19,18 +20,24 @@ mock.module('@archon/paths', () => ({
 }));
 
 import type { IWorkflowPlatform } from './deps';
+import { nodeFailureKindSchema } from './schemas/node-execution';
 import {
   substituteWorkflowVariables,
   buildPromptWithContext,
-  detectCreditExhaustion,
   detectCompletionSignal,
+  describeUnmetCompletion,
   stripCompletionTags,
   isInlineScript,
   formatSubprocessFailure,
-  classifyError,
-  toTelemetryErrorClass,
+  retainStreamTail,
+  getRetryDelayMs,
+  RATE_LIMIT_RETRY_DELAY_MS,
+  RATE_LIMIT_PAUSE_DELAY_MS,
+  rateLimitResumeAt,
+  aggregateProviderFailure,
+  nodeFailureKindOf,
+  retryClassOf,
   safeSendMessage,
-  type UnknownErrorTracker,
 } from './executor-shared';
 
 describe('substituteWorkflowVariables', () => {
@@ -90,6 +97,114 @@ describe('substituteWorkflowVariables', () => {
       { shellSafe: true, stateDir: '/state/root' }
     );
     expect(prompt).toBe('cat "/state/root/pr-state.json"');
+  });
+
+  // $ADOPTED_RUN_DIR (#2747): resolves only under an explicit adoption; a run
+  // that references it without one throws instead of substituting empty.
+  it('replaces $ADOPTED_RUN_DIR with the adopted run artifact directory', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'Read $ADOPTED_RUN_DIR/report.md',
+      'run-2',
+      'msg',
+      '/tmp/artifacts',
+      'main',
+      'docs/',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { adoptedRunDir: '/root/artifacts/runs/run-1' }
+    );
+    expect(prompt).toBe('Read /root/artifacts/runs/run-1/report.md');
+  });
+
+  it('throws when $ADOPTED_RUN_DIR is referenced without an adoption active', () => {
+    expect(() =>
+      substituteWorkflowVariables(
+        'Read $ADOPTED_RUN_DIR/report.md',
+        'run-2',
+        'msg',
+        '/tmp/artifacts',
+        'main',
+        'docs/'
+      )
+    ).toThrow(/did not adopt a prior run/);
+  });
+
+  it("replaces $TYPED_ARTIFACTS_FILE with this invocation's listing", () => {
+    const { prompt } = substituteWorkflowVariables(
+      'Read $TYPED_ARTIFACTS_FILE',
+      'run-1',
+      'msg',
+      '/tmp/artifacts',
+      'main',
+      'docs/',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { typedArtifactsFile: '/tmp/artifacts/.archon/typed-artifacts/list.json' }
+    );
+    expect(prompt).toBe('Read /tmp/artifacts/.archon/typed-artifacts/list.json');
+  });
+
+  it('replaces $TYPED_ARTIFACTS_FILE even under shellSafe (engine-controlled)', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'cat "$TYPED_ARTIFACTS_FILE"',
+      'run-1',
+      'msg',
+      '/tmp/artifacts',
+      'main',
+      'docs/',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { shellSafe: true, typedArtifactsFile: '/listings/l.json' }
+    );
+    expect(prompt).toBe('cat "/listings/l.json"');
+  });
+
+  it('throws when $TYPED_ARTIFACTS_FILE is referenced without a materialized listing', () => {
+    expect(() =>
+      substituteWorkflowVariables(
+        'Read $TYPED_ARTIFACTS_FILE',
+        'run-1',
+        'msg',
+        '/tmp/artifacts',
+        'main',
+        'docs/'
+      )
+    ).toThrow(/has no typed-artifact listing/);
+  });
+
+  it('treats an explicit empty listing as a caller stating it has none (dry run)', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'Read [$TYPED_ARTIFACTS_FILE]',
+      'run-1',
+      'msg',
+      '/tmp/artifacts',
+      'main',
+      'docs/',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { typedArtifactsFile: '' }
+    );
+    expect(prompt).toBe('Read []');
+  });
+
+  it('leaves the INPUTS_ variable of an input named typed_artifacts_file alone', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'Use $INPUTS_TYPED_ARTIFACTS_FILE',
+      'run-1',
+      'msg',
+      '/tmp/artifacts',
+      'main',
+      'docs/'
+    );
+    expect(prompt).toBe('Use $INPUTS_TYPED_ARTIFACTS_FILE');
   });
 
   it('throws when $STATE_DIR is referenced but no state dir was resolved', () => {
@@ -449,6 +564,24 @@ describe('substituteWorkflowVariables', () => {
     );
     expect(prompt).toBe('cd /tmp/artifacts && git checkout main # run-1 docs/');
   });
+
+  it('inserts every value verbatim, never reading it as a variable or a replacement pattern', () => {
+    const { prompt, contextSubstituted } = substituteWorkflowVariables(
+      '$ARGUMENTS | $INPUTS.plan | $CONTEXT',
+      'run-1',
+      "msg $& $' $INPUTS.plan $CONTEXT",
+      '/tmp',
+      'main',
+      'docs/',
+      'issue $ARGUMENTS',
+      undefined,
+      undefined,
+      undefined,
+      { inputs: { plan: 'plan $ARGUMENTS $$' } }
+    );
+    expect(prompt).toBe("msg $& $' $INPUTS.plan $CONTEXT | plan $ARGUMENTS $$ | issue $ARGUMENTS");
+    expect(contextSubstituted).toBe(true);
+  });
 });
 
 describe('buildPromptWithContext', () => {
@@ -528,64 +661,6 @@ describe('buildPromptWithContext', () => {
   });
 });
 
-describe('detectCreditExhaustion', () => {
-  it('detects "You\'re out of extra usage" (exact SDK phrase)', () => {
-    const result = detectCreditExhaustion("You're out of extra usage · resets in 2h");
-    expect(result).toBe('Credit exhaustion detected — resume when credits reset');
-  });
-
-  it('detects "out of credits" phrase', () => {
-    expect(detectCreditExhaustion('Sorry, you are out of credits.')).not.toBeNull();
-  });
-
-  it('detects "credit balance" phrase', () => {
-    expect(detectCreditExhaustion('Your credit balance is too low.')).not.toBeNull();
-  });
-
-  it('returns null for normal output', () => {
-    expect(detectCreditExhaustion('Here is the investigation summary...')).toBeNull();
-  });
-
-  it('detects "insufficient credit" phrase', () => {
-    expect(detectCreditExhaustion('Insufficient credit to continue.')).not.toBeNull();
-  });
-
-  it('is case-insensitive', () => {
-    expect(detectCreditExhaustion("YOU'RE OUT OF EXTRA USAGE")).not.toBeNull();
-  });
-
-  it('detects "You\'ve hit your session limit" and includes reset time', () => {
-    const result = detectCreditExhaustion(
-      "You've hit your session limit · resets 3am (America/Mexico_City)"
-    );
-    expect(result).not.toBeNull();
-    expect(result).toContain('session limit');
-    expect(result).toContain('3am (America/Mexico_City)');
-  });
-
-  it('returns generic session limit message when no reset time found', () => {
-    const result = detectCreditExhaustion("You've hit your session limit.");
-    expect(result).not.toBeNull();
-    expect(result).toContain('session limit');
-  });
-
-  it('detects "hit your session limit" variant (case-insensitive)', () => {
-    expect(detectCreditExhaustion("YOU'VE HIT YOUR SESSION LIMIT · resets noon")).not.toBeNull();
-  });
-
-  it('detects "session limit reached" variant', () => {
-    const result = detectCreditExhaustion('session limit reached');
-    expect(result).not.toBeNull();
-    expect(result).toContain('session limit');
-  });
-
-  it('detects "session limit has been reached" variant', () => {
-    const result = detectCreditExhaustion('Session limit has been reached.');
-    expect(result).not.toBeNull();
-    expect(result).toContain('session limit');
-  });
-});
-
 describe('isInlineScript', () => {
   // Named identifiers — should return false
   it('plain identifier is not inline', () => {
@@ -636,6 +711,15 @@ describe('isInlineScript', () => {
 });
 
 describe('detectCompletionSignal', () => {
+  it('treats signal metacharacters literally in XML detection and stripping', () => {
+    const signal = 'DONE.+[x](y)';
+    const output = `<done>${signal}</done>`;
+    const lookalike = '<done>DONEZxxy</done>';
+    expect(detectCompletionSignal(output, signal)).toBe(true);
+    expect(detectCompletionSignal(lookalike, signal)).toBe(false);
+    expect(stripCompletionTags(`Result ${output}`, signal)).toBe('Result');
+    expect(stripCompletionTags(lookalike, signal)).toBe(lookalike);
+  });
   it('detects <promise>SIGNAL</promise> format', () => {
     expect(detectCompletionSignal('<promise>COMPLETE</promise>', 'COMPLETE')).toBe(true);
   });
@@ -649,16 +733,34 @@ describe('detectCompletionSignal', () => {
     expect(detectCompletionSignal('<status>DONE</status>', 'DONE')).toBe(true);
   });
 
-  it('detects plain signal at end of output', () => {
-    expect(detectCompletionSignal('Work done. COMPLETE', 'COMPLETE')).toBe(true);
+  it('detects a plain signal as the final standalone line', () => {
+    expect(detectCompletionSignal('Work done.\n  COMPLETE  \n', 'COMPLETE')).toBe(true);
   });
 
-  it('detects plain signal on its own line', () => {
-    expect(detectCompletionSignal('Work done.\nCOMPLETE\nExtra text', 'COMPLETE')).toBe(true);
+  it('detects a plain signal followed by trailing blank lines and whitespace', () => {
+    expect(detectCompletionSignal('Work done.\nCOMPLETE\n\n\n', 'COMPLETE')).toBe(true);
+    expect(detectCompletionSignal('Work done.\nCOMPLETE\n   \n\t\n', 'COMPLETE')).toBe(true);
   });
 
-  it('does not detect signal embedded in prose', () => {
-    expect(detectCompletionSignal('The status is not COMPLETE yet.', 'COMPLETE')).toBe(false);
+  it('detects a plain signal with CRLF line endings', () => {
+    expect(detectCompletionSignal('Work done.\r\nCOMPLETE\r\n', 'COMPLETE')).toBe(true);
+  });
+
+  it('does not detect the live incident shape: a negated mention ending the output', () => {
+    expect(
+      detectCompletionSignal(
+        'the story still has open tasks — T8 is now ready, and T9 remains — so not replying ALL_TASKS_COMPLETE.',
+        'ALL_TASKS_COMPLETE'
+      )
+    ).toBe(false);
+  });
+
+  it('does not detect a plain signal mentioned inline at the end of output', () => {
+    expect(detectCompletionSignal('Work done. COMPLETE', 'COMPLETE')).toBe(false);
+  });
+
+  it('does not detect a negated plain signal at the end of output', () => {
+    expect(detectCompletionSignal('The status is not COMPLETE', 'COMPLETE')).toBe(false);
   });
 
   it('does not detect signal when wrong value is in tags', () => {
@@ -727,16 +829,15 @@ describe('formatSubprocessFailure', () => {
     expect(userMessage).toContain('[exit 2]');
   });
 
-  it('truncates diagnostics larger than 2 KB from the tail', () => {
+  it('keeps the tail of diagnostics larger than 2 KB and bounds the output', () => {
     const big = 'x'.repeat(5000) + '\nactual error at end';
     const { userMessage } = formatSubprocessFailure(
       { message: 'Command failed: cmd\n', stderr: big, code: 1 },
       "Script node 'n1'"
     );
     expect(userMessage).toContain('actual error at end');
-    expect(userMessage).toContain('[truncated]');
-    // Tight bound: ~2 KB diagnostic + label prefix + truncation suffix should fit
-    // well under 2.1 KB. Bumping SUBPROCESS_ERROR_MAX_CHARS would trip this.
+    // Tight bound: ~2 KB diagnostic + label prefix should fit well under 2.1 KB.
+    // Bumping SUBPROCESS_ERROR_MAX_CHARS would trip this.
     expect(userMessage.length).toBeLessThan(2100);
   });
 
@@ -772,6 +873,56 @@ describe('formatSubprocessFailure', () => {
     expect(logFields.stderrTail).toBeUndefined();
   });
 
+  it('uses a stdout tail as the diagnostic when stderr is empty', () => {
+    const err = {
+      message: 'Command failed: bash -c script body\n',
+      stdout: 'targeted test failed on repetition 3/5: bun test foo.test.ts',
+      code: 1,
+    };
+    const { userMessage, logFields } = formatSubprocessFailure(err, "Script node 'n1'");
+    expect(userMessage).not.toContain('no diagnostic output');
+    expect(userMessage).toContain('targeted test failed on repetition 3/5');
+    expect(userMessage).toContain('[exit 1]');
+    expect(logFields.stdoutTail).toBe(err.stdout);
+    expect(logFields.stderrTail).toBeUndefined();
+  });
+
+  it('includes labelled stderr and stdout tails when both streams are populated', () => {
+    const err = {
+      message: 'Command failed: bash -c script body\n',
+      stderr: 'error: assertion failed',
+      stdout: 'progress line before failure',
+      code: 1,
+    };
+    const { userMessage, logFields } = formatSubprocessFailure(err, "Script node 'n1'");
+    expect(userMessage).toContain('[stderr]');
+    expect(userMessage).toContain('error: assertion failed');
+    expect(userMessage).toContain('[stdout]');
+    expect(userMessage).toContain('progress line before failure');
+    expect(logFields.stderrTail).toBe('error: assertion failed');
+    expect(logFields.stdoutTail).toBe('progress line before failure');
+  });
+
+  it('caps stderr and stdout tails jointly under the existing 2 KB budget', () => {
+    const err = {
+      message: 'Command failed: cmd\n',
+      stderr: 'e'.repeat(1200),
+      stdout: 'o'.repeat(5000),
+      code: 1,
+    };
+    const { userMessage, logFields } = formatSubprocessFailure(err, "Script node 'n1'");
+    expect(userMessage.length).toBeLessThan(2100);
+    expect(userMessage).toContain('[stderr]');
+    expect(userMessage).toContain('[stdout]');
+    const { stderrTail, stdoutTail } = logFields;
+    expect(typeof stderrTail).toBe('string');
+    expect(typeof stdoutTail).toBe('string');
+    if (typeof stderrTail !== 'string' || typeof stdoutTail !== 'string')
+      throw new Error('tails missing');
+    expect(stderrTail.length).toBeLessThanOrEqual(1000);
+    expect(stdoutTail.length).toBeLessThanOrEqual(2000 - stderrTail.length);
+  });
+
   it('omits the [exit N] suffix when no code is present', () => {
     const { userMessage } = formatSubprocessFailure({ stderr: 'diagnostic' }, "Script node 'n1'");
     expect(userMessage).not.toContain('[exit');
@@ -779,233 +930,240 @@ describe('formatSubprocessFailure', () => {
   });
 });
 
-describe('classifyError', () => {
-  it('classifies 429 as TRANSIENT', () => {
-    expect(classifyError(new Error('rate limit: 429 too many requests'))).toBe('TRANSIENT');
-  });
-
-  it('classifies 529 as TRANSIENT', () => {
-    expect(classifyError(new Error('HTTP 529 service overloaded'))).toBe('TRANSIENT');
-  });
-
-  it('classifies overloaded messages as TRANSIENT', () => {
-    expect(classifyError(new Error('Minimax: overloaded, try again later'))).toBe('TRANSIENT');
-  });
-
-  it('classifies Codex 503 responses decorated with auth error as TRANSIENT — #2386', () => {
-    expect(
-      classifyError(
-        new Error(
-          "Node 'prime' failed: SDK returned codex_turn_failed — unexpected status 503 Service Unavailable: Service Unavailable, url: https://chatgpt.com/backend-api/codex/responses, cf-ray: ..., auth error: 503, auth error code: biscuit_baker_service_me_circuit_open"
-        )
-      )
-    ).toBe('TRANSIENT');
-  });
-
-  it('classifies Codex model-capacity errors as TRANSIENT — #2425', () => {
-    expect(
-      classifyError(new Error('Selected model is at capacity. Please try a different model.'))
-    ).toBe('TRANSIENT');
-  });
-
-  it('classifies 401 as FATAL', () => {
-    expect(classifyError(new Error('401 unauthorized'))).toBe('FATAL');
-  });
-
-  it('FATAL takes priority over TRANSIENT when both match', () => {
-    expect(classifyError(new Error('unauthorized: exited with code 1'))).toBe('FATAL');
-  });
-
-  it('keeps concrete authentication and quota failures FATAL', () => {
-    expect(classifyError(new Error('auth error: 401'))).toBe('FATAL');
-    expect(classifyError(new Error('rate limit: session limit reached'))).toBe('FATAL');
-  });
-
-  it('keeps a generic auth error FATAL when no transient signal is present', () => {
-    expect(classifyError(new Error('auth error: credentials rejected'))).toBe('FATAL');
-  });
-
-  it('classifies session-limit and usage-limit errors as FATAL (never retried) — #2177', () => {
-    // Verbatim node_failed payload from the issue report — regression pin.
-    expect(
-      classifyError(
-        new Error(
-          'Claude session limit reached — resets 3:20pm (UTC). Abandon this run and retry after reset.'
-        )
-      )
-    ).toBe('FATAL');
-    // CLI-only quota string: not producible by detectCreditExhaustion, so the
-    // drift guard below cannot cover it.
-    expect(classifyError(new Error('Claude AI usage limit reached|1751234567'))).toBe('FATAL');
-  });
-
-  it('session-limit stays FATAL even when the message also matches a TRANSIENT pattern', () => {
-    expect(classifyError(new Error('rate limit: session limit reached'))).toBe('FATAL');
-  });
-
-  it('every detectCreditExhaustion output string classifies FATAL (drift guard)', () => {
-    const outputs = [
-      detectCreditExhaustion("You've hit your session limit · resets 3am"),
-      detectCreditExhaustion('session limit reached'),
-      detectCreditExhaustion('out of credits'),
-    ];
-    for (const msg of outputs) {
-      expect(msg).not.toBeNull();
-      expect(classifyError(new Error(msg as string))).toBe('FATAL');
+describe('getRetryDelayMs', () => {
+  it('capacity backoff grows to a capped center with jitter', () => {
+    const random = Math.random;
+    try {
+      Math.random = () => 0.5;
+      expect([0, 1, 2, 3, 4].map(i => getRetryDelayMs('overloaded', i, 1))).toEqual([
+        45000, 90000, 180000, 300000, 300000,
+      ]);
+      Math.random = () => 0;
+      expect(getRetryDelayMs('overloaded', 0, 1)).toBe(22500);
+      expect(getRetryDelayMs('overloaded', 9, 1)).toBe(150000);
+      Math.random = () => 1;
+      expect(getRetryDelayMs('overloaded', 0, 1)).toBe(67500);
+      expect(getRetryDelayMs('overloaded', 9, 1)).toBe(450000);
+    } finally {
+      Math.random = random;
     }
   });
 
-  it('classifies unknown errors as UNKNOWN', () => {
-    expect(classifyError(new Error('something completely unexpected happened'))).toBe('UNKNOWN');
+  it('backs off flat + jitter on rate limits, exponential otherwise — #2706', () => {
+    for (let i = 0; i < 20; i++) {
+      const delay = getRetryDelayMs('rate_limited', i, 3000);
+      expect(delay).toBeGreaterThanOrEqual(RATE_LIMIT_RETRY_DELAY_MS / 2);
+      expect(delay).toBeLessThanOrEqual((RATE_LIMIT_RETRY_DELAY_MS * 3) / 2);
+    }
+    expect(getRetryDelayMs('transient', 0, 3000)).toBe(3000);
+    expect(getRetryDelayMs('transient', 2, 3000)).toBe(12000);
   });
 });
 
-describe('toTelemetryErrorClass', () => {
-  it('maps FATAL to fatal', () => {
-    expect(toTelemetryErrorClass('FATAL')).toBe('fatal');
+describe('rateLimitResumeAt', () => {
+  const now = Date.parse('2026-10-16T12:00:00.000Z');
+
+  it("waits for the provider's reported reset while it is still ahead", () => {
+    const resetAt = '2026-10-16T12:30:00.000Z';
+    expect(rateLimitResumeAt({ class: 'rate_limited', evidence: '429', resetAt }, now)).toBe(
+      Date.parse(resetAt)
+    );
   });
 
-  it('maps TRANSIENT to transient', () => {
-    expect(toTelemetryErrorClass('TRANSIENT')).toBe('transient');
+  it('backs off 5 to 15 minutes without a reset, or once the reported one has passed', () => {
+    const random = Math.random;
+    try {
+      for (const resetAt of [undefined, '2026-10-16T11:59:00.000Z']) {
+        const failure = { class: 'rate_limited' as const, evidence: '429', resetAt };
+        Math.random = () => 0;
+        expect(rateLimitResumeAt(failure, now)).toBe(now + RATE_LIMIT_PAUSE_DELAY_MS / 2);
+        Math.random = () => 0.999999;
+        expect(rateLimitResumeAt(failure, now)).toBe(
+          now + Math.round(RATE_LIMIT_PAUSE_DELAY_MS * 1.499999)
+        );
+      }
+    } finally {
+      Math.random = random;
+    }
+  });
+});
+
+describe('aggregateProviderFailure', () => {
+  const now = Date.parse('2026-10-16T12:00:00Z');
+  const sooner = {
+    class: 'rate_limited' as const,
+    evidence: '429',
+    resetAt: '2026-10-16T12:10:00Z',
+  };
+  const later = {
+    class: 'quota_exhausted' as const,
+    evidence: 'session limit',
+    resetAt: '2026-10-16T13:00:00Z',
+  };
+
+  it('reports a lone failed descendant unchanged, whatever its class', () => {
+    const auth = { class: 'auth' as const, evidence: 'bad key' };
+    expect(aggregateProviderFailure([auth], now)).toBe(auth);
+    expect(aggregateProviderFailure([undefined], now)).toBeUndefined();
   });
 
-  it('maps UNKNOWN to unknown', () => {
-    expect(toTelemetryErrorClass('UNKNOWN')).toBe('unknown');
+  it('reports nothing when a provider limit sits beside any other failure', () => {
+    expect(aggregateProviderFailure([sooner, undefined], now)).toBeUndefined();
+    expect(
+      aggregateProviderFailure([later, { class: 'transient', evidence: 'socket hang up' }], now)
+    ).toBeUndefined();
   });
 
-  it('round-trips classifyError output for every ErrorType', () => {
-    expect(toTelemetryErrorClass(classifyError(new Error('401 unauthorized')))).toBe('fatal');
-    expect(toTelemetryErrorClass(classifyError(new Error('rate limit: 429')))).toBe('transient');
-    expect(toTelemetryErrorClass(classifyError(new Error('mystery')))).toBe('unknown');
+  it('reports the latest resume deadline among several limits, and a resetless usage limit over any', () => {
+    const noReset = { class: 'rate_limited' as const, evidence: '429' };
+    expect(aggregateProviderFailure([noReset, sooner, later], now)).toBe(later);
+    const unwaitable = { class: 'quota_exhausted' as const, evidence: 'session limit' };
+    expect(aggregateProviderFailure([later, unwaitable], now)).toBe(unwaitable);
+  });
+
+  it('ranks a resetless rate limit by its backoff, so an expired usage limit beside it still waits', () => {
+    const noReset = { class: 'rate_limited' as const, evidence: '429' };
+    const expired = {
+      class: 'quota_exhausted' as const,
+      evidence: 'session limit',
+      resetAt: '2026-10-16T11:00:00Z',
+    };
+    expect(aggregateProviderFailure([expired, noReset], now)).toBe(noReset);
+    expect(aggregateProviderFailure([noReset, expired], now)).toBe(noReset);
+  });
+});
+
+describe('typed provider failures decide retry — #3520', () => {
+  it('maps every failure class onto a retry kind', () => {
+    const kinds = providerFailureClassSchema.options.map(cls =>
+      nodeFailureKindOf({ class: cls, evidence: 'x' })
+    );
+    expect(kinds).toEqual([
+      'fatal',
+      'fatal',
+      'fatal',
+      'fatal',
+      'rate_limited',
+      'overloaded',
+      'transient',
+      'unknown',
+    ]);
+  });
+
+  it('a provider kind is its own retry class; a record without a kind is unknown', () => {
+    for (const kind of ['fatal', 'transient', 'rate_limited', 'overloaded', 'unknown'] as const) {
+      expect(retryClassOf(kind)).toBe(kind);
+    }
+    expect(retryClassOf(undefined)).toBe('unknown');
+  });
+
+  it('gives every failure kind its retry class', () => {
+    const classes = Object.fromEntries(
+      nodeFailureKindSchema.options.map(kind => [kind, retryClassOf(kind)])
+    );
+    expect(classes).toEqual({
+      fatal: 'fatal',
+      transient: 'transient',
+      unknown: 'unknown',
+      rate_limited: 'rate_limited',
+      overloaded: 'overloaded',
+      timeout: 'transient',
+      exec_failed: 'unknown',
+      output_contract: 'unknown',
+      max_iterations: 'unknown',
+      child_failed: 'unknown',
+      cancelled: 'fatal',
+      config: 'fatal',
+    });
   });
 });
 
 describe('safeSendMessage', () => {
-  const makePlatform = (impl: () => Promise<void>) => ({
-    sendMessage: mock(impl),
-    getPlatformType: mock(() => 'test'),
-  });
-
-  it('returns true and resets tracker to 0 on success', async () => {
-    const platform = makePlatform(() => Promise.resolve());
-    const tracker: UnknownErrorTracker = { count: 5 };
-    const result = await safeSendMessage(
-      platform as unknown as IWorkflowPlatform,
-      'conv-1',
-      'hello',
-      undefined,
-      undefined,
-      tracker
-    );
-    expect(result).toBe(true);
-    expect(tracker.count).toBe(0);
-  });
-
-  it('returns false on TRANSIENT error without throwing', async () => {
-    const platform = makePlatform(() => Promise.reject(new Error('timeout connecting')));
-    const result = await safeSendMessage(
-      platform as unknown as IWorkflowPlatform,
-      'conv-1',
-      'hello'
-    );
-    expect(result).toBe(false);
-  });
-
-  it('rethrows FATAL errors', async () => {
-    const platform = makePlatform(() => Promise.reject(new Error('unauthorized')));
-    await expect(
-      safeSendMessage(platform as unknown as IWorkflowPlatform, 'conv-1', 'hello')
-    ).rejects.toThrow('Platform authentication/permission error: unauthorized');
-  });
-
-  it('increments UNKNOWN tracker and returns false below threshold', async () => {
-    const platform = makePlatform(() => Promise.reject(new Error('some unclassified glitch')));
-    const tracker: UnknownErrorTracker = { count: 0 };
-    const result = await safeSendMessage(
-      platform as unknown as IWorkflowPlatform,
-      'conv-1',
-      'hello',
-      undefined,
-      undefined,
-      tracker
-    );
-    expect(result).toBe(false);
-    expect(tracker.count).toBe(1);
-  });
-
-  it('throws after three consecutive UNKNOWN errors', async () => {
-    const platform = makePlatform(() => Promise.reject(new Error('some unclassified glitch')));
-    const tracker: UnknownErrorTracker = { count: 2 };
-    await expect(
-      safeSendMessage(
-        platform as unknown as IWorkflowPlatform,
-        'conv-1',
-        'hello',
-        undefined,
-        undefined,
-        tracker
-      )
-    ).rejects.toThrow('3 consecutive unrecognized errors');
-  });
-
-  it('TRANSIENT resets tracker so subsequent UNKNOWN does not trip threshold', async () => {
-    // Sequence: UNKNOWN (count→1), TRANSIENT (count→0), UNKNOWN (count→1) — no throw
-    const errors = [
-      new Error('some unclassified glitch'), // UNKNOWN
-      new Error('timeout'), // TRANSIENT
-      new Error('some unclassified glitch'), // UNKNOWN
-    ];
-    let callCount = 0;
-    const platform = {
-      sendMessage: mock(async () => {
-        throw errors[callCount++];
-      }),
+  const platformThat = (send: () => Promise<void>): IWorkflowPlatform =>
+    ({
+      sendMessage: mock(send),
       getPlatformType: mock(() => 'test'),
-    };
-    const tracker: UnknownErrorTracker = { count: 0 };
+    }) as unknown as IWorkflowPlatform;
 
-    await safeSendMessage(
-      platform as unknown as IWorkflowPlatform,
-      'conv-1',
-      'msg',
-      undefined,
-      undefined,
-      tracker
-    );
-    expect(tracker.count).toBe(1);
-
-    await safeSendMessage(
-      platform as unknown as IWorkflowPlatform,
-      'conv-1',
-      'msg',
-      undefined,
-      undefined,
-      tracker
-    );
-    expect(tracker.count).toBe(0);
-
-    const result = await safeSendMessage(
-      platform as unknown as IWorkflowPlatform,
-      'conv-1',
-      'msg',
-      undefined,
-      undefined,
-      tracker
-    );
-    expect(result).toBe(false);
-    expect(tracker.count).toBe(1);
+  it('returns true when the platform accepts the message', async () => {
+    expect(
+      await safeSendMessage(
+        platformThat(() => Promise.resolve()),
+        'conv-1',
+        'hello'
+      )
+    ).toBe(true);
   });
 
-  it('works correctly without unknownErrorTracker (DAG executor path)', async () => {
-    const platform = makePlatform(() => Promise.reject(new Error('some unclassified glitch')));
-    // No tracker passed — UNKNOWN errors never throw regardless of call count
-    for (let i = 0; i < 5; i++) {
-      const result = await safeSendMessage(
-        platform as unknown as IWorkflowPlatform,
+  it('logs and suppresses a send failure whatever it says', async () => {
+    for (const message of ['401 unauthorized', 'timeout connecting', 'some unclassified glitch']) {
+      mockLogFn.mockClear();
+      const sent = await safeSendMessage(
+        platformThat(() => Promise.reject(new Error(message))),
         'conv-1',
         'hello'
       );
-      expect(result).toBe(false);
+      expect(sent).toBe(false);
+      expect(
+        (mockLogFn as unknown as Mock<(obj: unknown, msg?: string) => void>).mock.calls.some(
+          call => call[1] === 'platform_message_send_failed'
+        )
+      ).toBe(true);
     }
+  });
+});
+
+describe('describeUnmetCompletion', () => {
+  // The max-iterations failure message for both loop variants. `loop.until` is
+  // optional (#2563), so this exists to stop the two executors describing the same
+  // loop differently — and to stop either printing `undefined` at the author.
+  it('names the signal when only until is declared', () => {
+    expect(describeUnmetCompletion({ until: 'COMPLETE' })).toBe(
+      "without completion signal 'COMPLETE'"
+    );
+  });
+
+  it('names the check when only until_bash is declared', () => {
+    expect(describeUnmetCompletion({ until_bash: 'bun run test' })).toBe(
+      "without a passing 'until_bash' check"
+    );
+  });
+
+  it('names both when both are declared', () => {
+    expect(describeUnmetCompletion({ until: 'DONE', until_bash: 'test -f x' })).toBe(
+      "without completion signal 'DONE' or a passing 'until_bash' check"
+    );
+  });
+
+  it('never emits the literal "undefined" for a channel-less control', () => {
+    // Unreachable through the schema (it requires at least one channel), but this is
+    // an error message: degrade to something readable rather than assert.
+    const described = describeUnmetCompletion({});
+    expect(described).toBe('without a completion channel');
+    expect(described).not.toContain('undefined');
+  });
+});
+
+describe('retainStreamTail', () => {
+  it('returns a stream at the exact budget whole and unmarked', () => {
+    // The boundary an off-by-one would move: 2000 characters is retained in full, so a
+    // reader never sees a truncation marker on output that was not truncated.
+    const exact = 'y'.repeat(2000);
+    expect(retainStreamTail(exact)).toBe(exact);
+  });
+
+  it('keeps the tail and marks the dropped head one character over budget', () => {
+    const overBudget = `HEAD${'y'.repeat(2000)}`;
+    const retained = retainStreamTail(overBudget);
+    expect(retained).toBe(`…[truncated to last 2000 chars]\n${'y'.repeat(2000)}`);
+    expect(retained).not.toContain('HEAD');
+  });
+
+  it('reports an empty or whitespace-only stream as absent, not as an empty string', () => {
+    // `undefined` is what makes an absent tail field mean "this stream was empty"
+    // rather than "retention did not happen".
+    expect(retainStreamTail('')).toBeUndefined();
+    expect(retainStreamTail('   \n  ')).toBeUndefined();
+    expect(retainStreamTail(undefined)).toBeUndefined();
   });
 });
