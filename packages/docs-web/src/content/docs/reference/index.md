@@ -11,7 +11,7 @@ Technical reference documentation for Archon internals.
 
 ## Reference Docs
 
-- **[Architecture](/reference/architecture/)** -- System overview, interfaces, data flow, extension guides
+- **[Architecture](/reference/architecture/)** -- How the packages fit together, with a link to the maintained architecture map
 - **[Archon Directories](/reference/archon-directories/)** -- Directory structure, path resolution, configuration system
 - **[CLI Reference](/reference/cli/)** -- All CLI commands, flags, and usage examples
 - **[Commands Reference](/reference/commands/)** -- Slash commands available in all platform adapters
@@ -29,3 +29,4 @@ Point your AI assistant at these URLs for accurate, up-to-date documentation:
 - [`/llms.txt`](https://archon.diy/llms.txt) -- Index of all documentation pages
 - [`/llms-full.txt`](https://archon.diy/llms-full.txt) -- Full documentation in a single file
 - [`/llms-small.txt`](https://archon.diy/llms-small.txt) -- Trimmed documentation variant
+- `/<page-path>.md` -- Raw source for Markdown documentation pages (e.g., [`/getting-started/installation.md`](https://archon.diy/getting-started/installation.md)); use `/llms-full.txt` for pages authored in MDX

@@ -1,6 +1,20 @@
+import { GitFailure } from './errors';
+import { gitCredentialOptions, sanitizeGitError } from './credentials';
+import { inspectRemoteBranches, ConfiguredBaseBranchNotFoundError } from './remote-branches';
 import { existsSync } from 'fs';
-import { readdir } from 'fs/promises';
-import { join } from 'path';
+import {
+  readdir,
+  open,
+  readFile,
+  realpath,
+  rename,
+  stat,
+  lstat,
+  unlink,
+  appendFile,
+} from 'fs/promises';
+import { homedir } from 'os';
+import { dirname, join } from 'path';
 import { createLogger } from '@archon/paths';
 import { execFileAsync } from './exec';
 import { getDefaultBranch } from './branch';
@@ -22,6 +36,35 @@ function getLog(): ReturnType<typeof createLogger> {
 }
 
 /**
+ * Fetch is repeatable, but Git has no distinct ref-contention exit status.
+ * Bound recovery for exited subprocess failures without guessing their cause
+ * from stderr. Known failures and spawn/termination errors propagate immediately.
+ */
+export async function fetchWithRetry(
+  repoPath: RepoPath,
+  fetchArgs: string[],
+  options: { timeout: number }
+): Promise<void> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await execFileAsync('git', ['-C', repoPath, 'fetch', ...fetchArgs], options);
+      return;
+    } catch (error) {
+      if (
+        !(error instanceof GitFailure) ||
+        error.kind !== 'unclassified' ||
+        typeof error.code !== 'number' ||
+        error.code <= 0
+      )
+        throw error;
+      if (attempt === 2) throw error;
+      getLog().warn({ err: error, repoPath, attempt: attempt + 1 }, 'git.fetch_retry');
+      await new Promise(resolve => setTimeout(resolve, 250 * (attempt + 1)));
+    }
+  }
+}
+
+/**
  * Find the root of the git repository containing the given path
  * Returns null if not in a git repository
  */
@@ -30,21 +73,21 @@ export async function findRepoRoot(startPath: string): Promise<RepoPath | null> 
     const { stdout } = await execFileAsync(
       'git',
       ['-C', startPath, 'rev-parse', '--show-toplevel'],
-      { timeout: 10000 }
+      {
+        timeout: 10000,
+      }
     );
     return toRepoPath(stdout.trim());
   } catch (error) {
     const err = error as Error & { stderr?: string };
-    const errorText = `${err.message} ${err.stderr ?? ''}`;
-
-    // Expected: not a git repository
-    if (errorText.includes('not a git repository') || errorText.includes('Not a git repository')) {
+    // A missing start path also reads as no repository; callers rely on this
+    // function to refuse it rather than treat it as a folder.
+    if (error instanceof GitFailure && error.kind === 'not_repository' && existsSync(startPath))
       return null;
-    }
 
     // Unexpected error - surface it
     getLog().error({ startPath, err, stderr: err.stderr }, 'find_repo_root_failed');
-    throw new Error(`Failed to find repo root for ${startPath}: ${err.message}`);
+    throw new Error(`Failed to find repo root for ${startPath}: ${err.message}`, { cause: error });
   }
 }
 
@@ -111,19 +154,31 @@ export async function getRemoteUrl(repoPath: RepoPath, remote = 'origin'): Promi
     return stdout.trim() || null;
   } catch (error) {
     const err = error as Error & { stderr?: string };
-    const errorText = `${err.message} ${err.stderr ?? ''}`;
-
-    // Expected: no remote with that name
-    if (
-      errorText.includes('No such remote') ||
-      errorText.includes('does not have a url configured')
-    ) {
-      return null;
+    if (error instanceof GitFailure && error.kind === 'unclassified' && error.code === 2) {
+      try {
+        await execFileAsync(
+          'git',
+          ['-C', repoPath, 'config', '--local', '--get', `remote.${remote}.url`],
+          {
+            timeout: 10000,
+          }
+        );
+      } catch (inspectionError) {
+        if (
+          inspectionError instanceof GitFailure &&
+          inspectionError.kind === 'unclassified' &&
+          inspectionError.code === 1
+        )
+          return null;
+      }
     }
 
     // Unexpected error - surface it
     getLog().error({ repoPath, remote, err, stderr: err.stderr }, 'get_remote_url_failed');
-    throw new Error(`Failed to get remote URL for ${repoPath} (remote: ${remote}): ${err.message}`);
+    throw new Error(
+      `Failed to get remote URL for ${repoPath} (remote: ${remote}): ${err.message}`,
+      { cause: error }
+    );
   }
 }
 
@@ -159,27 +214,33 @@ export async function syncWorkspace(
   const remote = options?.remote ?? 'origin';
   const branchToSync = baseBranch ?? (await getDefaultBranch(workspacePath, remote));
 
-  // Fetch from the remote to ensure <remote>/<branchToSync> is up-to-date
+  // Fetch from the remote to ensure <remote>/<branchToSync> is up-to-date.
   try {
-    await execFileAsync('git', ['-C', workspacePath, 'fetch', remote, branchToSync], {
+    await fetchWithRetry(workspacePath, [remote, branchToSync], {
       timeout: 60000,
     });
   } catch (error) {
     const err = error as Error;
-    const errorMessage = err.message.toLowerCase();
-
-    // If configured branch doesn't exist on remote, provide actionable error
-    if (
-      baseBranch &&
-      (errorMessage.includes("couldn't find remote ref") || errorMessage.includes('not found'))
-    ) {
-      throw new Error(
-        `Configured base branch '${baseBranch}' not found on remote '${remote}'. ` +
-          'Either create the branch, update worktree.baseBranch in .archon/config.yaml, ' +
-          'or remove the setting to use the auto-detected default branch.'
-      );
+    if (baseBranch) {
+      const inspection = await inspectRemoteBranches({
+        kind: 'local',
+        repoPath: workspacePath,
+        remote,
+      }).catch((inspectionError: unknown) => {
+        getLog().warn(
+          { err: inspectionError, workspacePath, remote },
+          'workspace.fetch_failure_inspection_failed'
+        );
+        return null;
+      });
+      if (inspection?.status === 'available' && !inspection.branches.includes(baseBranch)) {
+        throw new ConfiguredBaseBranchNotFoundError(baseBranch, remote);
+      }
     }
-    throw new Error(`Sync fetch from ${remote}/${branchToSync} failed: ${err.message}`);
+
+    throw new Error(`Sync fetch from ${remote}/${branchToSync} failed: ${err.message}`, {
+      cause: error,
+    });
   }
 
   const previousHead = await readShortSha(workspacePath, 'HEAD');
@@ -206,7 +267,9 @@ export async function syncWorkspace(
       );
     } catch (error) {
       const err = error as Error;
-      throw new Error(`Fast-forward to ${remote}/${branchToSync} failed: ${err.message}`);
+      throw new Error(`Fast-forward to ${remote}/${branchToSync} failed: ${err.message}`, {
+        cause: err,
+      });
     }
 
     const newHead = await readShortSha(workspacePath, 'HEAD');
@@ -233,7 +296,7 @@ export async function syncWorkspace(
     );
   } catch (error) {
     const err = error as Error;
-    throw new Error(`Reset to ${remote}/${branchToSync} failed: ${err.message}`);
+    throw new Error(`Reset to ${remote}/${branchToSync} failed: ${err.message}`, { cause: err });
   }
 
   const newHead = await readShortSha(workspacePath, 'HEAD');
@@ -332,7 +395,9 @@ async function isAncestor(
       { err, workspacePath, ancestor, descendant, stderr: err.stderr },
       'workspace.merge_base_check_failed'
     );
-    throw new Error(`Failed to compare git ancestry in ${workspacePath}: ${err.message}`);
+    throw new Error(`Failed to compare git ancestry in ${workspacePath}: ${err.message}`, {
+      cause: error,
+    });
   }
 }
 
@@ -367,49 +432,140 @@ async function classifyWorkspaceState(
  *
  * @param url - Repository URL (e.g., https://github.com/owner/repo.git)
  * @param targetPath - Local path to clone into
- * @param options - Optional: { token } for authenticated clones
+ * @param options - Optional request-scoped HTTP credentials
  * @returns GitResult<void>
  */
+export interface CloneCredentials {
+  username: string;
+  password: string;
+}
+
+export interface CloneRepositoryOptions {
+  credentials?: CloneCredentials;
+}
+
+function normalizeCloneSource(url: string): string {
+  if (url.startsWith('/') || url.startsWith('~') || url.startsWith('.')) return url;
+
+  const scpStyle = /^git@([^:]+):(.+)$/.exec(url);
+  if (scpStyle) return `https://${scpStyle[1]}/${scpStyle[2]}`;
+
+  const firstSlash = url.indexOf('/');
+  if (firstSlash <= 0 || url.includes('://')) return url;
+
+  const authority = url.slice(0, firstSlash);
+  const isBareHost =
+    authority === 'localhost' ||
+    authority.includes('.') ||
+    /^[^:]+:\d+$/.test(authority) ||
+    /^\[[^\]]+\](?::\d+)?$/.test(authority);
+  return isBareHost ? `https://${url}` : url;
+}
+
+export function validateCloneUrl(
+  url: string
+): { ok: true; url: string; httpUrl: URL | null } | { ok: false; error: string } {
+  const cloneSource = normalizeCloneSource(url);
+  if (!/^\s*https?:/i.test(cloneSource)) {
+    return { ok: true, url: cloneSource, httpUrl: null };
+  }
+  if (cloneSource.includes('\\')) {
+    return { ok: false, error: 'Invalid HTTP(S) repository URL' };
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(cloneSource);
+  } catch {
+    return { ok: false, error: 'Invalid HTTP(S) repository URL' };
+  }
+
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    return { ok: false, error: 'Invalid HTTP(S) repository URL' };
+  }
+  if (parsed.username || parsed.password) {
+    return { ok: false, error: 'Repository URL must not include credentials' };
+  }
+  if (parsed.search || parsed.hash) {
+    return { ok: false, error: 'Invalid HTTP(S) repository URL' };
+  }
+  return { ok: true, url: parsed.href, httpUrl: parsed };
+}
+
+function stderrOf(error: unknown): string {
+  return error instanceof Error && 'stderr' in error && typeof error.stderr === 'string'
+    ? error.stderr
+    : '';
+}
+
+/**
+ * Git reports these causes only as stderr lines, not exit codes. Matching whole
+ * fatal lines keeps a URL, path, or branch name from changing the result. An
+ * HTTP 403 matches on curl's status text ending a fatal line, whatever prefix
+ * precedes it. The cause only chooses the guidance a GitResult reports; it
+ * never decides retry.
+ */
+function reportedCause(error: unknown): 'missing' | 'denied' | 'no_space' | undefined {
+  const stderr = stderrOf(error);
+  if (/^fatal: repository '.*' not found\r?$/m.test(stderr)) return 'missing';
+  if (
+    /^fatal: (?:Authentication failed for|could not read (?:Username|Password) for) '/m.test(
+      stderr
+    ) ||
+    /^fatal: Could not read from remote repository\.\r?$/m.test(stderr) ||
+    /^fatal: .*The requested URL returned error: 403\r?$/m.test(stderr)
+  )
+    return 'denied';
+  if (/: No space left on device\r?$/m.test(stderr)) return 'no_space';
+  return undefined;
+}
+
 export async function cloneRepository(
   url: string,
   targetPath: RepoPath,
-  options?: { token?: string }
+  options?: CloneRepositoryOptions
 ): Promise<GitResult<void>> {
+  const validatedUrl = validateCloneUrl(url);
+  if (!validatedUrl.ok) {
+    return { ok: false, error: { code: 'unknown', message: validatedUrl.error } };
+  }
+  const parsedUrl = validatedUrl.httpUrl;
+  if (options?.credentials && !parsedUrl) {
+    return {
+      ok: false,
+      error: { code: 'unknown', message: 'Authenticated clones require an HTTP(S) repository URL' },
+    };
+  }
+  const cloneUrl = validatedUrl.url;
+
   try {
-    let cloneUrl = url;
-    if (options?.token) {
-      // Construct authenticated URL: https://<token>@github.com/owner/repo.git
-      const parsed = new URL(url);
-      parsed.username = options.token;
-      cloneUrl = parsed.toString();
-    }
+    const args = ['clone', cloneUrl, targetPath];
+    const { args: authArgs, env } = gitCredentialOptions(parsedUrl, options?.credentials);
+    args.unshift(...authArgs);
 
     // GIT_TERMINAL_PROMPT=0 turns any missing-creds scenario into an
     // immediate, readable error instead of a hung stdin credential prompt.
-    await execFileAsync('git', ['clone', cloneUrl, targetPath], {
+    await execFileAsync('git', args, {
       timeout: 120000,
-      env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+      env,
     });
     return { ok: true, value: undefined };
   } catch (error) {
-    const err = error as Error;
-    // Sanitize any token from error messages to prevent credential leakage
-    const sanitizedMessage = options?.token
-      ? err.message.replaceAll(options.token, '***')
-      : err.message;
-    const message = sanitizedMessage.toLowerCase();
-
-    if (message.includes('not found') || message.includes('404')) {
-      return { ok: false, error: { code: 'not_a_repo', path: url } };
-    }
-    if (message.includes('authentication failed') || message.includes('could not read')) {
-      return { ok: false, error: { code: 'permission_denied', path: url } };
-    }
-    if (message.includes('no space')) {
-      return { ok: false, error: { code: 'no_space', path: targetPath } };
-    }
-
-    getLog().error({ url, targetPath, errorMessage: sanitizedMessage }, 'clone_repository_failed');
+    const sanitizedMessage = sanitizeGitError(error, options?.credentials);
+    getLog().error(
+      { url: cloneUrl, targetPath, errorMessage: sanitizedMessage },
+      'clone_repository_failed'
+    );
+    // GitHub over SSH prints this before the generic "Could not read from remote
+    // repository" line. Dev reported it as not found on clone but as denied on
+    // fetch, so only clone reads it.
+    const cause = /^ERROR: Repository not found\.\r?$/m.test(stderrOf(error))
+      ? 'missing'
+      : reportedCause(error);
+    if (cause === 'missing') return { ok: false, error: { code: 'not_a_repo', path: cloneUrl } };
+    if (cause === 'denied')
+      return { ok: false, error: { code: 'permission_denied', path: cloneUrl } };
+    if (cause === 'no_space') return { ok: false, error: { code: 'no_space', path: targetPath } };
     return { ok: false, error: { code: 'unknown', message: sanitizedMessage } };
   }
 }
@@ -418,9 +574,6 @@ export async function cloneRepository(
  * Sync a repository to match a remote branch.
  * Runs sequential fetch + reset --hard. If fetch fails, reset is skipped.
  * Uses execFileAsync (no shell interpolation) for safety.
- *
- * Note: Uses `cwd` option instead of `-C` flag. Both are functionally
- * equivalent; this style was chosen for readability with multi-arg commands.
  *
  * @param repoPath - Path to the local repository
  * @param branch - Branch to sync to (e.g., 'main')
@@ -433,21 +586,17 @@ export async function syncRepository(
   remote = 'origin'
 ): Promise<GitResult<void>> {
   try {
-    await execFileAsync('git', ['fetch', remote], { cwd: repoPath, timeout: 60000 });
+    await fetchWithRetry(repoPath, [remote], { timeout: 60000 });
   } catch (error) {
     const err = error as Error & { stderr?: string };
-    const errorText = `${err.message} ${err.stderr ?? ''}`.toLowerCase();
     getLog().error({ err, repoPath, branch, remote }, 'sync_repository_fetch_failed');
-
-    if (errorText.includes('not a git repository')) {
+    if (error instanceof GitFailure && error.kind === 'not_repository') {
       return { ok: false, error: { code: 'not_a_repo', path: repoPath } };
     }
-    if (errorText.includes('authentication failed') || errorText.includes('could not read')) {
+    const cause = reportedCause(error);
+    if (cause === 'denied')
       return { ok: false, error: { code: 'permission_denied', path: repoPath } };
-    }
-    if (errorText.includes('no space')) {
-      return { ok: false, error: { code: 'no_space', path: repoPath } };
-    }
+    if (cause === 'no_space') return { ok: false, error: { code: 'no_space', path: repoPath } };
     return { ok: false, error: { code: 'unknown', message: `Fetch failed: ${err.message}` } };
   }
 
@@ -458,12 +607,11 @@ export async function syncRepository(
     });
   } catch (error) {
     const err = error as Error;
-    const message = err.message.toLowerCase();
-
-    if (message.includes('unknown revision') || message.includes('not a valid object')) {
+    if (
+      stderrOf(err).startsWith(`fatal: ambiguous argument '${remote}/${branch}': unknown revision`)
+    ) {
       return { ok: false, error: { code: 'branch_not_found', branch } };
     }
-
     getLog().error({ err, repoPath, branch, remote }, 'sync_repository_reset_failed');
     return { ok: false, error: { code: 'unknown', message: `Reset failed: ${err.message}` } };
   }
@@ -471,18 +619,165 @@ export async function syncRepository(
   return { ok: true, value: undefined };
 }
 
+async function editSafeDirectory(
+  configPath: string,
+  path: RepoPath,
+  grant: boolean
+): Promise<void> {
+  const config = await realpath(configPath);
+  const lockPath = `${config}.lock`;
+  // Use Git's writer lock and publish only the finished edit. Readers retain
+  // their accepted trust even if a repair fails after removing the old entry.
+  const lock = await open(lockPath, 'wx', 0o600);
+  let published = false;
+  let closed = false;
+  try {
+    await lock.chmod((await stat(config)).mode);
+    await lock.writeFile(await readFile(config));
+    await lock.close();
+    closed = true;
+    try {
+      await execFileAsync(
+        'git',
+        ['config', '--file', lockPath, '--fixed-value', '--unset-all', 'safe.directory', path],
+        { timeout: 10000 }
+      );
+    } catch (error) {
+      if (!(error instanceof Error && 'code' in error && error.code === 5)) throw error;
+    }
+    if (grant) {
+      // Git writes into the last matching section, after any included resets.
+      await appendFile(lockPath, '\n[safe]\n');
+      await execFileAsync(
+        'git',
+        [
+          'config',
+          '--file',
+          lockPath,
+          '--fixed-value',
+          '--replace-all',
+          'safe.directory',
+          path,
+          path,
+        ],
+        { timeout: 10000 }
+      );
+    }
+    await rename(lockPath, config);
+    published = true;
+  } finally {
+    if (!closed) {
+      try {
+        await lock.close();
+      } catch (err) {
+        getLog().error({ err, lockPath }, 'safe_directory_lock_close_failed');
+      }
+    }
+    if (!published) {
+      try {
+        await unlink(lockPath);
+      } catch (err) {
+        getLog().error({ err, lockPath }, 'safe_directory_lock_cleanup_failed');
+      }
+    }
+  }
+}
+
 /**
- * Add a directory to git's global safe.directory config.
+ * Whether `path` does not exist yet and git will treat it as owned by the user
+ * running it once that user creates it, so git never reads safe.directory there.
+ * Judged by the nearest existing ancestor, followed through symlinks to the
+ * filesystem the path will live on, so a checkout inside another user's tree (a
+ * bind mount) keeps its grant. An existing path keeps the grant: git also checks
+ * the owner of its `.git` entry and gitdir. Follows git's POSIX check, including
+ * GIT_TEST_ASSUME_DIFFERENT_OWNER. Root and Windows always keep the grant: git
+ * judges sudo callers by SUDO_UID, and compares owner SIDs on Windows.
+ */
+async function newPathOwnedByCurrentUser(path: string): Promise<boolean> {
+  const euid = process.geteuid?.();
+  if (euid === undefined || euid === 0 || process.env.GIT_TEST_ASSUME_DIFFERENT_OWNER) {
+    return false;
+  }
+  const isMissing = (error: unknown): boolean =>
+    error instanceof Error && 'code' in error && error.code === 'ENOENT';
+  try {
+    await lstat(path);
+    return false;
+  } catch (error) {
+    if (!isMissing(error)) return false;
+  }
+  for (let candidate = dirname(path); ; candidate = dirname(candidate)) {
+    try {
+      return (await stat(candidate)).uid === euid;
+    } catch (error) {
+      // An unreadable path keeps the grant: ownership is unknown, so write as before.
+      if (!isMissing(error) || dirname(candidate) === candidate) return false;
+    }
+  }
+}
+
+/**
+ * Add a directory to git's global safe.directory config when git will need it.
+ * Skipping new paths this user will own keeps concurrent setups off the global
+ * config lock.
+ * Grants persist after setup failure: revocation could remove trust that a
+ * concurrent setup accepted for the same path.
  * Uses execFileAsync (no shell interpolation) for safety.
  */
 export async function addSafeDirectory(path: RepoPath): Promise<void> {
+  if (await newPathOwnedByCurrentUser(path)) return;
   try {
-    await execFileAsync('git', ['config', '--global', '--add', 'safe.directory', path], {
-      timeout: 10000,
-    });
+    let fields: string[];
+    try {
+      const { stdout } = await execFileAsync(
+        'git',
+        [
+          'config',
+          '--includes',
+          '--show-scope',
+          '--show-origin',
+          '--null',
+          '--get-all',
+          'safe.directory',
+        ],
+        { timeout: 10000 }
+      );
+      fields = stdout.split('\0').slice(0, -1);
+    } catch (error) {
+      if (!(error instanceof Error && 'code' in error && error.code === 1)) throw error;
+      fields = [];
+    }
+    const entries: { source: string; value: string }[] = [];
+    for (let i = 0; i < fields.length; i += 3) {
+      if (fields[i] === 'global') {
+        entries.push({ source: fields[i + 1].slice('file:'.length), value: fields[i + 2] });
+      }
+    }
+    const values = entries.map(entry => entry.value);
+    const grants = entries.filter(entry => entry.value === path);
+    if (grants.length === 1 && values.indexOf(path) > values.lastIndexOf('')) return;
+    if (grants.length === 0 && !values.includes('')) {
+      await execFileAsync(
+        'git',
+        ['config', '--global', '--fixed-value', '--replace-all', 'safe.directory', path, path],
+        { timeout: 10000 }
+      );
+      return;
+    }
+    const home = process.env.HOME || homedir();
+    const homeConfig = join(home, '.gitconfig');
+    const xdgConfig = join(process.env.XDG_CONFIG_HOME || join(home, '.config'), 'git/config');
+    const target = await realpath(
+      process.env.GIT_CONFIG_GLOBAL ?? (existsSync(homeConfig) ? homeConfig : xdgConfig)
+    );
+    // Publish effective trust before removing duplicate grants in earlier sources.
+    await editSafeDirectory(target, path, true);
+    for (const source of new Set(grants.map(entry => entry.source))) {
+      if ((await realpath(source)) !== target) await editSafeDirectory(source, path, false);
+    }
   } catch (error) {
     const err = error as Error;
     getLog().error({ err, path }, 'add_safe_directory_failed');
-    throw new Error(`Failed to add safe directory '${path}': ${err.message}`);
+    throw new Error(`Failed to add safe directory '${path}': ${err.message}`, { cause: err });
   }
 }

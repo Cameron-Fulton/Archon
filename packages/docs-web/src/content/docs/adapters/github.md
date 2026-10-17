@@ -80,9 +80,11 @@ Go to your repository settings:
 | **Content type** | `application/json` |
 | **Secret** | Paste the secret from Step 1 |
 | **SSL verification** | Enable SSL verification (recommended) |
-| **Events** | Select "Let me select individual events":<br>- Issues<br>- Issue comments<br>- Pull requests |
+| **Events** | Select "Let me select individual events":<br>- Check runs<br>- Issues<br>- Issue comments<br>- Pull requests |
 
 Click "Add webhook" and verify it shows a green checkmark after delivery.
+
+Webhook bodies are limited to **32 MiB (33,554,432 bytes)**, inclusive. Larger bodies receive HTTP **413** before the signature is checked; Archon stops reading them and creates no receipt or workflow start. This limit applies only to webhook routes.
 
 ## Step 4: Set Environment Variables
 
@@ -127,7 +129,7 @@ Once your server is running, add more repos by creating a webhook with the same 
 - **Payload URL**: Your server URL + `/webhooks/github`
 - **Content type**: `application/json`
 - **Secret**: Same `WEBHOOK_SECRET` from your `.env`
-- **Events**: Issues, Issue comments, Pull requests
+- **Events**: Check runs, Issues, Issue comments, Pull requests
 
 **Via CLI:**
 
@@ -140,12 +142,15 @@ gh api repos/OWNER/REPO/hooks --method POST \
   -f "config[url]=https://YOUR_DOMAIN/webhooks/github" \
   -f "config[content_type]=json" \
   -f "config[secret]=$WEBHOOK_SECRET" \
+  -f "events[]=check_run" \
   -f "events[]=issues" \
   -f "events[]=issue_comment" \
   -f "events[]=pull_request"
 ```
 
 **Important**: The webhook secret must be identical across all repos.
+
+Check-run deliveries wake CI waits quickly. They are not required for correctness: when GitHub does not deliver one, the workflow reaches its deadline and probes CI again.
 
 ## Further Reading
 

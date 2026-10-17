@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
+import { runProviderConformance } from '@archon/provider-contract/conformance';
 
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -132,20 +133,65 @@ mock.module('@opencode-ai/sdk', () => ({
 }));
 
 import { OpencodeProvider, resetEmbeddedRuntime } from './provider';
+import { normalizeTokens } from './tokens';
+
+describe('normalizeTokens', () => {
+  test('omits usage when either required token axis is absent', () => {
+    expect(normalizeTokens({ tokens: { output: 7 } })).toBeUndefined();
+    expect(normalizeTokens({ tokens: { input: 11 } })).toBeUndefined();
+  });
+
+  test('preserves measured zeros and computes a complete zero total', () => {
+    expect(
+      normalizeTokens({
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      })
+    ).toEqual({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 });
+  });
+
+  test('omits total when optional reasoning or cache axes are incomplete', () => {
+    expect(normalizeTokens({ tokens: { input: 11, output: 7 } })).toEqual({
+      input: 11,
+      output: 7,
+    });
+    expect(
+      normalizeTokens({
+        tokens: { input: 11, output: 7, reasoning: 3, cache: { read: 5 } },
+      })
+    ).toEqual({ input: 16, output: 7, cacheRead: 5 });
+  });
+});
+import { opencodeFailureClass } from './errors';
+import type { MessageChunk, NodeConfig } from '../../types';
 
 /** Default model for tests — satisfies the model-or-agent validation */
 const TEST_MODEL = { model: 'test/mock-model' };
 
-async function consume(
-  generator: AsyncGenerator<unknown>
-): Promise<{ chunks: unknown[]; error?: Error }> {
+/**
+ * Drain a turn. A turn that completes must end with `settled`; it is checked here and
+ * dropped, so each test asserts only the chunks it is about.
+ */
+async function consume(generator: AsyncGenerator<unknown>): Promise<{
+  chunks: unknown[];
+  error?: Error;
+  /** The typed failure a failed turn ended in. */
+  failure?: { class: string; evidence: string };
+}> {
   const chunks: unknown[] = [];
   try {
     for await (const chunk of generator) chunks.push(chunk);
-    return { chunks };
   } catch (error) {
     return { chunks, error: error as Error };
   }
+  expect(chunks.at(-1)).toEqual({ type: 'settled' });
+  const result = chunks.find(
+    (c): c is { type: 'result'; failure?: { class: string; evidence: string } } =>
+      typeof c === 'object' && c !== null && (c as { type?: unknown }).type === 'result'
+  );
+  return {
+    chunks: chunks.slice(0, -1),
+    ...(result?.failure !== undefined ? { failure: result.failure } : {}),
+  };
 }
 
 async function createTempProjectDir(): Promise<string> {
@@ -155,6 +201,19 @@ async function createTempProjectDir(): Promise<string> {
 }
 
 describe('OpencodeProvider', () => {
+  test('diagnostic cancellation after probe entry rejects with the abort reason', async () => {
+    const controller = new AbortController();
+    const probe = mock((signal: AbortSignal) => {
+      expect(signal).toBe(controller.signal);
+      return new Promise<'ready'>(() => {});
+    });
+    const pending = new OpencodeProvider(probe).diagnose({ signal: controller.signal });
+    expect(probe).toHaveBeenCalledTimes(1);
+    const reason = new Error('diagnostic deadline reached');
+    controller.abort(reason);
+    await expect(pending).rejects.toBe(reason);
+  });
+
   beforeEach(() => {
     scriptedEvents = [];
     runtimeQueue.length = 0;
@@ -174,26 +233,71 @@ describe('OpencodeProvider', () => {
     tempDirs.clear();
   });
 
-  test('basic text streaming yields assistant chunks', async () => {
+  test.each([
+    { options: { appendSystemPrompt: 'append' }, expected: 'append' },
+    {
+      options: { nodeConfig: { systemPrompt: 'node' }, appendSystemPrompt: 'append' },
+      expected: 'node',
+    },
+    {
+      options: {
+        systemPrompt: 'request',
+        nodeConfig: { systemPrompt: 'node' },
+        appendSystemPrompt: 'append',
+      },
+      expected: 'request',
+    },
+    {
+      options: {
+        nodeConfig: { systemPrompt: ['node', 'lines'] as string[] },
+        appendSystemPrompt: 'append',
+      },
+      expected: 'node\nlines',
+    },
+    {
+      options: {
+        systemPrompt: ['request', 'lines'] as string[],
+        nodeConfig: { systemPrompt: ['node', 'lines'] as string[] },
+        appendSystemPrompt: 'append',
+      },
+      expected: 'request\nlines',
+    },
+  ])('sends the selected system prompt to the SDK: $expected', async ({ options, expected }) => {
+    const runtime = makeRuntime();
+    runtimeQueue.push(runtime);
+    scriptedEvents = [{ type: 'session.idle', properties: { sessionID: 'session-1' } }];
+    const result = await consume(
+      new OpencodeProvider().sendQuery('hi', '/tmp', undefined, {
+        assistantConfig: TEST_MODEL,
+        ...options,
+      })
+    );
+    expect(result.error).toBeUndefined();
+    expect(result.failure).toBeUndefined();
+    expect(runtime.client.session.promptAsync).toHaveBeenCalledWith({
+      path: { id: 'session-1' },
+      query: { directory: '/tmp' },
+      body: expect.objectContaining({ system: expected }),
+    });
+  });
+
+  test('a part-update stream yields one chunk per text or reasoning part, once it ends', async () => {
+    const update = (part: Record<string, unknown>, delta?: string): OpencodeEvent => ({
+      type: 'message.part.updated',
+      properties: { part: { sessionID: 'session-1', ...part }, ...(delta ? { delta } : {}) },
+    });
+    const reasoning = { id: 'r1', type: 'reasoning' };
+    const text = { id: 't1', type: 'text' };
     scriptedEvents = [
-      {
-        type: 'message.part.updated',
-        properties: {
-          delta: 'Hello',
-          part: { sessionID: 'session-1', type: 'text' },
-        },
-      },
-      {
-        type: 'message.part.updated',
-        properties: {
-          delta: ' world',
-          part: { sessionID: 'session-1', type: 'text' },
-        },
-      },
-      {
-        type: 'session.idle',
-        properties: { sessionID: 'session-1' },
-      },
+      update(reasoning, 'Let me '),
+      update(reasoning, 'think'),
+      update({ ...reasoning, text: 'Let me think', time: { start: 1, end: 2 } }),
+      update(text, 'Hello'),
+      update(text, ' world'),
+      update({ ...text, text: 'Hello world', time: { start: 3, end: 4 } }),
+      // A late update of a finished part is not emitted again.
+      update({ ...text, text: 'Hello world', time: { start: 3, end: 4 } }),
+      { type: 'session.idle', properties: { sessionID: 'session-1' } },
     ];
 
     const { chunks, error } = await consume(
@@ -202,13 +306,37 @@ describe('OpencodeProvider', () => {
 
     expect(error).toBeUndefined();
     expect(chunks).toEqual([
-      { type: 'assistant', content: 'Hello' },
-      { type: 'assistant', content: ' world' },
+      { type: 'agent_thought_chunk', text: 'Let me think' },
+      { type: 'agent_message_chunk', text: 'Hello world' },
       { type: 'result', sessionId: 'session-1' },
     ]);
   });
 
-  test('tool events normalize into tool and tool_result chunks', async () => {
+  test('a text part that never ends is emitted whole at session.idle', async () => {
+    scriptedEvents = [
+      {
+        type: 'message.part.updated',
+        properties: { delta: 'Hello', part: { id: 't1', sessionID: 'session-1', type: 'text' } },
+      },
+      {
+        type: 'message.part.updated',
+        properties: { delta: ' world', part: { id: 't1', sessionID: 'session-1', type: 'text' } },
+      },
+      { type: 'session.idle', properties: { sessionID: 'session-1' } },
+    ];
+
+    const { chunks, error } = await consume(
+      new OpencodeProvider().sendQuery('hi', '/tmp', undefined, { assistantConfig: TEST_MODEL })
+    );
+
+    expect(error).toBeUndefined();
+    expect(chunks).toEqual([
+      { type: 'agent_message_chunk', text: 'Hello world' },
+      { type: 'result', sessionId: 'session-1' },
+    ]);
+  });
+
+  test('tool part updates map to one tool_call and one tool_call_update', async () => {
     scriptedEvents = [
       {
         type: 'message.part.updated',
@@ -253,24 +381,18 @@ describe('OpencodeProvider', () => {
 
     expect(error).toBeUndefined();
     expect(chunks).toEqual([
+      { type: 'tool_call', toolCallId: 'tool-1', name: 'read', rawInput: { path: '/tmp/file.ts' } },
       {
-        type: 'tool',
-        toolName: 'read',
-        toolInput: { path: '/tmp/file.ts' },
+        type: 'tool_call_update',
         toolCallId: 'tool-1',
-      },
-      {
-        type: 'tool_result',
-        toolName: 'read',
-        toolOutput: 'file contents',
-        toolCallId: 'tool-1',
-        toolOutcome: 'success',
+        status: 'completed',
+        output: 'file contents',
       },
       { type: 'result', sessionId: 'session-1' },
     ]);
   });
 
-  test('tool errors preserve a structured error outcome', async () => {
+  test('a tool part in error closes the call as failed', async () => {
     scriptedEvents = [
       {
         type: 'message.part.updated',
@@ -304,11 +426,195 @@ describe('OpencodeProvider', () => {
     );
 
     expect(error).toBeUndefined();
-    expect(chunks[1]).toMatchObject({
-      type: 'tool_result',
+    expect(chunks[1]).toEqual({
+      type: 'tool_call_update',
       toolCallId: 'tool-error',
-      toolOutcome: 'error',
+      status: 'failed',
+      output: 'command failed',
     });
+  });
+
+  test('permission.asked with no following session.idle fails fast instead of hanging (#3332)', async () => {
+    scriptedEvents = [
+      {
+        type: 'message.part.updated',
+        properties: {
+          part: {
+            id: 't1',
+            sessionID: 'session-1',
+            type: 'text',
+            // Unfinished: no time.end. The failure still delivers it.
+            text: 'partial answer',
+            time: { start: 1 },
+          },
+        },
+      },
+      {
+        // Real server event shape (verified against a live OpenCode server's
+        // `EventPermissionAsked` schema via `GET /doc`) — the
+        // `@opencode-ai/sdk` npm package's types describe a stale
+        // `permission.updated`/`Permission{id,type,pattern}` shape no
+        // current server actually emits.
+        type: 'permission.asked',
+        properties: {
+          id: 'perm-1',
+          sessionID: 'session-1',
+          permission: 'bash',
+          patterns: ['rm -rf *'],
+          metadata: { command: 'rm -rf *' },
+          always: ['rm -rf *'],
+          tool: { messageID: 'msg-1', callID: 'call-1' },
+        },
+      },
+      // Deliberately no session.idle after this — the permission is never
+      // answered, matching the hang scenario from issue #3332.
+    ];
+
+    const { chunks, failure } = await consume(
+      new OpencodeProvider().sendQuery('hi', '/tmp', undefined, { assistantConfig: TEST_MODEL })
+    );
+
+    expect(chunks).toEqual([
+      { type: 'agent_message_chunk', text: 'partial answer' },
+      expect.objectContaining({ type: 'result', isError: true }),
+    ]);
+    expect(failure?.class).toBe('unknown');
+    expect(failure?.evidence).toContain('perm-1');
+    expect(failure?.evidence).toContain('bash');
+  });
+
+  test('an event stream that ends before session.idle is a failed turn, not an empty success', async () => {
+    scriptedEvents = [
+      {
+        type: 'message.part.updated',
+        properties: {
+          part: {
+            id: 't1',
+            sessionID: 'session-1',
+            type: 'text',
+            // Unfinished: no time.end. The failure still delivers it.
+            text: 'partial answer',
+            time: { start: 1 },
+          },
+        },
+      },
+      // The stream closes here: no session.idle, no session.error.
+    ];
+
+    const { chunks, failure } = await consume(
+      new OpencodeProvider().sendQuery('hi', '/tmp', undefined, { assistantConfig: TEST_MODEL })
+    );
+
+    expect(chunks).toEqual([
+      { type: 'agent_message_chunk', text: 'partial answer' },
+      expect.objectContaining({ type: 'result', isError: true }),
+    ]);
+    expect(failure?.class).toBe('unknown');
+    expect(failure?.evidence).toContain('session.idle');
+  });
+
+  test('permission.asked for a different session is ignored', async () => {
+    scriptedEvents = [
+      {
+        type: 'permission.asked',
+        properties: {
+          id: 'perm-other',
+          sessionID: 'some-other-session',
+          permission: 'bash',
+          patterns: [],
+          metadata: {},
+          always: [],
+        },
+      },
+      { type: 'session.idle', properties: { sessionID: 'session-1' } },
+    ];
+
+    const { chunks, error } = await consume(
+      new OpencodeProvider().sendQuery('hi', '/tmp', undefined, { assistantConfig: TEST_MODEL })
+    );
+
+    expect(error).toBeUndefined();
+    expect(chunks).toEqual([{ type: 'result', sessionId: 'session-1' }]);
+  });
+
+  test('multi-agent permission.asked fails fast naming the pending permission (#3332)', async () => {
+    const cwd = await createTempProjectDir();
+    const sessionIds = ['scout-session', 'reviewer-session'];
+    const runtime = makeRuntime({
+      sessionCreate: mock(async () => ({ data: { id: sessionIds.shift() } })),
+    });
+    runtimeQueue.push(runtime);
+    scriptedEvents = [
+      {
+        type: 'permission.asked',
+        properties: {
+          id: 'perm-2',
+          sessionID: 'scout-session',
+          permission: 'edit',
+          patterns: [],
+          metadata: {},
+          always: [],
+        },
+      },
+      // No session.idle for either child session follows.
+    ];
+
+    const { failure } = await consume(
+      new OpencodeProvider().sendQuery('hi', cwd, undefined, {
+        assistantConfig: TEST_MODEL,
+        nodeConfig: {
+          nodeId: 'research',
+          agents: {
+            scout: { description: 'Scout', prompt: 'Explore' },
+            reviewer: { description: 'Reviewer', prompt: 'Review' },
+          },
+        },
+      })
+    );
+
+    expect(failure?.class).toBe('unknown');
+    expect(failure?.evidence).toContain('perm-2');
+    expect(failure?.evidence).toContain('edit');
+    expect(runtime.client.session.abort).toHaveBeenCalled();
+  });
+
+  test('multi-agent permission.asked for an unrecognized session is ignored', async () => {
+    const cwd = await createTempProjectDir();
+    const sessionIds = ['scout-session', 'reviewer-session'];
+    const runtime = makeRuntime({
+      sessionCreate: mock(async () => ({ data: { id: sessionIds.shift() } })),
+    });
+    runtimeQueue.push(runtime);
+    scriptedEvents = [
+      {
+        type: 'permission.asked',
+        properties: {
+          id: 'perm-3',
+          sessionID: 'not-a-child-session',
+          permission: 'edit',
+          patterns: [],
+          metadata: {},
+          always: [],
+        },
+      },
+      { type: 'session.idle', properties: { sessionID: 'scout-session' } },
+      { type: 'session.idle', properties: { sessionID: 'reviewer-session' } },
+    ];
+
+    const { error } = await consume(
+      new OpencodeProvider().sendQuery('hi', cwd, undefined, {
+        assistantConfig: TEST_MODEL,
+        nodeConfig: {
+          nodeId: 'research',
+          agents: {
+            scout: { description: 'Scout', prompt: 'Explore' },
+            reviewer: { description: 'Reviewer', prompt: 'Review' },
+          },
+        },
+      })
+    );
+
+    expect(error).toBeUndefined();
   });
 
   test('multi-agent tool results retain scoped IDs and factual outcomes', async () => {
@@ -363,15 +669,321 @@ describe('OpencodeProvider', () => {
     expect(error).toBeUndefined();
     expect(chunks).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({
-          type: 'tool_result',
+        { type: 'tool_call', toolCallId: 'scout:call-1', name: 'read' },
+        {
+          type: 'tool_call_update',
           toolCallId: 'scout:call-1',
-          toolOutcome: 'success',
-        }),
-        expect.objectContaining({
-          type: 'tool_result',
+          status: 'completed',
+          output: 'contents',
+        },
+        { type: 'tool_call', toolCallId: 'reviewer:call-1', name: 'bash' },
+        {
+          type: 'tool_call_update',
           toolCallId: 'reviewer:call-1',
-          toolOutcome: 'error',
+          status: 'failed',
+          output: 'command failed',
+        },
+      ])
+    );
+    expect(chunks).toContainEqual({ type: 'result' });
+  });
+
+  /** Two tool parts; the second is still running when the session goes idle. */
+  const toolTurnEvents: OpencodeEvent[] = [
+    ['tool-1', 'read', { status: 'completed', input: { path: 'a' }, output: 'A' }],
+    ['tool-2', 'bash', { status: 'running', input: { command: 'sleep 60' } }],
+  ].map(([callID, tool, state]) => ({
+    type: 'message.part.updated',
+    properties: { part: { sessionID: 'session-1', type: 'tool', callID, tool, state } },
+  }));
+
+  test('a tool still running when the session goes idle closes as cancelled before the result', async () => {
+    scriptedEvents = [
+      ...toolTurnEvents,
+      { type: 'session.idle', properties: { sessionID: 'session-1' } },
+    ];
+
+    const { chunks, error } = await consume(
+      new OpencodeProvider().sendQuery('hi', '/tmp', undefined, { assistantConfig: TEST_MODEL })
+    );
+
+    expect(error).toBeUndefined();
+    expect(chunks).toEqual([
+      { type: 'tool_call', toolCallId: 'tool-1', name: 'read', rawInput: { path: 'a' } },
+      { type: 'tool_call_update', toolCallId: 'tool-1', status: 'completed', output: 'A' },
+      { type: 'tool_call', toolCallId: 'tool-2', name: 'bash', rawInput: { command: 'sleep 60' } },
+      { type: 'tool_call_update', toolCallId: 'tool-2', status: 'cancelled' },
+      { type: 'result', sessionId: 'session-1' },
+    ]);
+  });
+
+  test.each<[string, string | undefined]>([
+    ['stop', 'end_turn'],
+    ['length', 'max_tokens'],
+    ['tool-calls', undefined],
+  ])('finish %s maps to stop reason %s', async (finish, stopReason) => {
+    scriptedEvents = [
+      {
+        type: 'message.updated',
+        properties: { info: { id: 'm1', role: 'assistant', sessionID: 'session-1', finish } },
+      },
+      { type: 'session.idle', properties: { sessionID: 'session-1' } },
+    ];
+
+    const { chunks } = await consume(
+      new OpencodeProvider().sendQuery('hi', '/tmp', undefined, { assistantConfig: TEST_MODEL })
+    );
+
+    expect(chunks).toEqual([
+      { type: 'result', sessionId: 'session-1', ...(stopReason ? { stopReason } : {}) },
+    ]);
+  });
+
+  test('conforms to the provider contract', async () => {
+    const cwd = await createTempProjectDir();
+    const sessionError = (error: Record<string, unknown>): AsyncGenerator<MessageChunk> => {
+      scriptedEvents = [{ type: 'session.error', properties: { sessionID: 'session-1', error } }];
+      return new OpencodeProvider().sendQuery('hi', '/tmp', undefined, {
+        assistantConfig: TEST_MODEL,
+      });
+    };
+    const violations = await runProviderConformance({
+      capabilities: new OpencodeProvider().getCapabilities(),
+      // Only the SDK's auth discriminator and HTTP status fields carry a class; anything
+      // else, including auth-sounding text, is `unknown`.
+      failureCases: [
+        {
+          name: 'unclassified session error',
+          expected: 'unknown',
+          evidence: 'upstream request failed',
+          run: () =>
+            sessionError({ name: 'APIError', data: { message: 'upstream request failed' } }),
+        },
+        {
+          name: 'auth-sounding text without a structured signal',
+          expected: 'unknown',
+          evidence: 'Unauthorized',
+          run: () => sessionError({ name: 'APIError', data: { message: 'Unauthorized' } }),
+        },
+        {
+          name: 'ProviderAuthError',
+          expected: 'auth',
+          evidence: 'provider rejected request',
+          run: () =>
+            sessionError({
+              name: 'ProviderAuthError',
+              data: { providerID: 'anthropic', message: 'provider rejected request' },
+            }),
+        },
+        {
+          name: 'HTTP 401',
+          expected: 'auth',
+          evidence: 'key revoked',
+          run: () =>
+            sessionError({ name: 'APIError', data: { message: 'key revoked', statusCode: 401 } }),
+        },
+        {
+          name: 'HTTP 429',
+          expected: 'rate_limited',
+          evidence: 'slow down',
+          run: () =>
+            sessionError({ name: 'APIError', data: { message: 'slow down', statusCode: 429 } }),
+        },
+      ],
+      turns: [
+        {
+          name: 'single session',
+          run: () => {
+            scriptedEvents = [
+              {
+                type: 'message.part.updated',
+                properties: {
+                  delta: 'Hello',
+                  part: { id: 't1', sessionID: 'session-1', type: 'text' },
+                },
+              },
+              { type: 'session.idle', properties: { sessionID: 'session-1' } },
+            ];
+            return new OpencodeProvider().sendQuery('hi', '/tmp', undefined, {
+              assistantConfig: TEST_MODEL,
+            });
+          },
+        },
+        {
+          name: 'multi-agent',
+          run: () => {
+            const sessionIds = ['scout-session'];
+            runtimeQueue.push(
+              makeRuntime({
+                sessionCreate: mock(async () => ({ data: { id: sessionIds.shift() } })),
+              })
+            );
+            scriptedEvents = [{ type: 'session.idle', properties: { sessionID: 'scout-session' } }];
+            return new OpencodeProvider().sendQuery('hi', cwd, undefined, {
+              assistantConfig: TEST_MODEL,
+              nodeConfig: {
+                nodeId: 'research',
+                agents: { scout: { description: 'Scout', prompt: 'Explore' } },
+              },
+            });
+          },
+        },
+      ],
+      toolTurn: {
+        name: 'tool turn',
+        run: () => {
+          scriptedEvents = [
+            ...toolTurnEvents,
+            { type: 'session.idle', properties: { sessionID: 'session-1' } },
+          ];
+          return new OpencodeProvider().sendQuery('hi', '/tmp', undefined, {
+            assistantConfig: TEST_MODEL,
+          });
+        },
+      },
+    });
+    expect(violations).toEqual([]);
+  });
+
+  test('multi-agent usage keeps cache from the sub-agent that reported it', async () => {
+    const cwd = await createTempProjectDir();
+    const sessionIds = ['scout-session', 'reviewer-session'];
+    const runtime = makeRuntime({
+      sessionCreate: mock(async () => ({ data: { id: sessionIds.shift() } })),
+    });
+    runtimeQueue.push(runtime);
+    scriptedEvents = [
+      {
+        type: 'message.updated',
+        properties: {
+          info: {
+            id: 'message-scout',
+            role: 'assistant',
+            sessionID: 'scout-session',
+            providerID: 'anthropic',
+            modelID: 'claude-sonnet',
+            cost: 0.25,
+            finish: 'stop',
+            tokens: { input: 11, output: 7, cache: { read: 5, write: 0 } },
+          },
+        },
+      },
+      {
+        type: 'message.updated',
+        properties: {
+          info: {
+            id: 'message-reviewer',
+            role: 'assistant',
+            sessionID: 'reviewer-session',
+            providerID: 'anthropic',
+            modelID: 'claude-sonnet',
+            cost: 0.25,
+            finish: 'stop',
+            // No `cache` key at all — this sub-agent reports no cache telemetry.
+            tokens: { input: 20, output: 3 },
+          },
+        },
+      },
+      { type: 'session.idle', properties: { sessionID: 'scout-session' } },
+      { type: 'session.idle', properties: { sessionID: 'reviewer-session' } },
+    ];
+
+    const { chunks, error } = await consume(
+      new OpencodeProvider().sendQuery('hi', cwd, undefined, {
+        assistantConfig: TEST_MODEL,
+        nodeConfig: {
+          nodeId: 'research',
+          agents: {
+            scout: { description: 'Scout', prompt: 'Explore' },
+            reviewer: { description: 'Reviewer', prompt: 'Review' },
+          },
+        },
+      })
+    );
+
+    expect(error).toBeUndefined();
+    // Scout's cache survives as a floor instead of being erased by the reviewer's silence,
+    // while gross input still sums across both sub-agents (#2662). Total stays absent because
+    // neither event reported the optional reasoning axis and one omitted cache telemetry.
+    expect(chunks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: 'result',
+          cost: 0.5,
+          tokens: {
+            input: 36,
+            output: 10,
+            cacheRead: 5,
+            cacheWrite: 0,
+            cachePartial: true,
+            cost: 0.5,
+          },
+        }),
+      ])
+    );
+  });
+
+  test('multi-agent usage omits total when a sub-agent reports no usage', async () => {
+    const cwd = await createTempProjectDir();
+    const sessionIds = ['scout-session', 'reviewer-session'];
+    const runtime = makeRuntime({
+      sessionCreate: mock(async () => ({ data: { id: sessionIds.shift() } })),
+    });
+    runtimeQueue.push(runtime);
+    scriptedEvents = [
+      {
+        type: 'message.updated',
+        properties: {
+          info: {
+            id: 'message-scout',
+            role: 'assistant',
+            sessionID: 'scout-session',
+            providerID: 'anthropic',
+            modelID: 'claude-sonnet',
+            tokens: { input: 11, output: 7, reasoning: 3, cache: { read: 5, write: 0 } },
+          },
+        },
+      },
+      {
+        type: 'message.updated',
+        properties: {
+          info: {
+            id: 'message-reviewer',
+            role: 'assistant',
+            sessionID: 'reviewer-session',
+            providerID: 'anthropic',
+            modelID: 'claude-sonnet',
+          },
+        },
+      },
+      { type: 'session.idle', properties: { sessionID: 'scout-session' } },
+      { type: 'session.idle', properties: { sessionID: 'reviewer-session' } },
+    ];
+
+    const { chunks, error } = await consume(
+      new OpencodeProvider().sendQuery('hi', cwd, undefined, {
+        assistantConfig: TEST_MODEL,
+        nodeConfig: {
+          nodeId: 'research',
+          agents: {
+            scout: { description: 'Scout', prompt: 'Explore' },
+            reviewer: { description: 'Reviewer', prompt: 'Review' },
+          },
+        },
+      })
+    );
+
+    expect(error).toBeUndefined();
+    expect(chunks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: 'result',
+          tokens: {
+            input: 16,
+            output: 7,
+            cacheRead: 5,
+            cacheWrite: 0,
+          },
         }),
       ])
     );
@@ -390,7 +1002,7 @@ describe('OpencodeProvider', () => {
             modelID: 'claude-sonnet',
             cost: 0.42,
             finish: 'stop',
-            tokens: { input: 11, output: 7, reasoning: 3, cache: 1 },
+            tokens: { input: 11, output: 7, reasoning: 3, cache: { read: 5, write: 0 } },
           },
         },
       },
@@ -409,9 +1021,16 @@ describe('OpencodeProvider', () => {
       {
         type: 'result',
         sessionId: 'session-1',
-        tokens: { input: 11, output: 7, total: 21, cost: 0.42 },
+        tokens: {
+          input: 16,
+          output: 7,
+          cacheRead: 5,
+          cacheWrite: 0,
+          total: 26,
+          cost: 0.42,
+        },
         cost: 0.42,
-        stopReason: 'stop',
+        stopReason: 'end_turn',
         resolvedModel: { id: 'claude-sonnet' },
       },
     ]);
@@ -444,8 +1063,9 @@ describe('OpencodeProvider', () => {
     expect(runtime.client.session.create).toHaveBeenCalledWith({ query: { directory: '/tmp' } });
     expect(chunks).toEqual([
       {
-        type: 'system',
-        content: '⚠️ Could not resume OpenCode session. Starting fresh conversation.',
+        type: 'warning',
+        code: 'opencode.resume_failed',
+        message: 'Could not resume OpenCode session. Starting fresh conversation.',
       },
       // A requested resume that fell back to a fresh session is reported as cold.
       { type: 'result', sessionId: 'fresh-session', resumed: false },
@@ -578,56 +1198,90 @@ describe('OpencodeProvider', () => {
     expect(mockLogger.warn).toHaveBeenCalledTimes(1);
   });
 
-  test('rate limit errors are classified as retryable and retried', async () => {
-    const retryRuntime = makeRuntime({
-      promptAsync: mock(async () => {
-        throw new Error('429 rate limit exceeded');
+  // The engine owns retry: a failed query is one attempt, reported once. Each case queues
+  // a healthy second runtime, so a provider that retried would succeed and hide the failure.
+  // The inline agent keeps the agent-not-found case on the path that used to refresh and retry.
+  test.each([
+    ['rate-limit text', new Error('429 rate limit exceeded'), 'unknown'],
+    ['crash text', new Error('socket hang up'), 'unknown'],
+    ['agent-not-found text', new Error("Agent not found: 'archon-reviewer'"), 'unknown'],
+    [
+      'structured 429',
+      Object.assign(new Error('upstream request failed'), {
+        cause: { name: 'APIError', data: { message: 'upstream request failed', statusCode: 429 } },
       }),
-    });
-    const successRuntime = makeRuntime();
-    runtimeQueue.push(retryRuntime, successRuntime);
-    scriptedEvents = [
-      {
-        type: 'session.idle',
-        properties: { sessionID: 'session-1' },
-      },
-    ];
+      'rate_limited',
+    ],
+    [
+      'ProviderAuthError',
+      Object.assign(new Error('provider rejected request'), { name: 'ProviderAuthError' }),
+      'auth',
+    ],
+  ] as const)('%s fails the turn in one attempt', async (_name, thrown, expectedClass) => {
+    runtimeQueue.push(
+      makeRuntime({
+        promptAsync: mock(async () => {
+          throw thrown;
+        }),
+      }),
+      makeRuntime()
+    );
+    scriptedEvents = [{ type: 'session.idle', properties: { sessionID: 'session-1' } }];
 
-    const { chunks, error } = await consume(
-      new OpencodeProvider({ retryBaseDelayMs: 1 }).sendQuery('hi', '/tmp', undefined, {
+    const cwd = await createTempProjectDir();
+
+    const { chunks, failure } = await consume(
+      new OpencodeProvider().sendQuery('hi', cwd, undefined, {
         assistantConfig: TEST_MODEL,
+        nodeConfig: {
+          nodeId: 'node-1',
+          agents: { reviewer: { description: 'Review agent', prompt: 'Return review' } },
+        },
       })
     );
 
-    expect(error).toBeUndefined();
-    expect(chunks).toEqual([{ type: 'result', sessionId: 'session-1' }]);
-    expect(mockCreateOpencode).toHaveBeenCalledTimes(2);
-    expect(mockLogger.info).toHaveBeenCalledWith(
-      { attempt: 0, delayMs: 1, errorClass: 'rate_limit' },
-      'opencode.retrying_query'
-    );
+    // Only the failure result precedes `settled`.
+    expect(chunks).toEqual([expect.objectContaining({ type: 'result', isError: true })]);
+    expect(failure?.class).toBe(expectedClass);
+    expect(failure?.evidence).toContain(thrown.message);
+    expect(mockCreateOpencode).toHaveBeenCalledTimes(1);
   });
 
-  test('auth errors are classified as non-retryable and do not retry', async () => {
-    const runtime = makeRuntime({
-      promptAsync: mock(async () => {
-        const error = new Error('401 unauthorized api key');
-        error.name = 'AuthenticationError';
-        throw error;
+  test('a structured 429 from the multi-agent session stream fails the turn in one attempt', async () => {
+    const cwd = await createTempProjectDir();
+    const sdkError = {
+      name: 'APIError',
+      data: { message: 'upstream request failed', statusCode: 429, isRetryable: true },
+    };
+    const sessionIds = ['scout-session', 'reviewer-session'];
+    runtimeQueue.push(
+      makeRuntime({
+        sessionCreate: mock(async () => ({ data: { id: sessionIds.shift() } })),
+        subscribe: mock(async () => ({
+          stream: createEventStream([
+            { type: 'session.error', properties: { sessionID: 'scout-session', error: sdkError } },
+          ]),
+        })),
       }),
-    });
-    runtimeQueue.push(runtime);
+      makeRuntime()
+    );
 
-    const { chunks, error } = await consume(
-      new OpencodeProvider({ retryBaseDelayMs: 1 }).sendQuery('hi', '/tmp', undefined, {
+    const { failure } = await consume(
+      new OpencodeProvider().sendQuery('hi', cwd, undefined, {
         assistantConfig: TEST_MODEL,
+        nodeConfig: {
+          nodeId: 'research',
+          agents: {
+            scout: { description: 'Scout', prompt: 'Explore' },
+            reviewer: { description: 'Reviewer', prompt: 'Review' },
+          },
+        },
       })
     );
 
-    expect(chunks).toEqual([]);
-    expect(error?.message).toContain('OpenCode auth: 401 unauthorized api key');
+    expect(failure?.class).toBe('rate_limited');
+    expect(failure?.evidence).toContain('upstream request failed');
     expect(mockCreateOpencode).toHaveBeenCalledTimes(1);
-    expect(mockLogger.info).not.toHaveBeenCalledWith(expect.any(Object), 'opencode.retrying_query');
   });
 
   test('abort propagates to the OpenCode session and surfaces aborted error', async () => {
@@ -652,7 +1306,7 @@ describe('OpencodeProvider', () => {
     const { chunks, error } = await consumption;
 
     expect(chunks).toEqual([]);
-    expect(error?.message).toBe('OpenCode query aborted');
+    expect(error?.message).toStartWith('OpenCode query aborted');
     expect(runtime.client.session.abort).toHaveBeenCalledWith({
       path: { id: 'session-1' },
       query: { directory: '/tmp' },
@@ -727,6 +1381,20 @@ describe('OpencodeProvider', () => {
     expect(startupPort).toBeGreaterThan(0);
   });
 
+  test("embedded runtime config does not set a permission policy, preserving the user's own OpenCode config (#3332)", async () => {
+    const runtime = makeRuntime({ close: mock(() => undefined) });
+    runtimeQueue.push(runtime);
+    scriptedEvents = [{ type: 'session.idle', properties: { sessionID: 'session-1' } }];
+
+    const { error } = await consume(
+      new OpencodeProvider().sendQuery('one', '/tmp', undefined, { assistantConfig: TEST_MODEL })
+    );
+
+    expect(error).toBeUndefined();
+    const call = mockCreateOpencode.mock.calls[0] as Array<{ config?: Record<string, unknown> }>;
+    expect(call[0]?.config).not.toHaveProperty('permission');
+  });
+
   test('embedded runtime retries startup on port conflict and succeeds', async () => {
     startupErrors.push(new Error('Failed to start server on port 4096'));
     const runtime = makeRuntime({ close: mock(() => undefined) });
@@ -771,14 +1439,15 @@ describe('OpencodeProvider', () => {
   test('embedded runtime does not retry non-port startup errors', async () => {
     startupErrors.push(new Error('OpenCode binary missing'));
 
-    const { chunks, error } = await consume(
+    const { chunks, failure } = await consume(
       new OpencodeProvider().sendQuery('no retry startup', '/tmp', undefined, {
         assistantConfig: TEST_MODEL,
       })
     );
 
-    expect(chunks).toEqual([]);
-    expect(error?.message).toContain('OpenCode binary missing');
+    // Only the failure result precedes `settled`.
+    expect(chunks).toEqual([expect.objectContaining({ type: 'result', isError: true })]);
+    expect(failure?.evidence).toContain('OpenCode binary missing');
     expect(mockCreateOpencode).toHaveBeenCalledTimes(1);
     expect(mockLogger.warn).not.toHaveBeenCalledWith(
       expect.any(Object),
@@ -971,43 +1640,6 @@ describe('OpencodeProvider', () => {
     expect(callOrder).toEqual(['dispose', 'prompt']);
   });
 
-  test('retries once when first attempt fails with agent-not-found for inline agents', async () => {
-    const cwd = await createTempProjectDir();
-    const failingRuntime = makeRuntime({
-      promptAsync: mock(async () => {
-        throw new Error("Agent not found: 'archon-reviewer'");
-      }),
-    });
-    const successRuntime = makeRuntime();
-    runtimeQueue.push(failingRuntime, successRuntime);
-    scriptedEvents = [{ type: 'session.idle', properties: { sessionID: 'session-1' } }];
-
-    const nodeConfig = {
-      nodeId: 'node-2',
-      agents: {
-        reviewer: {
-          description: 'Review agent',
-          prompt: 'Return review',
-        },
-      },
-    };
-
-    const { chunks, error } = await consume(
-      new OpencodeProvider({ retryBaseDelayMs: 1 }).sendQuery('hi', cwd, undefined, {
-        assistantConfig: TEST_MODEL,
-        nodeConfig,
-      })
-    );
-
-    expect(error).toBeUndefined();
-    expect(chunks).toEqual([{ type: 'result', sessionId: 'session-1' }]);
-    expect(mockCreateOpencode).toHaveBeenCalledTimes(2);
-    expect(mockLogger.info).toHaveBeenCalledWith(
-      { attempt: 0, sessionCwd: join(cwd, '.archon-opencode', 'node-2') },
-      'opencode.retrying_after_agent_refresh'
-    );
-  });
-
   test('agent config with model override injects model into promptAsync body', async () => {
     const cwd = await createTempProjectDir();
     const runtime = makeRuntime();
@@ -1094,146 +1726,6 @@ describe('OpencodeProvider', () => {
     });
   });
 
-  test('external baseUrl mode is rejected to enforce managed runtime control', async () => {
-    const cwd = await createTempProjectDir();
-    const nodeConfig = {
-      agents: {
-        reviewer: {
-          description: 'Review agent',
-          prompt: 'Review safely',
-        },
-      },
-    };
-
-    const { chunks, error } = await consume(
-      new OpencodeProvider().sendQuery('hi', cwd, undefined, {
-        assistantConfig: { ...TEST_MODEL, baseUrl: 'http://remote-opencode.local' },
-        nodeConfig,
-      })
-    );
-
-    expect(chunks).toEqual([]);
-    expect(error?.message).toContain('external baseUrl mode is no longer supported');
-    expect(mockCreateOpencodeClient).not.toHaveBeenCalled();
-    expect(mockCreateOpencode).not.toHaveBeenCalled();
-  });
-
-  test('external baseUrl mode is rejected even when pre-generated agent files exist', async () => {
-    const cwd = await createTempProjectDir();
-    const agentsDir = join(cwd, '.opencode', 'agents');
-    await mkdir(agentsDir, { recursive: true });
-    await writeFile(
-      join(agentsDir, 'archon-reviewer.md'),
-      ['---', 'name: archon-reviewer', 'description: "Review agent"', '---', '', 'Review'].join(
-        '\n'
-      ),
-      'utf8'
-    );
-    await writeFile(join(agentsDir, 'custom-agent.md'), '# user content\n', 'utf8');
-
-    const runtime = makeRuntime();
-    runtimeQueue.push(runtime);
-    scriptedEvents = [{ type: 'session.idle', properties: { sessionID: 'session-1' } }];
-
-    const nodeConfig = {
-      agents: {
-        reviewer: {
-          description: 'Review agent',
-          prompt: 'Review',
-        },
-      },
-    };
-
-    const { error } = await consume(
-      new OpencodeProvider().sendQuery('hi', cwd, undefined, {
-        assistantConfig: { ...TEST_MODEL, baseUrl: 'http://remote-opencode.local' },
-        nodeConfig,
-      })
-    );
-
-    expect(error?.message).toContain('external baseUrl mode is no longer supported');
-    expect(await readFile(join(agentsDir, 'custom-agent.md'), 'utf8')).toBe('# user content\n');
-    expect(mockCreateOpencodeClient).not.toHaveBeenCalled();
-    expect(mockCreateOpencode).not.toHaveBeenCalled();
-  });
-
-  test('external baseUrl mode rejection happens before runtime/dispose side effects', async () => {
-    const cwd = await createTempProjectDir();
-    const agentsDir = join(cwd, '.opencode', 'agents');
-    await mkdir(agentsDir, { recursive: true });
-    await writeFile(
-      join(agentsDir, 'archon-reviewer.md'),
-      ['---', 'name: archon-reviewer', 'description: "Review agent"', '---', '', 'Review'].join(
-        '\n'
-      ),
-      'utf8'
-    );
-
-    const callOrder: string[] = [];
-    const runtime = makeRuntime({
-      instanceDispose: mock(async () => {
-        callOrder.push('dispose');
-        return true;
-      }),
-      promptAsync: mock(async () => {
-        callOrder.push('prompt');
-      }),
-    });
-    runtimeQueue.push(runtime);
-    scriptedEvents = [{ type: 'session.idle', properties: { sessionID: 'session-1' } }];
-
-    const nodeConfig = {
-      nodeId: 'node-remote',
-      agents: {
-        reviewer: {
-          description: 'Review agent',
-          prompt: 'Review',
-        },
-      },
-    };
-
-    const { error } = await consume(
-      new OpencodeProvider().sendQuery('hi', cwd, undefined, {
-        assistantConfig: { ...TEST_MODEL, baseUrl: 'http://remote-opencode.local' },
-        nodeConfig,
-      })
-    );
-
-    expect(error?.message).toContain('external baseUrl mode is no longer supported');
-    expect(runtime.client.instance.dispose).not.toHaveBeenCalled();
-    expect(callOrder).toEqual([]);
-    expect(mockCreateOpencode).not.toHaveBeenCalled();
-    expect(mockCreateOpencodeClient).not.toHaveBeenCalled();
-  });
-
-  test('external baseUrl mode rejects multi-agent execution with same deprecation error', async () => {
-    const cwd = await createTempProjectDir();
-    const agentsDir = join(cwd, '.opencode', 'agents');
-    await mkdir(agentsDir, { recursive: true });
-    await writeFile(join(agentsDir, 'archon-agent-a.md'), '---\nmode: subagent\n---\nA\n', 'utf8');
-    await writeFile(join(agentsDir, 'archon-agent-b.md'), '---\nmode: subagent\n---\nB\n', 'utf8');
-
-    const nodeConfig = {
-      nodeId: 'node-multi-remote',
-      agents: {
-        'agent-a': { description: 'A', prompt: 'A' },
-        'agent-b': { description: 'B', prompt: 'B' },
-      },
-    };
-
-    const { chunks, error } = await consume(
-      new OpencodeProvider().sendQuery('hi', cwd, undefined, {
-        assistantConfig: { ...TEST_MODEL, baseUrl: 'http://remote-opencode.local' },
-        nodeConfig,
-      })
-    );
-
-    expect(chunks).toEqual([]);
-    expect(error?.message).toContain('external baseUrl mode is no longer supported');
-    expect(mockCreateOpencodeClient).not.toHaveBeenCalled();
-    expect(mockCreateOpencode).not.toHaveBeenCalled();
-  });
-
   test('uses node prompt as task when agent is configured', async () => {
     const cwd = await createTempProjectDir();
     const runtime = makeRuntime();
@@ -1306,7 +1798,7 @@ describe('OpencodeProvider', () => {
           // No prompt field
         },
       },
-    };
+    } as unknown as NodeConfig;
 
     const { error } = await consume(
       new OpencodeProvider().sendQuery('fallback node prompt', cwd, undefined, {
@@ -1338,17 +1830,60 @@ describe('OpencodeProvider', () => {
       },
     };
 
-    const { chunks, error } = await consume(
+    const { chunks, failure } = await consume(
       new OpencodeProvider().sendQuery('hi', '/tmp', undefined, {
         assistantConfig: TEST_MODEL,
         nodeConfig,
       })
     );
 
-    expect(chunks).toEqual([]);
-    expect(error).toBeDefined();
-    expect(error?.message).toContain(
+    // Only the failure result precedes `settled`.
+    expect(chunks).toEqual([expect.objectContaining({ type: 'result', isError: true })]);
+    expect(failure?.class).toBe('unknown');
+    expect(failure?.evidence).toContain(
       "Invalid OpenCode agent model ref for 'bad-agent': 'invalid-no-slash-format'"
     );
+  });
+});
+
+describe('opencodeFailureClass', () => {
+  test('reads exact structured statuses across top-level, SDK, and wrapped shapes', () => {
+    const cases = [
+      [401, 'auth'],
+      [403, 'auth'],
+      [429, 'rate_limited'],
+      [500, 'unknown'],
+    ] as const;
+
+    for (const [statusCode, expectedClass] of cases) {
+      expect(opencodeFailureClass({ statusCode })).toBe(expectedClass);
+
+      const sdkError = { name: 'APIError', data: { message: 'request failed', statusCode } };
+      expect(opencodeFailureClass(sdkError)).toBe(expectedClass);
+
+      const wrappedError = new Error('request failed');
+      wrappedError.cause = sdkError;
+      expect(opencodeFailureClass(wrappedError)).toBe(expectedClass);
+    }
+  });
+
+  test('reads the SDK auth discriminator through Error.cause', () => {
+    const authError = new Error('provider rejected request');
+    authError.cause = {
+      name: 'ProviderAuthError',
+      data: { providerID: 'anthropic', message: 'provider rejected request' },
+    };
+    expect(opencodeFailureClass(authError)).toBe('auth');
+  });
+
+  test('never classifies from the message text', () => {
+    for (const message of [
+      'Selected model is at capacity',
+      '401 Unauthorized',
+      'rate limit exceeded',
+      '429 too many requests',
+    ]) {
+      expect(opencodeFailureClass(new Error(message))).toBe('unknown');
+    }
   });
 });

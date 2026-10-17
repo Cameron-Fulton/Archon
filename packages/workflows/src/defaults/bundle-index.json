@@ -1,0 +1,4 @@
+{
+  "$comment": "Only listed packs ship. sdlc is the maintained reference pack. Client, maintainer, experimental and test workflows are project content.",
+  "packs": ["sdlc"]
+}

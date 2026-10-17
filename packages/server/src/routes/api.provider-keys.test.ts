@@ -3,7 +3,8 @@ import { OpenAPIHono } from '@hono/zod-openapi';
 import type { ConversationLockManager } from '@archon/core';
 import type { WebAdapter } from '../adapters/web';
 import { validationErrorHook } from './openapi-defaults';
-import { mockAllWorkflowModules } from '../test/workflow-mock-factories';
+import { makeIdleLockStats } from '../test/conversation-lock-fixtures';
+import { makeListDashboardRunsMock, mockAllWorkflowModules } from '../test/workflow-mock-factories';
 
 // ---------------------------------------------------------------------------
 // Mock setup — must precede the dynamic import of ./api below. Exercises the
@@ -33,6 +34,7 @@ mock.module('../auth', () => ({
   isWebAuthEnabled: () => false,
   getSignupMode: () => 'disabled',
   isApiGateEnabled: () => false,
+  isConversationOwnershipEnforced: () => false,
 }));
 
 // --- Identity resolution (X-Archon-User → user) ---
@@ -78,15 +80,6 @@ class InvalidProviderKeyError extends Error {
   }
 }
 
-// Mirror core's retryable port-wedge error so the oauth/start route's
-// `instanceof` check (actionable 503 vs opaque 500) is exercised (#1963).
-class OAuthCallbackPortBusyError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'OAuthCallbackPortBusyError';
-  }
-}
-
 let keysEnabled = true;
 let savedKeys: { userId: string; provider: string; apiKey: string; label: string | null }[] = [];
 
@@ -122,18 +115,24 @@ const mockStartOAuth = mock(async (_userId: string, provider: string) => ({
   url: `https://auth/${provider}`,
   expiresIn: 600,
 }));
-const mockPollOAuth = mock((_sessionId: string, _userId: string, _code?: string) => ({
-  status: 'pending' as const,
+const mockPollOAuth = mock<typeof import('@archon/core')['pollOAuth']>(() => ({
+  status: 'pending',
 }));
 
 mock.module('@archon/core', () => ({
   handleMessage: mock(async () => {}),
   getDatabaseType: () => 'postgresql',
   loadConfig: mock(async () => ({})),
+  ProjectRegistrationError: class ProjectRegistrationError extends Error {},
+  inspectProjectBaseBranch: mock(async () => ({
+    kind: 'repo',
+    defaultBranch: 'dev',
+    reason: null,
+  })),
   cloneRepository: mock(async () => ({ codebaseId: 'x', alreadyExisted: false })),
   registerRepository: mock(async () => ({ codebaseId: 'x', alreadyExisted: false })),
   ConversationNotFoundError: class ConversationNotFoundError extends Error {},
-  generateAndSetTitle: mock(async () => {}),
+  generateTitleForUser: mock(async () => {}),
   resolveTitleRequest: mock(async () => ({ provider: 'claude', options: {} })),
   isPerUserGitHubEnabled: () => false,
   getArchonWorkspacesPath: () => '/tmp/.archon/workspaces',
@@ -158,15 +157,14 @@ mock.module('@archon/core', () => ({
   SUBSCRIPTION_PROVIDERS: SUBSCRIPTION,
   startOAuth: mockStartOAuth,
   pollOAuth: mockPollOAuth,
-  OAuthCallbackPortBusyError,
 }));
 
 mock.module('@archon/paths', () => ({
+  canonicalizeProjectPath: async (path: string) => path,
   createLogger: noopLogger,
   getWorkflowFolderSearchPaths: mock(() => ['.archon/workflows']),
   getCommandFolderSearchPaths: mock(() => ['.archon/commands']),
-  getDefaultCommandsPath: mock(() => '/tmp/.archon-test-nonexistent/commands/defaults'),
-  getDefaultWorkflowsPath: mock(() => '/tmp/.archon-test-nonexistent/workflows/defaults'),
+  getBundledWorkflowsPath: mock(() => '/tmp/.archon-test-nonexistent/workflows'),
   getArchonWorkspacesPath: () => '/tmp/.archon/workspaces',
   getArchonHome: () => '/tmp/.archon',
   getRunArtifactsPath: (owner: string, repo: string, runId: string): string =>
@@ -203,11 +201,7 @@ mock.module('@archon/core/db/isolation-environments', () => ({
 
 mock.module('@archon/core/db/workflows', () => ({
   listWorkflowRuns: mock(async () => []),
-  listDashboardRuns: mock(async () => ({
-    runs: [],
-    total: 0,
-    counts: { all: 0, running: 0, completed: 0, failed: 0, cancelled: 0, pending: 0 },
-  })),
+  listDashboardRuns: makeListDashboardRunsMock(),
   getWorkflowRun: mock(async () => null),
   getWorkflowRunByWorkerPlatformId: mock(async () => null),
 }));
@@ -223,7 +217,7 @@ mock.module('@archon/core/db/messages', () => ({
 }));
 
 mock.module('@archon/core/utils/commands', () => ({
-  findMarkdownFilesRecursive: mock(async () => []),
+  findCommandFiles: mock(async () => []),
 }));
 
 import { registerApiRoutes } from './api';
@@ -242,7 +236,7 @@ function makeApp(): OpenAPIHono {
       await fn();
       return { status: 'started' };
     }),
-    getStats: mock(() => ({ active: 0, queued: 0 })),
+    getStats: mock(makeIdleLockStats),
   } as unknown as ConversationLockManager;
   registerApiRoutes(app, mockWebAdapter, mockLockManager);
   return app;
@@ -287,7 +281,13 @@ describe('GET /api/auth/providers', () => {
     const body = (await res.json()) as {
       enabled: boolean;
       available: string[];
-      agents: { id: string; catalog: string; ready: boolean }[];
+      agents: {
+        id: string;
+        displayName: string;
+        catalog: string;
+        ready: boolean;
+        credentials: unknown[];
+      }[];
     };
     expect(body.enabled).toBe(false);
     expect(body.available.length).toBeGreaterThan(0);
@@ -442,6 +442,35 @@ describe('DELETE /api/auth/providers/:provider', () => {
     expect(res2.status).toBe(200);
   });
 
+  test('unauthenticated request cannot disconnect another user by supplying their ID', async () => {
+    const originalKeys = [...savedKeys];
+    const res = await makeApp().request('/api/auth/providers/openrouter?userId=user-from-alice', {
+      method: 'DELETE',
+    });
+    expect(res.status).toBe(401);
+    expect(mockDelete).not.toHaveBeenCalled();
+    expect(savedKeys).toEqual(originalKeys);
+  });
+
+  test('session user cannot disconnect another user through a conflicting header', async () => {
+    savedKeys.push({
+      userId: 'user-from-bob',
+      provider: 'openrouter',
+      apiKey: 'bob-key',
+      label: null,
+    });
+    authInstance = { api: { getSession: async () => ({ user: { id: 'alice', name: 'Alice' } }) } };
+    const res = await makeApp().request('/api/auth/providers/openrouter?userId=user-from-bob', {
+      method: 'DELETE',
+      headers: { 'X-Archon-User': 'bob' },
+    });
+    expect(res.status).toBe(200);
+    expect(mockDelete).toHaveBeenCalledWith('user-from-alice', 'openrouter');
+    expect(savedKeys).toEqual([
+      { userId: 'user-from-bob', provider: 'openrouter', apiKey: 'bob-key', label: null },
+    ]);
+  });
+
   test("legacy 'claude' id deletes the migrated 'anthropic' row", async () => {
     const res = await makeApp().request('/api/auth/providers/claude', {
       method: 'DELETE',
@@ -518,23 +547,6 @@ describe('POST /api/auth/providers/:provider/oauth/start', () => {
     });
     expect(res.status).toBe(500);
     expect(await res.text()).not.toContain('53999');
-  });
-
-  test('held callback port → 503 with the actionable message (#1963)', async () => {
-    mockStartOAuth.mockRejectedValueOnce(
-      new OAuthCallbackPortBusyError(
-        "A previous 'anthropic' login attempt is still holding the OAuth callback port. " +
-          'Wait a few seconds and retry; if it persists, restart the Archon server.'
-      )
-    );
-    const res = await makeApp().request('/api/auth/providers/claude/oauth/start', {
-      method: 'POST',
-      headers: ALICE,
-    });
-    expect(res.status).toBe(503);
-    const body = (await res.json()) as { error: string };
-    expect(body.error).toContain('callback port');
-    expect(body.error).toContain('retry');
   });
 
   test('no identity → 401', async () => {

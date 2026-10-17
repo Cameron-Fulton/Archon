@@ -1,3 +1,4 @@
+// @archon-test-isolated
 /**
  * Integration test: isolation-environment `metadata` normalization against a REAL
  * bun:sqlite database.
@@ -9,13 +10,16 @@
  * container during Phase B smoke testing. This runs the store's read/write path
  * against a real SqliteAdapter so the round trip is exercised end-to-end: the raw
  * column comes back as a string, and the store's `normalizeEnvironmentRow` boundary
- * turns it into a real object for every consumer.
+ * turns it into a real object for every consumer — including `created_at`, which
+ * must arrive as the UTC `Date` the type promises, not zone-less TEXT.
  *
- * Runs in its own `bun test` invocation (see package.json) — it mock.module's
+ * Runs in its own `bun test` invocation (declared by @archon-test-isolated) — it mock.module's
  * ./connection with a real adapter, conflicting with isolation-environments.test.ts's
  * fake.
  */
 import { describe, test, expect, mock } from 'bun:test';
+import { sameWorktreeRegistration } from '@archon/isolation/types';
+import { toBranchName } from '@archon/git';
 
 mock.module('@archon/paths', () => ({
   createLogger: () => ({
@@ -38,7 +42,7 @@ mock.module('./connection', () => ({
   getDatabaseType: () => 'sqlite',
 }));
 
-const { create, getById, listByCodebase, updateMetadata } =
+const { create, getById, listByCodebase, updateMetadata, findLatestByCodebaseAndWorkingPath } =
   await import('./isolation-environments');
 
 // isolation_environments.codebase_id is NOT NULL with an enforced FK — seed a parent.
@@ -131,4 +135,110 @@ describe('isolation-environments metadata — real SQLite round trip', () => {
       volume: 'archon-merge-upper',
     });
   });
+
+  test('SQLite stores created_at as zone-less TEXT, but the store returns a UTC-hydrated Date', async () => {
+    // Insert EXACTLY as SQLite writes it: created_at as zone-less UTC TEXT via
+    // the shape datetime('now') produces — under America/New_York a naive Date
+    // parse yields 2026-08-26T09:00 EDT (= 13:00Z), four hours after the true
+    // instant; east of UTC the sign flips.
+    const id = 'ts-env-1';
+    await db.query(
+      `INSERT INTO remote_agent_isolation_environments
+         (id, codebase_id, workflow_type, workflow_id, provider, working_path, branch_name, status, created_at)
+       VALUES ($1, 'cb-1', 'task', 'wf-ts-1', 'container', '/tmp/ts-hydrate', 'impl-ts-1', 'destroyed',
+         '2026-08-26 09:00:00')`,
+      [id]
+    );
+    // Prove the RAW column is unzoned TEXT (the naive reader's lie).
+    const raw = await db.query<{ created_at: unknown }>(
+      'SELECT created_at FROM remote_agent_isolation_environments WHERE id = $1',
+      [id]
+    );
+    expect(raw.rows[0]?.created_at).toBe('2026-08-26 09:00:00');
+
+    const fetched = await getById(id);
+    expect(fetched?.created_at).toEqual(new Date('2026-08-26T09:00:00.000Z'));
+  });
+
+  test('the historical lookup normalizes its adopted row the same way', async () => {
+    const env = await findLatestByCodebaseAndWorkingPath(
+      'cb-1',
+      '/tmp/ts-hydrate',
+      new Date('2026-09-01T00:00:00.000Z')
+    );
+    expect(env?.id).toBe('ts-env-1');
+    expect(env?.created_at).toEqual(new Date('2026-08-26T09:00:00.000Z'));
+  });
+
+  test('historical lookup selects the newest estate at or before the run cutoff', async () => {
+    const rows = [
+      ['history-old', 'wf-history-old', 'old-branch', '2026-08-25 08:00:00'],
+      ['history-intended', 'wf-history-intended', 'intended-branch', '2026-08-25 09:00:00'],
+      ['history-later', 'wf-history-later', 'later-branch', '2026-08-25 11:00:00'],
+    ] as const;
+    for (const [id, workflowId, branch, createdAt] of rows) {
+      await db.query(
+        `INSERT INTO remote_agent_isolation_environments
+           (id, codebase_id, workflow_type, workflow_id, provider, working_path,
+            branch_name, status, created_at, metadata)
+         VALUES ($1, 'cb-1', 'task', $2, 'worktree', '/tmp/shared-estate',
+                 $3, 'destroyed', $4, '{}')`,
+        [id, workflowId, branch, createdAt]
+      );
+    }
+
+    const selected = await findLatestByCodebaseAndWorkingPath(
+      'cb-1',
+      '/tmp/shared-estate',
+      new Date('2026-08-25T10:00:00.000Z')
+    );
+
+    expect(selected?.id).toBe('history-intended');
+    expect(selected?.branch_name).toBe('intended-branch');
+  });
 });
+
+const legacyMetadataCases = [
+  [
+    'integer-like key added by metadata merge',
+    '{"label":"legacy","1":"step result"}',
+    '{"1":"step result","label":"legacy"}',
+  ],
+  ['nested object key order', '{"nested":{"b":2,"a":1}}', '{"nested":{"a":1,"b":2}}'],
+  ['numeric representation', '{"value":1.0}', '{"value":1}'],
+  ['array order changed', '{"value":[1,2]}', '{"value":[2,1]}'],
+  ['nested value changed', '{"nested":{"value":1}}', '{"nested":{"value":2}}'],
+  ['key added', '{}', '{"extra":null}'],
+  ['key removed', '{"extra":null}', '{}'],
+  ['JSON type changed', '{"value":true}', '{"value":1}'],
+  ['empty container changed', '{"value":{}}', '{"value":[]}'],
+  ['quoted key changed', '{"a.b":{"c\\\"d":1}}', '{"a.b":{"c\\\"d":2}}'],
+] as const;
+
+for (const [name, persisted, selected] of legacyMetadataCases) {
+  test(`SQLite conditional adoption agrees with shared registration equality: ${name}`, async () => {
+    const created = await create({
+      codebase_id: 'cb-1',
+      workflow_type: 'task',
+      workflow_id: `conformance-${name}`,
+      working_path: '/tmp/legacy',
+      branch_name: toBranchName('legacy'),
+    });
+    await db.query('UPDATE remote_agent_isolation_environments SET metadata = $1 WHERE id = $2', [
+      persisted,
+      created.id,
+    ]);
+    const current = (await getById(created.id))!;
+    const observed = { ...current, metadata: JSON.parse(selected) };
+    const matches = sameWorktreeRegistration(current, observed);
+    if (matches) {
+      await updateMetadata(current.id, { adopted: true }, observed);
+      expect((await getById(current.id))?.metadata).toEqual({ ...current.metadata, adopted: true });
+    } else {
+      await expect(updateMetadata(current.id, { adopted: true }, observed)).rejects.toThrow(
+        'changed during adoption'
+      );
+      expect(await getById(current.id)).toEqual(current);
+    }
+  });
+}

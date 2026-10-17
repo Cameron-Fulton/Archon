@@ -1,31 +1,5 @@
-/**
- * Shared structured-output helpers.
- *
- * Best-effort providers (Pi/Copilot) have no native JSON-mode equivalent to
- * Claude's `outputFormat` or Codex's `outputSchema`, so they use a two-step
- * approach:
- *   1. Augment the user prompt with a "respond with JSON matching this schema"
- *      instruction, so instruction-following models emit parseable JSON.
- *   2. After the run completes, parse the accumulated assistant transcript
- *      (`tryParseStructuredOutput`).
- *
- * When parsing fails it returns `undefined`. For a node that declared
- * `output_format`, the dag-executor re-asks best-effort providers up to 3× (with
- * the schema errors appended) and then FAILS the node — it no longer degrades
- * silently to a warning. Enforced providers fail fast (no reask).
- *
- * This module also owns the cross-provider validation layer the dag-executor
- * runs for EVERY provider (enforced and best-effort): `validateStructuredOutput()`
- * checks a parsed value against the node's declared JSON Schema (ajv), and
- * `formatSchemaErrors()` renders the failures for logs and the reask prompts.
- */
-// Direct `ajv` / `jsonrepair` imports (not via @hono/zod-openapi): @archon/providers
-// is an SDK-deps-only leaf package that must not pull in Hono. Precedent: the
-// direct `zod` import in claude/native-tools.ts (see CLAUDE.md Zod conventions).
-// ajv MUST resolve to ^8 — a transitive ajv@6 exists in the tree with a different
-// API/draft; the package.json `^8` dep pins it per package.
-import Ajv, { type ErrorObject, type ValidateFunction } from 'ajv';
 import { jsonrepair } from 'jsonrepair';
+import { isObjectSchemaNode } from '@archon/provider-contract';
 
 /**
  * Append a "respond with JSON matching this schema" instruction to the user
@@ -139,18 +113,6 @@ function tryJsonParseObject(text: string): unknown {
 }
 
 /**
- * True when `node`'s shape marks it as a JSON-Schema object node: it declares
- * `type: 'object'` (or a type union including `'object'`) or carries a
- * `properties` map. OpenAI strict-mode requires `additionalProperties: false`
- * on exactly these nodes.
- */
-function isObjectSchemaNode(node: Record<string, unknown>): boolean {
-  const typeIncludesObject =
-    node.type === 'object' || (Array.isArray(node.type) && node.type.includes('object'));
-  return typeIncludesObject || 'properties' in node;
-}
-
-/**
  * Recursively inject `additionalProperties: false` on every object schema so a
  * JSON Schema satisfies OpenAI's Structured Outputs strict-mode validator.
  *
@@ -230,88 +192,4 @@ export function hasOpenAdditionalProperties(schema: unknown): boolean {
     return true;
   }
   return Object.values(node).some(hasOpenAdditionalProperties);
-}
-
-// ─── Schema validation (ajv) ─────────────────────────────────────────────────
-
-/**
- * Single process-wide ajv instance. `strict: false` keeps it tolerant of the
- * dialect drift real author schemas carry (unknown keywords/formats are ignored
- * rather than throwing at compile time); `allErrors: true` surfaces every
- * failure at once so a reask prompt can list them all.
- */
-const ajv = new Ajv({ allErrors: true, strict: false });
-
-/**
- * Compiled-validator cache keyed by the schema object identity. Compilation is
- * the cost (validation is cheap), and the dag-executor passes the same
- * `node.output_format` object across a node's lifetime (including every reask
- * attempt), so a WeakMap keyed by reference is a free hit without holding the
- * schema alive past its node.
- */
-const validatorCache = new WeakMap<object, ValidateFunction>();
-
-/**
- * Discriminated so the `errors` array only exists on the failure branch — the
- * caller can't read errors off a valid result, and a valid result can't smuggle
- * a non-empty errors list.
- */
-export type StructuredValidationResult = { valid: true } | { valid: false; errors: string[] };
-
-/**
- * Validate a parsed structured-output value against the node's declared JSON
- * Schema. Used for EVERY provider that declares `output_format` — even
- * SDK-enforced ones (Claude/Codex/OpenCode) need this net for the refusal /
- * `max_tokens`-truncation edges that bypass grammar-constrained decoding.
- *
- * The author's schema is validated as written — `additionalProperties` is NOT
- * required (that is an OpenAI-strict-mode concern handled separately by the
- * Codex normalizer), and optional fields stay optional.
- *
- * Fail-SAFE on a schema that ajv cannot compile (exotic dialect, bad `$ref`):
- * returns `{ valid: true }` so an un-compilable schema never turns a
- * genuinely-correct provider response into a spurious node failure. The compile
- * error is handed to the caller via the `onCompileError` hook, which the
- * dag-executor uses to both log AND surface a user-facing warning (so a schema
- * that silently can't be enforced doesn't go unnoticed).
- */
-export function validateStructuredOutput(
-  value: unknown,
-  schema: Record<string, unknown>,
-  onCompileError?: (message: string) => void
-): StructuredValidationResult {
-  let validate = validatorCache.get(schema);
-  if (!validate) {
-    try {
-      validate = ajv.compile(schema);
-      validatorCache.set(schema, validate);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      onCompileError?.(message);
-      // Can't validate → don't block. The net only covers compilable schemas.
-      return { valid: true };
-    }
-  }
-
-  if (validate(value)) return { valid: true };
-  return { valid: false, errors: formatSchemaErrors(validate.errors) };
-}
-
-/**
- * Render ajv errors as `path: message` lines for reask prompts and logs.
- * `instancePath` is empty for a root-level failure (e.g. a missing top-level
- * required field), rendered as `(root)`. Returns a single generic line when ajv
- * reports a failure with no error detail (shouldn't happen with `allErrors`).
- */
-export function formatSchemaErrors(errors: ErrorObject[] | null | undefined): string[] {
-  if (!errors || errors.length === 0) {
-    return ['value does not match the declared schema'];
-  }
-  return errors.map(e => {
-    const path = e.instancePath && e.instancePath.length > 0 ? e.instancePath : '(root)';
-    const detail = e.params?.missingProperty
-      ? `${e.message} ('${String(e.params.missingProperty)}')`
-      : (e.message ?? 'invalid');
-    return `${path}: ${detail}`;
-  });
 }

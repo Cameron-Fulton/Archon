@@ -1,3 +1,4 @@
+// @archon-test-isolated
 import { describe, test, expect } from 'bun:test';
 import {
   conversationRowSchema,
@@ -6,6 +7,7 @@ import {
   userRowSchema,
   userIdentityRowSchema,
   sessionRowSchema,
+  SESSION_TRANSITION_REASONS,
   sessionMetadataSchema,
   workflowEventRowSchema,
   codebaseEnvVarSchema,
@@ -14,6 +16,41 @@ import {
   dashboardRunsResultSchema,
   identityPlatformSchema,
 } from './index';
+import type { DashboardWorkflowRun } from './index';
+
+const validDashboardWorkflowRun = {
+  origin: { conversationId: 'conv-1' },
+  id: 'run-1',
+  workflow_name: 'deploy',
+  conversation_id: 'conv-1',
+  parent_conversation_id: null,
+  codebase_id: null,
+  status: 'running',
+  outcome: null,
+  user_message: 'deploy please',
+  metadata: {},
+  started_at: new Date(),
+  completed_at: null,
+  last_activity_at: new Date(),
+  working_path: null,
+  user_id: null,
+  parent_run_id: null,
+  output_root: null,
+  checkout_baseline: null,
+  adopted_from_run_id: null,
+  // dashboard extensions
+  codebase_name: 'my-repo',
+  platform_type: 'web',
+  worker_platform_id: null,
+  parent_platform_id: null,
+  active_nodes: [],
+  current_step_name: null,
+  total_steps: null,
+  current_step_status: null,
+  agents_completed: null,
+  agents_failed: null,
+  agents_total: null,
+} satisfies DashboardWorkflowRun;
 
 describe('core schemas', () => {
   // -----------------------------------------------------------------------
@@ -107,6 +144,7 @@ describe('core schemas', () => {
       default_cwd: '/home/user/projects/my-project',
       default_branch: 'main',
       ai_assistant_type: 'claude',
+      kind: 'repo',
       commands: { plan: { path: '/cmds/plan.md', description: 'Plan' } },
       created_at: new Date(),
       updated_at: new Date(),
@@ -179,6 +217,33 @@ describe('core schemas', () => {
     expect(result.success).toBe(true);
   });
 
+  test('session reasons validate supported history and reject unknown values independently', () => {
+    const row = {
+      id: 'sess-1',
+      conversation_id: 'conv-1',
+      codebase_id: null,
+      ai_assistant_type: 'claude',
+      assistant_session_id: null,
+      active: true,
+      metadata: {},
+      started_at: new Date(),
+      ended_at: null,
+      parent_session_id: null,
+      transition_reason: null,
+      ended_reason: null,
+    };
+    expect(SESSION_TRANSITION_REASONS).toContain('plan-to-execute');
+    expect(SESSION_TRANSITION_REASONS).toContain('cwd-changed');
+    for (const field of ['transition_reason', 'ended_reason']) {
+      for (const value of [null, ...SESSION_TRANSITION_REASONS]) {
+        expect(sessionRowSchema.safeParse({ ...row, [field]: value }).success).toBe(true);
+      }
+      for (const value of ['unknown-reason', 42, {}, undefined]) {
+        expect(sessionRowSchema.safeParse({ ...row, [field]: value }).success).toBe(false);
+      }
+    }
+  });
+
   test('sessionMetadataSchema allows extra keys via passthrough', () => {
     const result = sessionMetadataSchema.safeParse({ lastCommand: 'plan', extra: true });
     expect(result.success).toBe(true);
@@ -219,62 +284,57 @@ describe('core schemas', () => {
   // dashboardWorkflowRunSchema
   // -----------------------------------------------------------------------
   test('dashboardWorkflowRunSchema preserves all base workflowRun fields', () => {
-    const result = dashboardWorkflowRunSchema.safeParse({
-      id: 'run-1',
-      workflow_name: 'deploy',
-      conversation_id: 'conv-1',
-      parent_conversation_id: null,
-      codebase_id: null,
-      status: 'running',
-      user_message: 'deploy please',
-      metadata: {},
-      started_at: new Date(),
-      completed_at: null,
-      last_activity_at: new Date(),
-      working_path: null,
-      user_id: null,
-      // dashboard extensions
-      codebase_name: 'my-repo',
-      platform_type: 'web',
-      worker_platform_id: null,
-      parent_platform_id: null,
-      current_step_name: null,
-      total_steps: null,
-      current_step_status: null,
-      agents_completed: null,
-      agents_failed: null,
-      agents_total: null,
-    });
+    const result = dashboardWorkflowRunSchema.safeParse(validDashboardWorkflowRun);
     expect(result.success).toBe(true);
   });
 
   test('dashboardWorkflowRunSchema rejects invalid status', () => {
     const result = dashboardWorkflowRunSchema.safeParse({
-      id: 'run-1',
-      workflow_name: 'deploy',
-      conversation_id: 'conv-1',
-      parent_conversation_id: null,
-      codebase_id: null,
+      ...validDashboardWorkflowRun,
       status: 'invalid_status',
-      user_message: 'deploy please',
-      metadata: {},
-      started_at: new Date(),
-      completed_at: null,
-      last_activity_at: new Date(),
-      working_path: null,
-      user_id: null,
-      codebase_name: 'my-repo',
-      platform_type: 'web',
-      worker_platform_id: null,
-      parent_platform_id: null,
-      current_step_name: null,
-      total_steps: null,
-      current_step_status: null,
-      agents_completed: null,
-      agents_failed: null,
-      agents_total: null,
     });
     expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.map(issue => issue.path)).toEqual([['status']]);
+    }
+  });
+
+  test('dashboardWorkflowRunSchema requires non-empty active node identifiers', () => {
+    expect(
+      dashboardWorkflowRunSchema.safeParse({
+        ...validDashboardWorkflowRun,
+        active_nodes: ['plan', 'implement'],
+      }).success
+    ).toBe(true);
+    expect(
+      dashboardWorkflowRunSchema.safeParse({
+        ...validDashboardWorkflowRun,
+        active_nodes: [''],
+      }).success
+    ).toBe(false);
+    const { active_nodes: _, ...withoutActiveNodes } = validDashboardWorkflowRun;
+    expect(dashboardWorkflowRunSchema.safeParse(withoutActiveNodes).success).toBe(false);
+  });
+
+  test('dashboardWorkflowRunSchema preserves nullable authored outcomes and rejects unknown values', () => {
+    expect(
+      dashboardWorkflowRunSchema.safeParse({
+        ...validDashboardWorkflowRun,
+        outcome: 'succeeded',
+      }).success
+    ).toBe(true);
+    expect(
+      dashboardWorkflowRunSchema.safeParse({
+        ...validDashboardWorkflowRun,
+        outcome: 'failed',
+      }).success
+    ).toBe(true);
+    expect(
+      dashboardWorkflowRunSchema.safeParse({
+        ...validDashboardWorkflowRun,
+        outcome: 'unknown',
+      }).success
+    ).toBe(false);
   });
 
   // -----------------------------------------------------------------------
@@ -289,6 +349,13 @@ describe('core schemas', () => {
       offset: 0,
     });
     expect(result.success).toBe(true);
+  });
+
+  test('listDashboardRunsOptionsSchema accepts a non-empty status array', () => {
+    expect(
+      listDashboardRunsOptionsSchema.safeParse({ status: ['running', 'paused'] }).success
+    ).toBe(true);
+    expect(listDashboardRunsOptionsSchema.safeParse({ status: [] }).success).toBe(false);
   });
 
   test('listDashboardRunsOptionsSchema rejects invalid status', () => {
@@ -314,4 +381,33 @@ describe('core schemas', () => {
     });
     expect(result.success).toBe(true);
   });
+});
+
+test('identity platforms are open lowercase identifiers bounded by persisted storage', () => {
+  for (const id of [
+    'slack',
+    'telegram',
+    'discord',
+    'github',
+    'gitea',
+    'gitlab',
+    'web',
+    'cli',
+    'matrix-chat',
+    'a'.repeat(32),
+  ]) {
+    expect(identityPlatformSchema.parse(id)).toBe(id);
+  }
+  for (const id of [
+    '',
+    ' matrix',
+    'Matrix',
+    'matrix_chat',
+    'matrix/chat',
+    'matrix--chat',
+    'matrix-',
+    'a'.repeat(33),
+  ]) {
+    expect(identityPlatformSchema.safeParse(id).success).toBe(false);
+  }
 });

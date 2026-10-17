@@ -23,28 +23,45 @@ Archon provides a unified directory and configuration system with:
 
 ### User-Level: `~/.archon/`
 
+The workspace entries below show default shapes. Registration allocates a unique,
+readable name when a new project would share another project's name or storage root.
+For example, a repository can use `acme/api-2` or `_local/api-2`, and a folder can
+use `_folder/my-app-2`. New managed projects with nested namespaces receive a
+safe two-part name: `org/team/subteam/project` starts at `org/team-subteam-project`,
+with a suffix if needed. That allocated identity scopes their checkout, storage,
+and worktrees together. Local repositories with bare names retain the `_local/<basename>`
+layout below. Existing projects keep their names and storage.
+
 ```
 ~/.archon/                          # ARCHON_HOME
 ├── workspaces/                     # Per-project storage (project-centric layout)
 │   ├── <owner>/<repo>/             #   a registered repo with a remote
 │   ├── _local/<basename>/          #   a no-remote local git repo
-│   ├── _folder/<slug>/             #   a folder project (non-git; runs in place)
+│   ├── _folder/<slug>/             #   a folder project (runs in place; git is user/agent-owned)
 │   └── _cwd/<basename>/            #   an unregistered working directory
 │       ├── source/                 # Clone or symlink -> local path (repo kinds only)
 │       ├── worktrees/              # Git worktrees for this project (repo kinds only)
 │       ├── artifacts/              # Workflow artifacts — NEVER in git
 │       │   ├── runs/<run-id>/      #   $ARTIFACTS_DIR for one run
+│       │   │   ├── .archon/        #     engine-owned bookkeeping, never listed as artifacts
+│       │   │   │   ├── node-output-spills/  # oversized shell handoffs (*.nodeoutput)
+│       │   │   │   └── typed-artifacts/     # one listing per node invocation
 │       │   │   └── nodes/          #     typed output sidecars (<id>.md + <id>.meta.json)
 │       │   ├── scopes/<workflow>/<scope>/   # cross-invocation artifacts (persist_session)
 │       │   └── uploads/<conv-id>/  #   Web UI file uploads (ephemeral)
 │       ├── logs/<run-id>.jsonl     # Workflow execution logs
-│       └── state/                  # $STATE_DIR — cross-run state, shared per project
+│       ├── state/                  # $STATE_DIR — cross-run state, shared per project
+│       └── workflow-source/runs/<run-id>/  # The frozen workflow source one run executes
 ├── workflows/  commands/  scripts/ # Home-scoped ("global") definitions
+├── temp/                           # Ephemeral scratch (per-simulation dry-run dirs; removed when the run ends)
 ├── worktrees/                      # Legacy global worktrees (repos not in workspaces/)
 ├── vendor/codex/                   # Codex native binary (binary builds, user-placed)
+├── plugins/                        # Installed plugins: executables, installed/**/receipt.json, packs/
+├── server/<version>/               # Cached server executable (archon serve, binary only)
 ├── web-dist/<version>/             # Cached web UI dist (archon serve, binary only)
-├── update-check.json               # Update check cache (binary builds only, 24h TTL)
+├── update-check.json               # Update check cache (binary builds only, 1h release-data TTL; 24h CLI notice interval)
 ├── tier-notice.json                # One-time tier-default notice state (CLI, per version)
+├── install.json                    # Last compiled CLI path and version (discovery hint)
 ├── credential-key                  # Auto-provisioned per-user credential encryption key
 ├── archon.db                       # SQLite database (when DATABASE_URL is unset)
 └── config.yaml                     # Global user configuration
@@ -52,16 +69,30 @@ Archon provides a unified directory and configuration system with:
 
 **Purpose:**
 - `workspaces/<project>/` - Everything one project produces. The project segment is
-  resolved once per run from the codebase identity: `owner/repo` for a repo with a
+  resolved once per run from the allocated codebase identity. Default shapes are: `owner/repo` for a repo with a
   remote, `_local/<basename>` for a no-remote local repo, `_folder/<slug>` for a folder
   project, and `_cwd/<basename>` when a run has no registered codebase at all. Folder
   projects and `_cwd` projects have no `source/` or `worktrees/` — they run in place.
 - `workspaces/<project>/artifacts/` - Run output. `$ARTIFACTS_DIR` is
-  `artifacts/runs/<run-id>/`.
+  `artifacts/runs/<run-id>/`. Oversized values passed to shell nodes are retained in the
+  engine-owned `.archon/` child so concurrent runs never share the deferred read and
+  workflow-authored root files remain untouched. That child is the engine's own bookkeeping:
+  `archon workflow get` and the console run page list a run's artifacts without it. Archon
+  currently retains filesystem run artifacts until the operator removes them;
+  `archon workflow cleanup` deletes old database run records, not these directories.
 - `workspaces/<project>/logs/` - One JSONL execution log per run.
 - `workspaces/<project>/state/` - `$STATE_DIR`. Cross-run workflow state, shared by every
   workflow in the project. Survives worktree teardown; never visible to git.
 - `worktrees/` - Legacy fallback for repos not registered under `workspaces/`
+- `plugins/` - Everything `archon plugin add` and `archon provider add` write.
+  Plugin executables such as `archon-provider-codex` (`.exe` on Windows) sit at the top,
+  each plugin's receipt is `installed/<owner>/<repo>[/<path>]/receipt.json`, and
+  workflow pack trees live under `packs/`. Release binaries load the Claude, Codex
+  and Pi providers only from these receipts; source checkouts and Docker run them
+  from source and ignore receipts for those three.
+- `install.json` - Discovery metadata for the last compiled Archon invoked. GUI and
+  service consumers may use its absolute `binary` path when the user has not
+  configured one explicitly. Source/Bun runs do not write this file.
 - `config.yaml` - Non-secret user preferences
 
 Each run also records the project root it resolved in `workflow_runs.output_root`, so an
@@ -135,6 +166,10 @@ getArchonWorktreesPath(): string
 // Get global config path
 getArchonConfigPath(): string
 // Returns: ${ARCHON_HOME}/config.yaml
+
+// Get the compiled CLI discovery manifest path
+getInstallManifestPath(): string
+// Returns: ${ARCHON_HOME}/install.json
 
 // Get cached web UI distribution directory for a given version
 getWebDistDir(version: string): string
@@ -218,7 +253,7 @@ Key configuration options:
 | Option | Env Override | Default |
 |--------|--------------|---------|
 | `ARCHON_HOME` | `ARCHON_HOME` | `~/.archon` |
-| Default AI Assistant | `DEFAULT_AI_ASSISTANT` | `claude` |
+| Default AI Assistant | `DEFAULT_AI_ASSISTANT` | Only registered provider, otherwise unset |
 | Telegram Streaming | `TELEGRAM_STREAMING_MODE` | `stream` |
 | Discord Streaming | `DISCORD_STREAMING_MODE` | `batch` |
 | Slack Streaming | `SLACK_STREAMING_MODE` | `batch` |

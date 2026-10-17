@@ -24,9 +24,6 @@ package-lock.json
 yarn.lock
 pnpm-lock.yaml
 
-# ESLint cache
-.eslintcache
-
 # Environment files
 .env
 .env.local
@@ -50,8 +47,13 @@ e2e-screenshots/
 .archon/logs/
 .archon/artifacts/
 
-# Cross-run workflow state (e.g. issue-triage memory)
+# Legacy repo-local workflow state, replaced by $STATE_DIR
 .archon/state/
+
+# Personal per-run steering configs (#2482 sparse run config).
+# The shared .archon/config.yaml stays committed; only config.<name>.yaml variants are local.
+.archon/config.*.yaml
+!.archon/config.example.yaml
 
 # Maintainer standup — per-maintainer state and briefs (direction.md is committed)
 .archon/maintainer-standup/profile.md
@@ -121,7 +123,11 @@ skills-lock.json
 test-results/
 .archon/ralph/
 
-# Per-project knowledge digest (regenerated every 2h by librarian)
-.knowledge/
 # Stray run logs from a mis-threaded logDir argument (see #2299) — never committed.
 main/
+
+# Personal per-run config overlays (workflow run --config) — never tracked
+.config.*.yaml
+
+# Per-project knowledge digest (regenerated every 2h by librarian)
+.knowledge/

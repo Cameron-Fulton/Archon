@@ -19,42 +19,36 @@ export function loopFromDag(variantSpecific: Partial<WireDagNode>): LoopNodeData
       "loopFromDag: wire node has no 'loop' field — use defaultLoopData() for new nodes"
     );
   }
+  // Everything but the prompt source is copied as it is, so a loop field this
+  // file does not name still survives the round-trip.
+  const { prompt, command, ...rest } = loop;
   return {
     // Exactly one prompt source survives the round-trip. A command-backed loop
     // keeps `command` (never collapsed to an empty prompt); a prompt-backed
     // loop keeps `prompt`. A wire node carrying BOTH is invalid per the engine
     // schema — the importer flags it (see nodeFromDag) and `prompt` wins here
     // so the flagged node stays deterministically editable.
-    ...(typeof loop.prompt === 'string'
-      ? { prompt: loop.prompt }
-      : typeof loop.command === 'string'
-        ? { command: loop.command }
+    ...(typeof prompt === 'string'
+      ? { prompt }
+      : typeof command === 'string'
+        ? { command }
         : { prompt: '' }),
-    until: loop.until,
-    max_iterations: loop.max_iterations,
-    // Engine default is false but the generated type makes it required, so it is
-    // always present on the wire and must be carried verbatim across the round-trip.
-    fresh_context: loop.fresh_context,
-    ...ifDefined('until_bash', loop.until_bash),
-    ...ifDefined('interactive', loop.interactive),
-    ...ifDefined('gate_message', loop.gate_message),
+    ...rest,
+    ...ifDefined('timeout', variantSpecific.timeout),
   };
 }
 
 /** Serialize `LoopNodeData` to the sparse `{ loop: … }` wire fragment. */
 export function loopToDag(data: LoopNodeData): Partial<WireDagNode> {
+  const { timeout, prompt, command, ...rest } = data;
   return {
     loop: {
       // Emit exactly the prompt source the node carries (one-of invariant).
       // A node with neither (transient editing state) exports `prompt: ''`
       // so the engine's own "requires prompt or command" validation fires.
-      ...(data.command !== undefined ? { command: data.command } : { prompt: data.prompt ?? '' }),
-      until: data.until,
-      max_iterations: data.max_iterations,
-      fresh_context: data.fresh_context,
-      ...ifDefined('until_bash', data.until_bash),
-      ...ifDefined('interactive', data.interactive),
-      ...ifDefined('gate_message', data.gate_message),
+      ...(command !== undefined ? { command } : { prompt: prompt ?? '' }),
+      ...rest,
     },
+    ...ifDefined('timeout', timeout),
   };
 }

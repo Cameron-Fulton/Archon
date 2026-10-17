@@ -7,10 +7,13 @@ export type {
   PRIsolationRequest,
   ReviewIsolationRequest,
   ThreadIsolationRequest,
+  TaskBranchSelection,
   TaskIsolationRequest,
   IsolationRequest,
   AdoptedWorktreeMetadata,
   CreatedWorktreeMetadata,
+  ObservedWorktreeMetadata,
+  WorktreeCreationEnvironment,
   WorktreeMetadata,
   WorktreeEnvironment,
   IsolatedEnvironment,
@@ -28,6 +31,7 @@ export type {
   ResolveRequest,
   ResolutionMethod,
   IsolationResolution,
+  ResolvedIsolation,
   ExecutionContext,
   WriteBackFinalizeResult,
   WriteBackApplySummary,
@@ -37,7 +41,15 @@ export type {
   ContainerBackendConfig,
 } from './types';
 
-export { isPRIsolationRequest, CONTAINER_LABELS } from './types';
+export {
+  isPRIsolationRequest,
+  CONTAINER_LABELS,
+  worktreeRegistrationMetadata,
+  WORKTREE_REGISTRATION_ID,
+  readWorktreeCreationId,
+  readWorktreeBranchCreated,
+  WorktreeRegistrationChangedError,
+} from './types';
 
 // --- Backend seam (folder projects) ---
 export { resolveFolderBackend } from './backend-router';
@@ -52,9 +64,18 @@ export type { DockerRunner, DockerExecOptions, DockerExecResult } from './contai
 
 // --- Store ---
 export type { IIsolationStore } from './store';
+export { recordWorktreeAdoption, registerWorktree } from './store';
 
 // --- Errors ---
-export { IsolationBlockedError, classifyIsolationError } from './errors';
+export {
+  ExistingBranchDivergedError,
+  IsolationBlockedError,
+  IsolationFailure,
+  MissingProjectDirectoryError,
+  WorktreeLeftoverError,
+  WorktreeUncommittedChangesError,
+  classifyIsolationError,
+} from './errors';
 
 // --- Factory ---
 export { getIsolationProvider, configureIsolation, resetIsolationProvider } from './factory';
@@ -64,11 +85,11 @@ export { IsolationResolver } from './resolver';
 export type { IsolationResolverDeps } from './resolver';
 
 // --- Provider ---
-export { WorktreeProvider } from './providers/worktree';
+export { WorktreeProvider, resolveRepoLocalOverride } from './providers/worktree';
 
 // --- PR state lookup ---
 export { getPrState } from './pr-state';
-export type { PrState } from './pr-state';
+export type { PrLookup } from './pr-state';
 
 // --- Worktree copy utility ---
 export {
@@ -78,3 +99,9 @@ export {
   isPathWithinRoot,
 } from './worktree-copy';
 export type { CopyFileEntry } from './worktree-copy';
+
+export { validateWorktreePostCreate } from './post-create-config';
+export type { WorktreeSetupExecutor, WorktreeSetupInput } from './types';
+export { WorktreePostCreateError } from './errors';
+
+export type { IsolationFailureKind } from './errors';

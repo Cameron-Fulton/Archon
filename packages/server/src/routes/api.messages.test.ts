@@ -3,7 +3,8 @@ import { OpenAPIHono } from '@hono/zod-openapi';
 import type { ConversationLockManager } from '@archon/core';
 import type { WebAdapter } from '../adapters/web';
 import { validationErrorHook } from './openapi-defaults';
-import { mockAllWorkflowModules } from '../test/workflow-mock-factories';
+import { makeIdleLockStats } from '../test/conversation-lock-fixtures';
+import { makeListDashboardRunsMock, mockAllWorkflowModules } from '../test/workflow-mock-factories';
 import { MAX_TOOL_OUTPUT_CHARS } from '../adapters/web/truncate';
 
 // ---------------------------------------------------------------------------
@@ -32,16 +33,25 @@ const mockAddMessage = mock(
     role: _role,
     content: _content,
     metadata: '{}',
+    user_id: null,
     created_at: new Date().toISOString(),
   })
 );
-const mockListMessages = mock(async (_conversationId: string, _limit?: number) => []);
+const mockListMessages = mock<typeof import('@archon/core/db/messages')['listMessages']>(
+  async () => []
+);
 const mockHandleMessage = mock(async () => {});
 
 mock.module('@archon/core', () => ({
   handleMessage: mockHandleMessage,
   getDatabaseType: () => 'sqlite',
   loadConfig: mock(async () => ({})),
+  ProjectRegistrationError: class ProjectRegistrationError extends Error {},
+  inspectProjectBaseBranch: mock(async () => ({
+    kind: 'repo',
+    defaultBranch: 'dev',
+    reason: null,
+  })),
   cloneRepository: mock(async () => ({ codebaseId: 'x', alreadyExisted: false })),
   registerRepository: mock(async () => ({ codebaseId: 'x', alreadyExisted: false })),
   ConversationNotFoundError: class ConversationNotFoundError extends Error {
@@ -51,7 +61,7 @@ mock.module('@archon/core', () => ({
     }
   },
   getArchonWorkspacesPath: () => '/tmp/.archon/workspaces',
-  generateAndSetTitle: mock(async () => {}),
+  generateTitleForUser: mock(async () => {}),
   resolveTitleRequest: mock(async () => ({ provider: 'claude', options: {} })),
   createLogger: () => ({
     fatal: mock(() => undefined),
@@ -70,6 +80,7 @@ mock.module('@archon/core', () => ({
 }));
 
 mock.module('@archon/paths', () => ({
+  canonicalizeProjectPath: async (path: string) => path,
   createLogger: () => ({
     fatal: mock(() => undefined),
     error: mock(() => undefined),
@@ -86,8 +97,7 @@ mock.module('@archon/paths', () => ({
   }),
   getWorkflowFolderSearchPaths: mock(() => ['.archon/workflows']),
   getCommandFolderSearchPaths: mock(() => ['.archon/commands']),
-  getDefaultCommandsPath: mock(() => '/tmp/.archon-test-nonexistent/commands/defaults'),
-  getDefaultWorkflowsPath: mock(() => '/tmp/.archon-test-nonexistent/workflows/defaults'),
+  getBundledWorkflowsPath: mock(() => '/tmp/.archon-test-nonexistent/workflows'),
   getArchonWorkspacesPath: () => '/tmp/.archon/workspaces',
 }));
 
@@ -101,6 +111,8 @@ mock.module('@archon/git', () => ({
 
 mock.module('@archon/core/db/conversations', () => ({
   findConversationByPlatformId: mockFindConversationByPlatformId,
+  getConversationByPlatformId: (_platform: string, id: string) =>
+    mockFindConversationByPlatformId(id),
   listConversations: mock(async () => []),
   getOrCreateConversation: mock(async () => ({
     id: 'internal-uuid-123',
@@ -131,11 +143,7 @@ mock.module('@archon/core/db/isolation-environments', () => ({
 
 mock.module('@archon/core/db/workflows', () => ({
   listWorkflowRuns: mock(async () => []),
-  listDashboardRuns: mock(async () => ({
-    runs: [],
-    total: 0,
-    counts: { all: 0, running: 0, completed: 0, failed: 0, cancelled: 0, pending: 0 },
-  })),
+  listDashboardRuns: makeListDashboardRunsMock(),
   getWorkflowRun: mock(async () => null),
   cancelWorkflowRun: mock(async () => {}),
   getWorkflowRunByWorkerPlatformId: mock(async () => null),
@@ -151,7 +159,7 @@ mock.module('@archon/core/db/messages', () => ({
 }));
 
 mock.module('@archon/core/utils/commands', () => ({
-  findMarkdownFilesRecursive: mock(async () => []),
+  findCommandFiles: mock(async () => []),
 }));
 
 import { registerApiRoutes } from './api';
@@ -179,6 +187,7 @@ const MOCK_MESSAGES = [
     role: 'user' as const,
     content: 'Hello there',
     metadata: '{}',
+    user_id: null,
     created_at: new Date().toISOString(),
   },
   {
@@ -187,6 +196,7 @@ const MOCK_MESSAGES = [
     role: 'assistant' as const,
     content: 'Hi! How can I help?',
     metadata: '{"toolCalls":[]}',
+    user_id: null,
     created_at: new Date().toISOString(),
   },
 ];
@@ -203,7 +213,7 @@ function makeApp(): { app: OpenAPIHono; mockWebAdapter: WebAdapter } {
       await fn();
       return { status: 'started' };
     }),
-    getStats: mock(() => ({ active: 0, queued: 0 })),
+    getStats: mock(makeIdleLockStats),
   } as unknown as ConversationLockManager;
   registerApiRoutes(app, mockWebAdapter, mockLockManager);
   return { app, mockWebAdapter };
@@ -228,6 +238,7 @@ describe('POST /api/conversations/:id/message', () => {
       role: 'user' as const,
       content: 'Hello',
       metadata: '{}',
+      user_id: null,
       created_at: new Date().toISOString(),
     }));
     mockHandleMessage.mockImplementationOnce(async () => {});
@@ -253,6 +264,7 @@ describe('POST /api/conversations/:id/message', () => {
       role: 'user' as const,
       content: 'Test message',
       metadata: '{}',
+      user_id: null,
       created_at: new Date().toISOString(),
     }));
     mockHandleMessage.mockImplementationOnce(async () => {});
@@ -273,7 +285,7 @@ describe('POST /api/conversations/:id/message', () => {
     );
   });
 
-  test('still dispatches when conversation lookup fails (no message persistence)', async () => {
+  test('still dispatches when no conversation exists (no message persistence)', async () => {
     mockFindConversationByPlatformId.mockImplementationOnce(async () => null);
     mockHandleMessage.mockImplementationOnce(async () => {});
 
@@ -384,6 +396,7 @@ describe('GET /api/conversations/:id/messages', () => {
         content: 'Response',
         // Simulate PostgreSQL returning JSONB as an object
         metadata: { toolCalls: [{ name: 'bash' }] } as unknown as string,
+        user_id: null,
         created_at: new Date().toISOString(),
       },
     ]);
@@ -412,6 +425,7 @@ describe('GET /api/conversations/:id/messages', () => {
         content: 'Response',
         // Simulate unserializable metadata from PostgreSQL JSONB
         metadata: circular as unknown as string,
+        user_id: null,
         created_at: new Date().toISOString(),
       },
     ]);
@@ -502,6 +516,7 @@ describe('GET /api/conversations/:id/messages — tool output bounding', () => {
         role: 'assistant' as const,
         content: '',
         metadata: storedMetadata,
+        user_id: null,
         created_at: new Date().toISOString(),
       },
     ]);
@@ -535,6 +550,7 @@ describe('GET /api/conversations/:id/messages — tool output bounding', () => {
         role: 'assistant' as const,
         content: '',
         metadata,
+        user_id: null,
         created_at: new Date().toISOString(),
       },
     ]);
@@ -556,6 +572,7 @@ describe('GET /api/conversations/:id/messages — tool output bounding', () => {
         role: 'assistant' as const,
         content: 'Done.',
         metadata,
+        user_id: null,
         created_at: new Date().toISOString(),
       },
     ]);

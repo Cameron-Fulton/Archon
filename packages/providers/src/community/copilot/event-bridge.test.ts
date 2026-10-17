@@ -6,8 +6,9 @@ mock.module('@archon/paths', () => ({
 }));
 
 import type { SessionEvent } from '@github/copilot-sdk';
+import { TOOL_OUTPUT_MAX_CHARS } from '@archon/provider-contract';
 
-import type { MessageChunk, TokenUsage } from '../../types';
+import type { TokenUsage } from '../../types';
 import {
   AsyncQueue,
   mapCopilotEvent,
@@ -19,11 +20,9 @@ function makeCtx(): EventMapperContext & {
   capturedUsage: TokenUsage | undefined;
   erroredWith: string | undefined;
 } {
-  const toolCallIdToName = new Map<string, string>();
   let capturedUsage: TokenUsage | undefined;
   let erroredWith: string | undefined;
   return {
-    toolCallIdToName,
     captureUsage: (u: TokenUsage): void => {
       capturedUsage = u;
     },
@@ -108,6 +107,25 @@ describe('AsyncQueue', () => {
   });
 });
 
+describe('Copilot JSON tool arguments', () => {
+  test.each(['patch text', 0, false, null, ['a', 1]].map(value => [value] as const))(
+    'preserves %j',
+    args => {
+      const chunks = mapCopilotEvent(
+        evt('tool.execution_start', {
+          toolCallId: 't1',
+          toolName: 'apply_patch',
+          arguments: args,
+        }),
+        makeCtx()
+      );
+      expect(chunks).toEqual([
+        { type: 'tool_call', toolCallId: 't1', name: 'apply_patch', rawInput: args },
+      ]);
+    }
+  );
+});
+
 describe('normalizeCopilotUsage', () => {
   test('returns undefined when input is undefined', () => {
     expect(normalizeCopilotUsage(undefined)).toBeUndefined();
@@ -118,9 +136,9 @@ describe('normalizeCopilotUsage', () => {
     expect(normalizeCopilotUsage({ inputTokens: 'x' as unknown as number })).toBeUndefined();
   });
 
-  test('fills missing side with 0 when only one is numeric', () => {
-    expect(normalizeCopilotUsage({ inputTokens: 100 })).toEqual({ input: 100, output: 0 });
-    expect(normalizeCopilotUsage({ outputTokens: 50 })).toEqual({ input: 0, output: 50 });
+  test('returns undefined when only one required axis is numeric', () => {
+    expect(normalizeCopilotUsage({ inputTokens: 100 })).toBeUndefined();
+    expect(normalizeCopilotUsage({ outputTokens: 50 })).toBeUndefined();
   });
 
   test('maps both input and output when present', () => {
@@ -129,34 +147,40 @@ describe('normalizeCopilotUsage', () => {
       output: 42,
     });
   });
+
+  test('preserves measured zeros', () => {
+    expect(normalizeCopilotUsage({ inputTokens: 0, outputTokens: 0 })).toEqual({
+      input: 0,
+      output: 0,
+    });
+  });
 });
 
 describe('mapCopilotEvent', () => {
-  test('assistant.message_delta → assistant chunk with deltaContent', () => {
+  test('a delta stream followed by the whole message yields one agent_message_chunk', () => {
     const ctx = makeCtx();
-    const out = mapCopilotEvent(
+    const out = [
       evt('assistant.message_delta', { messageId: 'm1', deltaContent: 'Hello ' }),
-      ctx
-    );
-    expect(out).toEqual([{ type: 'assistant', content: 'Hello ' }]);
+      evt('assistant.message_delta', { messageId: 'm1', deltaContent: 'world' }),
+      evt('assistant.message', { messageId: 'm1', content: 'Hello world' }),
+    ].flatMap(event => mapCopilotEvent(event, ctx));
+    expect(out).toEqual([{ type: 'agent_message_chunk', text: 'Hello world' }]);
   });
 
-  test('assistant.message_delta with empty content is dropped', () => {
+  test('an assistant.message with empty content is dropped', () => {
     const ctx = makeCtx();
-    const out = mapCopilotEvent(
-      evt('assistant.message_delta', { messageId: 'm1', deltaContent: '' }),
-      ctx
-    );
-    expect(out).toEqual([]);
+    expect(
+      mapCopilotEvent(evt('assistant.message', { messageId: 'm1', content: '' }), ctx)
+    ).toEqual([]);
   });
 
-  test('assistant.reasoning_delta → thinking chunk', () => {
+  test('reasoning deltas then the whole reasoning block yield one agent_thought_chunk', () => {
     const ctx = makeCtx();
-    const out = mapCopilotEvent(
-      evt('assistant.reasoning_delta', { messageId: 'm1', deltaContent: 'hmm ' }),
-      ctx
-    );
-    expect(out).toEqual([{ type: 'thinking', content: 'hmm ' }]);
+    const out = [
+      evt('assistant.reasoning_delta', { reasoningId: 'r1', deltaContent: 'hmm ' }),
+      evt('assistant.reasoning', { reasoningId: 'r1', content: 'hmm, let me think' }),
+    ].flatMap(event => mapCopilotEvent(event, ctx));
+    expect(out).toEqual([{ type: 'agent_thought_chunk', text: 'hmm, let me think' }]);
   });
 
   test('assistant.usage → no chunk, captures usage via callback', () => {
@@ -169,106 +193,135 @@ describe('mapCopilotEvent', () => {
     expect(ctx.capturedUsage).toEqual({ input: 7, output: 42 });
   });
 
-  test('tool.execution_start → tool chunk + records name by id', () => {
-    const ctx = makeCtx();
+  test('tool.execution_start → tool_call with arguments as rawInput', () => {
     const out = mapCopilotEvent(
-      evt('tool.execution_start', {
-        toolCallId: 'c1',
-        toolName: 'bash',
-        arguments: { cmd: 'ls' },
-      }),
-      ctx
+      evt('tool.execution_start', { toolCallId: 'c1', toolName: 'bash', arguments: { cmd: 'ls' } }),
+      makeCtx()
     );
     expect(out).toEqual([
-      {
-        type: 'tool',
-        toolName: 'bash',
-        toolInput: { cmd: 'ls' },
-        toolCallId: 'c1',
-      },
+      { type: 'tool_call', toolCallId: 'c1', name: 'bash', rawInput: { cmd: 'ls' } },
     ]);
-    expect(ctx.toolCallIdToName.get('c1')).toBe('bash');
   });
 
-  test('tool.execution_start without arguments uses empty object', () => {
-    const ctx = makeCtx();
+  test('tool.execution_start without arguments omits rawInput', () => {
     const out = mapCopilotEvent(
       evt('tool.execution_start', { toolCallId: 'c1', toolName: 'read' }),
-      ctx
+      makeCtx()
     );
-    expect((out[0] as { toolInput: unknown }).toolInput).toEqual({});
+    expect(out).toEqual([{ type: 'tool_call', toolCallId: 'c1', name: 'read' }]);
   });
 
-  test('tool.execution_complete on success → tool_result chunk with detailedContent', () => {
-    const ctx = makeCtx();
-    ctx.toolCallIdToName.set('c1', 'bash');
+  test('tool.execution_complete on success → completed update with detailedContent', () => {
     const out = mapCopilotEvent(
       evt('tool.execution_complete', {
         toolCallId: 'c1',
         success: true,
         result: { content: 'brief', detailedContent: 'full diff output' },
       }),
-      ctx
+      makeCtx()
     );
     expect(out).toEqual([
       {
-        type: 'tool_result',
-        toolName: 'bash',
-        toolOutput: 'full diff output',
+        type: 'tool_call_update',
         toolCallId: 'c1',
-        toolOutcome: 'success',
+        status: 'completed',
+        output: 'full diff output',
       },
     ]);
   });
 
   test('tool.execution_complete falls back to content when detailedContent absent', () => {
-    const ctx = makeCtx();
-    ctx.toolCallIdToName.set('c1', 'read');
     const out = mapCopilotEvent(
       evt('tool.execution_complete', {
         toolCallId: 'c1',
         success: true,
         result: { content: 'file contents' },
       }),
-      ctx
+      makeCtx()
     );
-    expect((out[0] as { toolOutput: string }).toolOutput).toBe('file contents');
+    expect(out).toEqual([
+      { type: 'tool_call_update', toolCallId: 'c1', status: 'completed', output: 'file contents' },
+    ]);
   });
 
-  test('tool.execution_complete on failure → system warning + tool_result with ❌', () => {
-    const ctx = makeCtx();
-    ctx.toolCallIdToName.set('c1', 'bash');
+  test('tool output over the cap is truncated and flagged', () => {
     const out = mapCopilotEvent(
       evt('tool.execution_complete', {
         toolCallId: 'c1',
-        success: false,
-        result: { content: 'permission denied' },
+        success: true,
+        result: { content: 'x'.repeat(TOOL_OUTPUT_MAX_CHARS + 10) },
       }),
-      ctx
+      makeCtx()
     );
     expect(out).toEqual([
-      { type: 'system', content: '⚠️ Tool bash failed' },
       {
-        type: 'tool_result',
-        toolName: 'bash',
-        toolOutput: '❌ permission denied',
+        type: 'tool_call_update',
         toolCallId: 'c1',
-        toolOutcome: 'error',
+        status: 'completed',
+        output: 'x'.repeat(TOOL_OUTPUT_MAX_CHARS),
+        outputTruncated: true,
       },
     ]);
   });
 
-  test('tool.execution_complete with unknown toolCallId uses "unknown"', () => {
-    const ctx = makeCtx();
+  test.each<[string, Record<string, unknown>, string]>([
+    ['result only', { result: { content: 'permission denied' } }, 'permission denied'],
+    [
+      'error.message and no result',
+      { error: { message: 'permission denied', code: 'EACCES' } },
+      'permission denied',
+    ],
+    [
+      'error.message and a distinct result',
+      {
+        error: { message: 'command exited with code 1' },
+        result: { content: 'brief', detailedContent: 'stderr: file not found' },
+      },
+      'command exited with code 1\nstderr: file not found',
+    ],
+    [
+      'error.message already in the result',
+      { error: { message: 'permission denied' }, result: { content: 'Error: permission denied' } },
+      'Error: permission denied',
+    ],
+  ])('a failed tool.execution_complete with %s → failed update', (_label, data, output) => {
     const out = mapCopilotEvent(
-      evt('tool.execution_complete', {
-        toolCallId: 'missing',
-        success: true,
-        result: { content: 'x' },
-      }),
-      ctx
+      evt('tool.execution_complete', { toolCallId: 'c1', success: false, ...data }),
+      makeCtx()
     );
-    expect((out[0] as { toolName: string }).toolName).toBe('unknown');
+    expect(out).toEqual([{ type: 'tool_call_update', toolCallId: 'c1', status: 'failed', output }]);
+  });
+
+  test.each([
+    ['connected', 'connected'],
+    ['failed', 'failed'],
+    ['needs-auth', 'needs_auth'],
+    ['pending', 'pending'],
+    ['disabled', 'disabled'],
+    ['stopped', 'disabled'],
+    ['not_configured', 'failed'],
+  ] as const)('session.mcp_server_status_changed %s → mcp_server_status %s', (status, mapped) => {
+    const out = mapCopilotEvent(
+      evt('session.mcp_server_status_changed', { serverName: 'posthog', status }),
+      makeCtx()
+    );
+    expect(out).toEqual([{ type: 'mcp_server_status', server: 'posthog', status: mapped }]);
+  });
+
+  test('session.mcp_servers_loaded → one mcp_server_status per server, with its error', () => {
+    const out = mapCopilotEvent(
+      evt('session.mcp_servers_loaded', {
+        servers: [
+          { name: 'posthog', status: 'failed', error: 'spawn ENOENT' },
+          { name: 'linear', status: 'connected' },
+        ],
+      }),
+      makeCtx()
+    );
+    expect(out).toEqual([
+      { type: 'mcp_server_status', server: 'posthog', status: 'failed', error: 'spawn ENOENT' },
+      { type: 'mcp_server_status', server: 'linear', status: 'connected' },
+    ]);
   });
 
   test('session.error → no chunk emitted, markErrored called (deferred to bridgeSession)', () => {
@@ -277,8 +330,8 @@ describe('mapCopilotEvent', () => {
       evt('session.error', { errorType: 'rate_limit', message: 'Slow down' }),
       ctx
     );
-    // Defer the system chunk to bridgeSession so it can suppress the warning
-    // when SDK auto-recovery still delivers a fallback assistant message.
+    // Deferred to bridgeSession so it can suppress the warning when SDK
+    // auto-recovery still delivers a fallback assistant message.
     expect(out).toEqual([]);
     expect(ctx.erroredWith).toBe('Slow down');
   });
@@ -290,10 +343,20 @@ describe('mapCopilotEvent', () => {
     expect(ctx.erroredWith).toBe('Copilot session error');
   });
 
-  test('session.compaction_start → context-compaction system chunk', () => {
+  test('compaction start and complete → compaction started/completed with token counts', () => {
     const ctx = makeCtx();
-    const out = mapCopilotEvent(evt('session.compaction_start', {}), ctx);
-    expect(out).toEqual([{ type: 'system', content: '⚙️ Compacting context…' }]);
+    const out = [
+      evt('session.compaction_start', {}),
+      evt('session.compaction_complete', {
+        success: true,
+        preCompactionTokens: 9000,
+        postCompactionTokens: 1200,
+      }),
+    ].flatMap(event => mapCopilotEvent(event, ctx));
+    expect(out).toEqual([
+      { type: 'compaction', phase: 'started' },
+      { type: 'compaction', phase: 'completed', tokensBefore: 9000, tokensAfter: 1200 },
+    ]);
   });
 
   test('unhandled event types yield no chunks', () => {

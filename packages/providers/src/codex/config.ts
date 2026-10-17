@@ -1,46 +1,58 @@
 /**
- * Typed config parsing for Codex provider defaults.
- * Validates and narrows the opaque assistantConfig to typed fields.
+ * Codex provider config: the schema owns the shape, and the defaults type is
+ * derived from it.
  */
-import type { CodexProviderDefaults } from '../types';
-
-// Re-export so consumers can import the type from either location
-export type { CodexProviderDefaults } from '../types';
+import {
+  EFFORT_LADDER,
+  snapshotConfigSchema,
+  type ProviderConfigScope,
+} from '@archon/provider-contract';
+import { z } from 'zod';
+import { configStringSchema, parseConfigLenient, parseConfigSchema } from '../shared/run-config';
+import type { WebSearchMode } from './protocol/WebSearchMode';
 
 /**
- * Parse raw assistantConfig into typed Codex defaults.
- * Defensive: invalid fields are silently dropped.
+ * Codex accepts every rung of the shared ladder. Its protocol types the effort as a plain
+ * string, so there is no closed vendor vocabulary to check the ladder against.
  */
+export const CODEX_EFFORTS = EFFORT_LADDER;
+
+/** The web-search modes Archon exposes; Codex's protocol also has `indexed`. */
+const CODEX_WEB_SEARCH_MODES = [
+  'disabled',
+  'cached',
+  'live',
+] as const satisfies readonly WebSearchMode[];
+
+const portableFields = {
+  model: configStringSchema.optional(),
+  modelReasoningEffort: z
+    .enum(CODEX_EFFORTS, { error: `expected ${CODEX_EFFORTS.join(', ')}` })
+    .optional(),
+};
+const localFields = {
+  webSearchMode: z.enum(CODEX_WEB_SEARCH_MODES).optional(),
+  additionalDirectories: z.array(z.string()).optional(),
+  /** Path to the Codex CLI binary. Overrides auto-detection in compiled Archon builds. */
+  codexBinaryPath: configStringSchema.optional(),
+};
+const fields = { ...portableFields, ...localFields };
+export const configSchemas = {
+  install: z.strictObject(fields),
+  run: z.strictObject(fields),
+  snapshot: snapshotConfigSchema(portableFields, localFields),
+};
+
+export type CodexProviderDefaults = z.output<typeof configSchemas.install>;
+
+/** Parse raw assistantConfig into typed Codex defaults, dropping invalid values. */
 export function parseCodexConfig(raw: Record<string, unknown>): CodexProviderDefaults {
-  const result: CodexProviderDefaults = {};
+  return parseConfigLenient(configSchemas.install, raw, 'codex');
+}
 
-  if (typeof raw.model === 'string') {
-    result.model = raw.model;
-  }
-
-  const validEfforts = ['minimal', 'low', 'medium', 'high', 'xhigh'];
-  if (
-    typeof raw.modelReasoningEffort === 'string' &&
-    validEfforts.includes(raw.modelReasoningEffort)
-  ) {
-    result.modelReasoningEffort =
-      raw.modelReasoningEffort as CodexProviderDefaults['modelReasoningEffort'];
-  }
-
-  const validSearchModes = ['disabled', 'cached', 'live'];
-  if (typeof raw.webSearchMode === 'string' && validSearchModes.includes(raw.webSearchMode)) {
-    result.webSearchMode = raw.webSearchMode as CodexProviderDefaults['webSearchMode'];
-  }
-
-  if (Array.isArray(raw.additionalDirectories)) {
-    result.additionalDirectories = raw.additionalDirectories.filter(
-      (d): d is string => typeof d === 'string'
-    );
-  }
-
-  if (typeof raw.codexBinaryPath === 'string') {
-    result.codexBinaryPath = raw.codexBinaryPath;
-  }
-
-  return result;
+export function parseCodexConfigStrict(
+  raw: Record<string, unknown>,
+  scope: ProviderConfigScope = 'install'
+): CodexProviderDefaults {
+  return parseConfigSchema(configSchemas[scope], raw);
 }

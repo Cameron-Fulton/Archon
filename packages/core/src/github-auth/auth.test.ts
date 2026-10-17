@@ -1,10 +1,10 @@
+// @archon-test-isolated
 /**
  * Tests for the GitHub App auth module.
  *
  * Strictly mocked at the @octokit/rest boundary — no live api.github.com calls
- * in CI (PRD Q7). `mock.module` is process-global; this file is the ONLY place
- * in @archon/core that mocks @octokit/rest, and it's slotted as its own
- * `bun test` invocation in package.json's test script for isolation.
+ * in CI (PRD Q7). `mock.module` is process-global; the file directive requests
+ * a fresh process.
  */
 import { mock, spyOn, describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
@@ -183,16 +183,17 @@ describe('getInstallationToken', () => {
     expect(mockRequest).toHaveBeenCalledTimes(3);
   });
 
-  test('skips lookup when defaultInstallationId is set', async () => {
+  test('repository tokens verify installation access even with a default installation', async () => {
     const provider = makeProvider({ defaultInstallationId: 555 });
-    mockRequest.mockResolvedValueOnce(tokenResponse('ghs_direct', 3600));
-
-    const token = await provider.getInstallationToken('whatever', 'repo');
-    expect(token).toBe('ghs_direct');
-    // Exactly one call — the token-issuance, no install lookup.
-    expect(mockRequest).toHaveBeenCalledTimes(1);
-    const firstCallArgs = mockRequest.mock.calls[0];
-    expect(firstCallArgs?.[0]).toBe('POST /app/installations/{installation_id}/access_tokens');
+    mockRequest
+      .mockResolvedValueOnce({ status: 200, data: { id: 99 } })
+      .mockResolvedValueOnce(tokenResponse('ghs_repository', 3600));
+    expect(await provider.getInstallationToken('owner', 'repo')).toBe('ghs_repository');
+    expect(mockRequest.mock.calls[0]).toEqual([
+      'GET /repos/{owner}/{repo}/installation',
+      { owner: 'owner', repo: 'repo' },
+    ]);
+    expect(mockRequest.mock.calls[1]?.[1]).toEqual({ installation_id: 99 });
   });
 });
 
@@ -227,9 +228,122 @@ describe('resolveInstallationId', () => {
       AppNotInstalledError
     );
   });
+
+  test('retries a cold-cache lookup on 5xx and succeeds', async () => {
+    const provider = makeProvider();
+    mockRequest
+      .mockRejectedValueOnce(Object.assign(new Error('Server Error'), { status: 500 }))
+      .mockResolvedValueOnce({ status: 200, data: { id: 42 } });
+
+    expect(await provider.resolveInstallationId('o', 'r')).toBe(42);
+    expect(mockRequest).toHaveBeenCalledTimes(2);
+  });
+
+  test('throws after exhausting retries on a cold-cache 5xx', async () => {
+    const provider = makeProvider();
+    const err = Object.assign(new Error('Server Error'), { status: 502 });
+    mockRequest.mockRejectedValue(err);
+
+    await expect(provider.resolveInstallationId('o', 'r')).rejects.toBe(err);
+    expect(mockRequest).toHaveBeenCalledTimes(3);
+  });
+
+  test('does not retry a 4xx other than 404', async () => {
+    const provider = makeProvider();
+    const err = Object.assign(new Error('Bad credentials'), { status: 401 });
+    mockRequest.mockRejectedValueOnce(err);
+
+    await expect(provider.resolveInstallationId('o', 'r')).rejects.toBe(err);
+    expect(mockRequest).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('expired lookup fallback', () => {
+  const baseTime = 1_700_000_000_000;
+  let mockedNow = baseTime;
+  let nowSpy: ReturnType<typeof spyOn>;
+
+  beforeEach(() => {
+    mockedNow = baseTime;
+    nowSpy = spyOn(Date, 'now').mockImplementation(() => mockedNow);
+  });
+
+  afterEach(() => {
+    nowSpy.mockRestore();
+  });
+
+  async function primeThenExpire(): Promise<ReturnType<typeof makeProvider>> {
+    const provider = makeProvider();
+    mockRequest.mockResolvedValueOnce({ status: 200, data: { id: 555 } });
+    await provider.resolveInstallationId('o', 'r');
+    mockedNow = baseTime + 60 * 60 * 1000 + 1;
+    return provider;
+  }
+
+  test('serves the expired id without retrying when the re-lookup fails with 5xx', async () => {
+    const provider = await primeThenExpire();
+    mockRequest.mockRejectedValueOnce(Object.assign(new Error('Server Error'), { status: 500 }));
+
+    expect(await provider.resolveInstallationId('o', 'r')).toBe(555);
+    expect(mockRequest).toHaveBeenCalledTimes(2);
+  });
+
+  test('keeps re-trying the lookup and adopts the new id once GitHub recovers', async () => {
+    const provider = await primeThenExpire();
+    mockRequest
+      .mockRejectedValueOnce(Object.assign(new Error('Server Error'), { status: 500 }))
+      .mockResolvedValueOnce({ status: 200, data: { id: 777 } });
+
+    expect(await provider.resolveInstallationId('o', 'r')).toBe(555);
+    expect(await provider.resolveInstallationId('o', 'r')).toBe(777);
+    expect(await provider.resolveInstallationId('o', 'r')).toBe(777);
+    expect(mockRequest).toHaveBeenCalledTimes(3);
+  });
+
+  test('still throws AppNotInstalledError on 404 instead of serving the expired id', async () => {
+    const provider = await primeThenExpire();
+    mockRequest.mockRejectedValueOnce(Object.assign(new Error('Not Found'), { status: 404 }));
+
+    await expect(provider.resolveInstallationId('o', 'r')).rejects.toBeInstanceOf(
+      AppNotInstalledError
+    );
+  });
+
+  test('mints a token for the expired id when the lookup is down', async () => {
+    const provider = await primeThenExpire();
+    mockRequest
+      .mockRejectedValueOnce(Object.assign(new Error('Server Error'), { status: 500 }))
+      .mockResolvedValueOnce(tokenResponse('ghs_during_outage', 3600));
+
+    expect(await provider.getInstallationToken('o', 'r')).toBe('ghs_during_outage');
+    expect(mockRequest.mock.calls[2]?.[1]).toEqual({ installation_id: 555 });
+  });
+});
+
+describe('token issuance retry', () => {
+  test('retries access_tokens on 5xx', async () => {
+    const provider = makeProvider({ defaultInstallationId: 9 });
+    mockRequest
+      .mockRejectedValueOnce(Object.assign(new Error('Server Error'), { status: 503 }))
+      .mockResolvedValueOnce(tokenResponse('ghs_retry', 3600));
+
+    expect(await provider.getInstallationTokenById(9)).toBe('ghs_retry');
+    expect(mockRequest).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe('primeInstallationLookup', () => {
+  test('fixed-install mode uses the webhook installation for repository tokens', async () => {
+    const provider = makeProvider({ defaultInstallationId: 555 });
+    provider.primeInstallationLookup('Owner', 'Repo', 99);
+    mockRequest.mockResolvedValueOnce(tokenResponse('ghs_webhook', 3600));
+
+    expect(await provider.getInstallationToken('owner', 'repo')).toBe('ghs_webhook');
+    expect(mockRequest.mock.calls).toEqual([
+      ['POST /app/installations/{installation_id}/access_tokens', { installation_id: 99 }],
+    ]);
+  });
+
   test('priming from webhook payload skips the lookup HTTP call', async () => {
     const provider = makeProvider();
     provider.primeInstallationLookup('o', 'r', 1234);
@@ -249,12 +363,12 @@ describe('invalidateToken', () => {
       .mockResolvedValueOnce(tokenResponse('ghs_first', 3600))
       .mockResolvedValueOnce(tokenResponse('ghs_second', 3600));
 
-    const first = await provider.getInstallationToken('o', 'r');
+    const first = await provider.getInstallationTokenById(1);
     expect(first).toBe('ghs_first');
 
     provider.invalidateToken(1);
 
-    const second = await provider.getInstallationToken('o', 'r');
+    const second = await provider.getInstallationTokenById(1);
     expect(second).toBe('ghs_second');
     expect(mockRequest).toHaveBeenCalledTimes(2);
   });
@@ -286,6 +400,32 @@ describe('invalidateToken', () => {
 });
 
 describe('invalidateRepo', () => {
+  test('evicts repository and fixed-install caches', async () => {
+    const provider = makeProvider({ defaultInstallationId: 555 });
+    mockRequest
+      .mockResolvedValueOnce(tokenResponse('ghs_fixed_before', 3600))
+      .mockResolvedValueOnce({ status: 200, data: { id: 99 } })
+      .mockResolvedValueOnce(tokenResponse('ghs_repo_before', 3600));
+    expect(await provider.getInstallationTokenById(555)).toBe('ghs_fixed_before');
+    expect(await provider.getInstallationToken('owner', 'repo')).toBe('ghs_repo_before');
+    expect(mockRequest.mock.calls.at(-1)?.[1]).toEqual({ installation_id: 99 });
+    const fixedClient = await provider.getOctokitForInstallation('owner', 'repo');
+
+    provider.invalidateRepo('owner', 'repo');
+
+    expect(await provider.getOctokitForInstallation('owner', 'repo')).not.toBe(fixedClient);
+    mockRequest
+      .mockResolvedValueOnce(tokenResponse('ghs_fixed_after', 3600))
+      .mockResolvedValueOnce({ status: 200, data: { id: 100 } })
+      .mockResolvedValueOnce(tokenResponse('ghs_repo_after', 3600))
+      .mockResolvedValueOnce(tokenResponse('ghs_old_repo_after', 3600));
+    expect(await provider.getInstallationTokenById(555)).toBe('ghs_fixed_after');
+    expect(await provider.getInstallationToken('owner', 'repo')).toBe('ghs_repo_after');
+    expect(mockRequest.mock.calls.at(-1)?.[1]).toEqual({ installation_id: 100 });
+    expect(await provider.getInstallationTokenById(99)).toBe('ghs_old_repo_after');
+    expect(mockRequest).toHaveBeenCalledTimes(7);
+  });
+
   test('evicts both lookup and token caches for the repo', async () => {
     const provider = makeProvider();
     mockRequest
@@ -309,12 +449,12 @@ describe('invalidateRepo', () => {
     mockRequest
       .mockResolvedValueOnce(tokenResponse('ghs_one', 3600))
       .mockResolvedValueOnce(tokenResponse('ghs_two', 3600));
-    const first = await provider.getInstallationToken('o', 'r');
+    const first = await provider.getInstallationTokenById(123);
     expect(first).toBe('ghs_one');
 
     provider.invalidateRepo('o', 'r');
 
-    const second = await provider.getInstallationToken('o', 'r');
+    const second = await provider.getInstallationTokenById(123);
     expect(second).toBe('ghs_two');
   });
 });
@@ -324,8 +464,7 @@ describe('cache TTL boundaries', () => {
     const baseTime = 1_700_000_000_000;
     let mockedNow = baseTime;
     // spyOn restores cleanly in afterEach via mockRestore; avoids direct
-    // mutation of the Date.now reference (and the eslint-disable that came
-    // with it).
+    // mutation of the Date.now reference.
     const nowSpy = spyOn(Date, 'now').mockImplementation(() => mockedNow);
 
     try {

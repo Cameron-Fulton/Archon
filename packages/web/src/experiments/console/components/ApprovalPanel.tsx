@@ -12,82 +12,104 @@ interface ApprovalPanelProps {
   run: Run;
 }
 
-type Mode = 'idle' | 'rejecting';
+/** `null` (nothing being answered) or the id of the non-default decision being answered. */
+type Mode = string | null;
+
+function decisionLabel(id: string, label: string | undefined): string {
+  if (label !== undefined && label.length > 0) return label;
+  return id.charAt(0).toUpperCase() + id.slice(1);
+}
 
 /**
  * Inline approval surface for a paused run.
  *
- * Two distinct flows kept visually separate so accidental rejects don't
- * happen mid-conversation:
+ * Renders whichever decisions the gate actually declared (#2707 step 2) —
+ * `approve`/`reject` for an ordinary gate, or any author-declared vocabulary for
+ * one that wrote `approval.decisions:`. Two flows kept visually separate so an
+ * accidental non-default decision doesn't happen mid-conversation:
  *
- *   - **Continue / Approve**: one click. The single-line input above is an
- *     optional comment — Archon captures it as `$<node-id>.output` so the
- *     workflow can branch on the answer.
- *   - **Reject**: two-step. The first click reveals an expanded textarea
- *     for the reason; the confirm button is only enabled once the textarea
- *     has content. Mirrors the old UI's ConfirmRunActionDialog flow without
- *     a modal.
+ *   - **`approve`**: one click. The single-line input above is an optional
+ *     comment — Archon captures it as `$<node-id>.output.text` so the workflow
+ *     can branch on the answer.
+ *   - **Every other decision**: two-step. The first click reveals an expanded
+ *     textarea for the reviewer's text; the confirm button is only enabled once
+ *     the textarea has content. `reject` behaves exactly as it always has — it is simply
+ *     one entry in the declared vocabulary now, not a hardcoded second button.
  *
  * Demo runs (id starts with `demo-`) short-circuit to a no-op so the
  * preview UI doesn't hit the backend with bogus ids.
  */
 export function ApprovalPanel({ run }: ApprovalPanelProps): ReactElement {
+  const attention = run.attention;
+  if (attention?.kind === 'blocked_on_child' || attention?.kind === 'blocked_on_children') {
+    const childRunIds =
+      attention.kind === 'blocked_on_child' ? [attention.childRunId] : attention.childRunIds;
+    return (
+      <p className="mt-2 rounded border border-warning/30 bg-warning/[0.06] p-3 text-[12px] text-warning">
+        Waiting on sub-runs: {childRunIds.join(', ')}. Review the child runs to continue.
+      </p>
+    );
+  }
+  return (
+    <GateResponsePanel
+      key={JSON.stringify([run.id, run.approval?.nodeId, run.approval?.pauseId])}
+      run={run}
+    />
+  );
+}
+
+function GateResponsePanel({ run }: ApprovalPanelProps): ReactElement {
   const [comment, setComment] = useState('');
-  const [reason, setReason] = useState('');
-  const [mode, setMode] = useState<Mode>('idle');
+  const [text, setText] = useState('');
+  const [mode, setMode] = useState<Mode>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const isDemo = run.id.startsWith('demo-');
   // Signal-bearing interactive-loop gate (#2074): a bare approve finalizes the
   // node from the already-computed output (no re-run); a comment runs another
-  // iteration with it as feedback. Same approveRun call either way — the
-  // backend derives finalize-vs-iterate from comment presence.
+  // iteration. Same respond call either way — the backend derives
+  // finalize-vs-iterate from comment presence.
   const signalBearing = run.approval?.completionSignaled === true;
+
+  const authored = run.approval?.decisionsAuthored === true;
+  const decisions = run.approval?.decisions ?? [];
+  const approveDecision = decisions.find(d => d.id === 'approve');
+  const canApprove = !authored || approveDecision !== undefined;
+  const approveLabel = authored
+    ? decisionLabel('approve', approveDecision?.label)
+    : signalBearing && comment.trim().length === 0
+      ? 'Accept & complete'
+      : 'Continue';
+  const secondaryDecisions = decisions.filter(d => d.id !== 'approve');
 
   const stopPropagation = (e: MouseEvent | ReactKeyboardEvent): void => {
     e.stopPropagation();
   };
 
-  const approve = async (): Promise<void> => {
-    const trimmed = comment.trim();
+  const respond = async (decisionId: string, rawText: string): Promise<void> => {
+    const trimmed = rawText.trim();
     setBusy(true);
     setError(null);
     try {
       if (isDemo) {
         await new Promise<void>(r => setTimeout(r, 300));
       } else {
-        await skill.approveRun(run.id, trimmed.length > 0 ? trimmed : undefined);
+        await skill.respondRun(
+          run.id,
+          decisionId,
+          trimmed.length > 0 ? trimmed : undefined,
+          run.approval?.pauseId === undefined
+            ? undefined
+            : { nodeId: run.approval.nodeId, pauseId: run.approval.pauseId }
+        );
       }
       invalidate('runs');
       invalidate(`run:${run.id}`);
       setComment('');
+      setText('');
+      setMode(null);
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : 'Approve failed.');
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const confirmReject = async (): Promise<void> => {
-    const trimmed = reason.trim();
-    if (trimmed.length === 0) {
-      setError('Reject requires a reason.');
-      return;
-    }
-    setBusy(true);
-    setError(null);
-    try {
-      if (isDemo) {
-        await new Promise<void>(r => setTimeout(r, 300));
-      } else {
-        await skill.rejectRun(run.id, trimmed);
-      }
-      invalidate('runs');
-      invalidate(`run:${run.id}`);
-      setReason('');
-      setMode('idle');
-    } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : 'Reject failed.');
+      setError(e instanceof Error ? e.message : 'Response failed.');
     } finally {
       setBusy(false);
     }
@@ -98,24 +120,24 @@ export function ApprovalPanel({ run }: ApprovalPanelProps): ReactElement {
     // Don't submit while an IME composition is in progress (Japanese,
     // Chinese, Korean, etc. — the first Enter accepts a candidate).
     if (e.nativeEvent.isComposing || e.keyCode === 229) return;
-    if (e.key === 'Enter' && !e.shiftKey) {
+    if (canApprove && e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
-      void approve();
+      void respond('approve', comment);
     }
   };
 
-  const onRejectKey = (e: ReactKeyboardEvent<HTMLTextAreaElement>): void => {
+  const onSecondaryKey = (e: ReactKeyboardEvent<HTMLTextAreaElement>): void => {
     stopPropagation(e);
     if (e.key === 'Escape') {
       e.preventDefault();
-      setMode('idle');
-      setReason('');
+      setMode(null);
+      setText('');
       setError(null);
       return;
     }
-    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && mode !== null) {
       e.preventDefault();
-      void confirmReject();
+      if (text.trim().length > 0) void respond(mode, text);
     }
   };
 
@@ -131,7 +153,7 @@ export function ApprovalPanel({ run }: ApprovalPanelProps): ReactElement {
         </p>
       ) : null}
 
-      {mode === 'idle' ? (
+      {mode === null ? (
         <div className="flex items-stretch gap-2">
           <input
             type="text"
@@ -150,49 +172,51 @@ export function ApprovalPanel({ run }: ApprovalPanelProps): ReactElement {
             autoFocus
             className="min-w-0 flex-1 rounded border border-border bg-surface-inset px-3 py-1.5 text-[13px] text-text-primary placeholder:text-text-tertiary focus:border-border-bright focus:outline-none disabled:opacity-50"
           />
-          <button
-            type="button"
-            data-keymap-approve
-            onClick={() => void approve()}
-            disabled={busy}
-            className="flex shrink-0 items-center gap-1 rounded border border-success/40 bg-success/15 px-3 text-[12px] font-medium text-success transition-colors hover:bg-success/25 disabled:opacity-50"
-            title={
-              signalBearing && comment.trim().length === 0
-                ? 'Accept & complete · Enter'
-                : 'Continue · Enter'
-            }
-          >
-            {signalBearing && comment.trim().length === 0 ? 'Accept & complete' : 'Continue'}
-            <span aria-hidden className="font-mono text-[10px] opacity-70">
-              ↵
-            </span>
-          </button>
-          <button
-            type="button"
-            data-keymap-reject
-            onClick={() => {
-              setMode('rejecting');
-              setError(null);
-            }}
-            disabled={busy}
-            className="shrink-0 rounded border border-error/30 px-3 text-[12px] text-error transition-colors hover:bg-error/10 disabled:opacity-40"
-            title="Reject this run"
-          >
-            Reject
-          </button>
+          {canApprove && (
+            <button
+              type="button"
+              data-keymap-approve
+              onClick={() => void respond('approve', comment)}
+              disabled={busy}
+              className="flex shrink-0 items-center gap-1 rounded border border-success/40 bg-success/15 px-3 text-[12px] font-medium text-success transition-colors hover:bg-success/25 disabled:opacity-50"
+              title={`${approveLabel} · Enter`}
+            >
+              {approveLabel}
+              <span aria-hidden className="font-mono text-[10px] opacity-70">
+                ↵
+              </span>
+            </button>
+          )}
+          {secondaryDecisions.map(d => (
+            <button
+              key={d.id}
+              type="button"
+              data-keymap-reject={d.id === 'reject' ? true : undefined}
+              onClick={() => {
+                setMode(d.id);
+                setError(null);
+              }}
+              disabled={busy}
+              className="shrink-0 rounded border border-error/30 px-3 text-[12px] text-error transition-colors hover:bg-error/10 disabled:opacity-40"
+              title={`${decisionLabel(d.id, d.label)} this run`}
+            >
+              {decisionLabel(d.id, d.label)}
+            </button>
+          ))}
         </div>
       ) : (
         <div className="flex flex-col gap-2">
           <label className="font-mono text-[10px] uppercase tracking-[0.14em] text-error">
-            Reason for rejecting · required
+            {decisionLabel(mode, secondaryDecisions.find(d => d.id === mode)?.label)} — text
+            required
           </label>
           <textarea
-            value={reason}
+            value={text}
             onChange={e => {
-              setReason(e.target.value);
+              setText(e.target.value);
               if (error !== null) setError(null);
             }}
-            onKeyDown={onRejectKey}
+            onKeyDown={onSecondaryKey}
             placeholder="why is the agent going the wrong way? this is sent back as feedback."
             rows={3}
             disabled={busy}
@@ -207,8 +231,8 @@ export function ApprovalPanel({ run }: ApprovalPanelProps): ReactElement {
               <button
                 type="button"
                 onClick={() => {
-                  setMode('idle');
-                  setReason('');
+                  setMode(null);
+                  setText('');
                   setError(null);
                 }}
                 disabled={busy}
@@ -218,11 +242,15 @@ export function ApprovalPanel({ run }: ApprovalPanelProps): ReactElement {
               </button>
               <button
                 type="button"
-                onClick={() => void confirmReject()}
-                disabled={busy || reason.trim().length === 0}
+                onClick={() => {
+                  if (text.trim().length > 0) void respond(mode, text);
+                }}
+                disabled={busy || text.trim().length === 0}
                 className="flex items-center gap-1 rounded border border-error/40 bg-error/15 px-3 py-1 text-[12px] font-medium text-error transition-colors hover:bg-error/25 disabled:opacity-40"
               >
-                {busy ? 'Rejecting…' : 'Reject run'}
+                {busy
+                  ? 'Sending…'
+                  : `${decisionLabel(mode, secondaryDecisions.find(d => d.id === mode)?.label)} run`}
                 <span aria-hidden className="font-mono text-[10px] opacity-70">
                   ⌘↵
                 </span>

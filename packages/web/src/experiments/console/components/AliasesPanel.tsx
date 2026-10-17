@@ -14,8 +14,9 @@ import { K } from '../store/keys';
 import { providerOptionHint } from '../lib/agent-status';
 import { effortOptionsForAgent, normalizeEffortForAgent } from '../lib/model-options';
 import { useCancelledRef } from '../lib/use-cancelled-ref';
+import { errorDetail } from '../lib/http';
 import { SettingsSection } from './SettingsSection';
-import { ScopeToggle } from './ScopeToggle';
+import { UserScopeSlot, userScopeStatus } from './ScopeToggle';
 import { INPUT_CLASS, SELECT_CLASS, SelectShell } from './SettingsFormPrimitives';
 import { ModelPickerField } from './ModelPickerField';
 
@@ -23,8 +24,8 @@ import { ModelPickerField } from './ModelPickerField';
  * Editor for `@custom` model aliases in two scopes: "This install" writes
  * PATCH /api/config/aliases → ~/.archon/config.yaml (ungated), "Just me"
  * writes the caller's per-user prefs row via PATCH /api/auth/me/ai-prefs/aliases.
- * The "Just me" scope is hidden when the per-user prefs read fails (no web
- * identity), mirroring ModelTiersPanel. Removing a row (or renaming) sends a
+ * The "Just me" scope follows ModelTiersPanel: hidden on a 401, reported on
+ * any other prefs read failure. Removing a row (or renaming) sends a
  * `null` for the old name — the routes apply a per-key merge.
  */
 export function AliasesPanel(): ReactElement {
@@ -47,8 +48,11 @@ export function AliasesPanel(): ReactElement {
   // the server returns [] when the catalog can't load; an error means no hints.
   const { data: piModels } = useEntity<PiModelInfo[]>(K.piModels, skill.listPiModels);
 
-  const userScopeAvailable = userPrefsError === undefined;
-  const [scope, setScope] = useState<SettingsScope>('install');
+  const userScope = userScopeStatus(userPrefsError);
+  const [selectedScope, setScope] = useState<SettingsScope>('install');
+  // Without per-user prefs the editor is install-only, so it never labels
+  // install values as "Just me".
+  const scope: SettingsScope = userScope.kind === 'available' ? selectedScope : 'install';
 
   const [rows, setRows] = useState<AliasRowForm[] | null>(null);
   const baselineRef = useRef('');
@@ -118,7 +122,7 @@ export function AliasesPanel(): ReactElement {
       }
     } catch (e: unknown) {
       if (cancelledRef.current) return;
-      setSaveError(e instanceof Error ? e.message : 'Failed to save aliases.');
+      setSaveError(e instanceof Error ? errorDetail(e) : 'Failed to save aliases.');
     } finally {
       if (!cancelledRef.current) setSaving(false);
     }
@@ -133,7 +137,7 @@ export function AliasesPanel(): ReactElement {
           <code className="font-mono">@fast</code>).
           {scope === 'user' ? ' Your aliases override install aliases with the same name.' : ''}
         </p>
-        {userScopeAvailable ? <ScopeToggle scope={scope} onChange={setScope} /> : null}
+        <UserScopeSlot status={userScope} scope={scope} onChange={setScope} />
       </div>
 
       {rows.length === 0 ? (
@@ -143,7 +147,7 @@ export function AliasesPanel(): ReactElement {
       ) : (
         <div className="flex flex-col gap-[11px]">
           {rows.map((row, i) => {
-            const effortOptions = effortOptionsForAgent(row.provider);
+            const effortOptions = effortOptionsForAgent(row.provider, providers);
             return (
               <div
                 // Index key is intentional: rows are positional edit buffers and
@@ -169,7 +173,7 @@ export function AliasesPanel(): ReactElement {
                       const provider = e.target.value;
                       setRow(i, {
                         provider,
-                        effort: normalizeEffortForAgent(provider, row.effort),
+                        effort: normalizeEffortForAgent(provider, row.effort, providers),
                       });
                     }}
                     aria-label="Provider"
@@ -192,7 +196,7 @@ export function AliasesPanel(): ReactElement {
                   onChange={v => {
                     setRow(i, { model: v });
                   }}
-                  placeholder="model (e.g. opus, gpt-5.5)"
+                  placeholder="model (e.g. opus, gpt-5.6-terra)"
                   ariaLabel="Model"
                   className="min-w-[140px] flex-1"
                   agents={keyData?.agents}
@@ -203,7 +207,9 @@ export function AliasesPanel(): ReactElement {
                     <select
                       value={row.effort}
                       onChange={e => {
-                        setRow(i, { effort: e.target.value });
+                        setRow(i, {
+                          effort: effortOptions.find(option => option === e.target.value) ?? '',
+                        });
                       }}
                       aria-label="Effort"
                       className={SELECT_CLASS}

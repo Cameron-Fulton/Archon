@@ -1,37 +1,41 @@
 /**
- * Codex binary resolver for compiled (bun --compile) archon binaries.
+ * Codex binary resolver.
  *
- * The @openai/codex-sdk uses `createRequire(import.meta.url)` to locate the
- * native Codex CLI binary, which breaks in compiled binaries where
- * `import.meta.url` is frozen to the build host's path.
- *
- * Resolution order:
+ * Source installs find the native binary of the pinned `@openai/codex` package in
+ * node_modules. That lookup uses `createRequire(import.meta.url)`, which breaks in
+ * compiled (bun --compile) binaries where `import.meta.url` is frozen to the build
+ * host's path, so compiled builds resolve in this order:
  * 1. `CODEX_BIN_PATH` environment variable
  * 2. `assistants.codex.codexBinaryPath` in config
  * 3. `~/.archon/vendor/codex/<platform-binary>` (user-placed)
  * 4. Autodetect canonical install paths (npm prefix defaults per platform)
  * 5. Throw with install instructions
  *
- * In dev mode (BUNDLED_IS_BINARY=false), returns undefined so the SDK
- * uses its normal node_modules-based resolution.
+ * Source installs honor explicit env/config pins, then fall back to
+ * {@link resolveBundledCodexBinary}.
  */
 import { existsSync as _existsSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { BUNDLED_IS_BINARY, getArchonHome, createLogger } from '@archon/paths';
+import {
+  appendBinaryCandidateHint,
+  classifyBinaryPath,
+  type BinaryPathKind,
+} from '../shared/binary-resolution';
+import { ClassifiedProviderError } from '../shared/failure';
 
 /** Wrapper for existsSync — enables spyOn in tests (direct imports can't be spied on). */
 export function fileExists(path: string): boolean {
   return _existsSync(path);
 }
 
-// TODO(#1723): existsSync returns true for directories, so an env or config
-// path pointing at the platform-package *directory* (e.g. an npm-distributed
-// `@openai/codex-<platform>` folder containing `codex{.exe}`) currently slips
-// past validation and crashes inside the SDK's child_process.spawn as ENOENT.
-// The Claude resolver applies a pathKind() / expandDirectoryToExecutable()
-// fix; mirror the same pattern here when a Codex bug report lands or as part
-// of a deliberate parity pass.
+export function pathKind(path: string): BinaryPathKind {
+  return classifyBinaryPath(path, error => {
+    getLog().warn({ err: error, path, code: error.code }, 'codex.path_stat_failed');
+  });
+}
 
 /** Lazy-initialized logger */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -44,20 +48,95 @@ const CODEX_VENDOR_DIR = 'vendor/codex';
 
 const SUPPORTED_PLATFORMS = ['darwin', 'linux', 'win32'];
 
+const CODEX_BINARY_NAME = process.platform === 'win32' ? 'codex.exe' : 'codex';
+
 /** Which resolution tier produced the Codex binary path. */
 export type CodexBinarySource = 'env' | 'config' | 'vendor' | 'autodetect';
+
+interface CodexBinaryResolution {
+  path: string;
+  source: CodexBinarySource;
+}
+
+interface CodexBinaryPin {
+  sourceLabel: string;
+  removableSetting: string;
+  missingInstruction: string;
+}
+
+const CODEX_ENV_PIN: CodexBinaryPin = {
+  sourceLabel: 'CODEX_BIN_PATH',
+  removableSetting: 'CODEX_BIN_PATH',
+  missingInstruction: 'Please verify the path points to the Codex CLI binary.',
+};
+
+const CODEX_CONFIG_PIN: CodexBinaryPin = {
+  sourceLabel: 'assistants.codex.codexBinaryPath',
+  removableSetting: 'codexBinaryPath',
+  missingInstruction:
+    'Please verify the path in .archon/config.yaml points to the Codex CLI binary.',
+};
 
 /** Returns the vendor binary filename for the current platform, or undefined if unsupported. */
 function getVendorBinaryName(): string | undefined {
   if (!SUPPORTED_PLATFORMS.includes(process.platform)) return undefined;
   if (process.arch !== 'x64' && process.arch !== 'arm64') return undefined;
-  return process.platform === 'win32' ? 'codex.exe' : 'codex';
+  return CODEX_BINARY_NAME;
+}
+
+function findLowerTierBinary(): CodexBinaryResolution | undefined {
+  const binaryName = getVendorBinaryName();
+  if (binaryName) {
+    const vendorBinaryPath = join(getArchonHome(), CODEX_VENDOR_DIR, binaryName);
+    if (pathKind(vendorBinaryPath) === 'file') {
+      return { path: vendorBinaryPath, source: 'vendor' };
+    }
+  }
+
+  for (const probePath of getAutodetectPaths()) {
+    if (pathKind(probePath) === 'file') {
+      return { path: probePath, source: 'autodetect' };
+    }
+  }
+
+  return undefined;
+}
+
+function validateAndExpand(rawPath: string, pin: CodexBinaryPin): string {
+  const kind = pathKind(rawPath);
+  if (kind === 'file') return rawPath;
+
+  let message: string;
+  if (kind === 'directory') {
+    const executablePath = join(rawPath, CODEX_BINARY_NAME);
+    if (pathKind(executablePath) === 'file') return executablePath;
+    message =
+      `${pin.sourceLabel} is set to "${rawPath}", which is a directory, but it does not contain ${CODEX_BINARY_NAME}.\n` +
+      'Please point this setting at the Codex CLI binary itself.';
+  } else {
+    message =
+      `${pin.sourceLabel} is set to "${rawPath}" but the file does not exist.\n` +
+      pin.missingInstruction;
+  }
+
+  // Only compiled installs use the vendor/autodetect fallback after removing a pin.
+  const candidate = BUNDLED_IS_BINARY ? findLowerTierBinary() : undefined;
+  throw new ClassifiedProviderError(
+    'misconfigured',
+    appendBinaryCandidateHint(message, {
+      candidatePath: candidate?.path,
+      binaryLabel: 'Codex',
+      sourceLabel: pin.sourceLabel,
+      removableSetting: pin.removableSetting,
+    })
+  );
 }
 
 /**
  * Resolve the path to the Codex native binary.
  *
- * In dev mode: returns undefined (let SDK resolve via node_modules).
+ * In dev mode: honors explicit pins, otherwise returns undefined so the turn runs the
+ * bundled `@openai/codex` binary.
  * In binary mode: resolves from env/config/vendor dir, or throws with install instructions.
  */
 export async function resolveCodexBinaryPath(
@@ -71,65 +150,45 @@ export async function resolveCodexBinaryPath(
  * Same resolution as {@link resolveCodexBinaryPath}, but also reports which
  * tier produced the path. Used by `archon doctor` to tell the user how the
  * binary was found (env / config / vendor / autodetect). Returns undefined in
- * dev mode; throws with install instructions in binary mode when unresolved.
+ * unpinned dev mode; throws with install instructions in binary mode when unresolved.
+ * An invalid explicit env or config pin throws in either mode.
  */
 export async function resolveCodexBinaryWithSource(
   configCodexBinaryPath?: string
-): Promise<{ path: string; source: CodexBinarySource } | undefined> {
-  if (!BUNDLED_IS_BINARY) return undefined;
-
+): Promise<CodexBinaryResolution | undefined> {
   // 1. Environment variable override
   const envPath = process.env.CODEX_BIN_PATH;
   if (envPath) {
-    if (!fileExists(envPath)) {
-      throw new Error(
-        `CODEX_BIN_PATH is set to "${envPath}" but the file does not exist.\n` +
-          'Please verify the path points to the Codex CLI binary.'
-      );
-    }
-    getLog().info({ binaryPath: envPath, source: 'env' }, 'codex.binary_resolved');
-    return { path: envPath, source: 'env' };
+    const resolvedEnv = validateAndExpand(envPath, CODEX_ENV_PIN);
+    getLog().info({ binaryPath: resolvedEnv, source: 'env' }, 'codex.binary_resolved');
+    return { path: resolvedEnv, source: 'env' };
   }
 
   // 2. Config file override
   if (configCodexBinaryPath) {
-    if (!fileExists(configCodexBinaryPath)) {
-      throw new Error(
-        `assistants.codex.codexBinaryPath is set to "${configCodexBinaryPath}" but the file does not exist.\n` +
-          'Please verify the path in .archon/config.yaml points to the Codex CLI binary.'
-      );
-    }
-    getLog().info({ binaryPath: configCodexBinaryPath, source: 'config' }, 'codex.binary_resolved');
-    return { path: configCodexBinaryPath, source: 'config' };
+    const resolvedConfig = validateAndExpand(configCodexBinaryPath, CODEX_CONFIG_PIN);
+    getLog().info({ binaryPath: resolvedConfig, source: 'config' }, 'codex.binary_resolved');
+    return { path: resolvedConfig, source: 'config' };
   }
 
-  // 3. Check vendor directory (user-placed binary)
-  const binaryName = getVendorBinaryName();
-  if (binaryName) {
-    const archonHome = getArchonHome();
-    const vendorBinaryPath = join(archonHome, CODEX_VENDOR_DIR, binaryName);
+  // Source installs honor explicit pins too; the bundled package remains the unpinned default.
+  if (!BUNDLED_IS_BINARY) return undefined;
 
-    if (fileExists(vendorBinaryPath)) {
-      getLog().info({ binaryPath: vendorBinaryPath, source: 'vendor' }, 'codex.binary_resolved');
-      return { path: vendorBinaryPath, source: 'vendor' };
-    }
-  }
-
-  // 4. Autodetect — probe the handful of paths Codex typically lands at
-  // when installed via the documented package managers. Users who install
-  // somewhere else (custom npm prefix, etc.) still set one of the higher-
-  // priority sources above. Order: most specific → least specific.
-  const autodetectPaths = getAutodetectPaths();
-  for (const probePath of autodetectPaths) {
-    if (fileExists(probePath)) {
-      getLog().info({ binaryPath: probePath, source: 'autodetect' }, 'codex.binary_resolved');
-      return { path: probePath, source: 'autodetect' };
-    }
+  // 3-4. Vendor then autodetect. The same search supplies diagnostics for an
+  // invalid explicit pin, but a candidate is returned only when no pin exists.
+  const lowerTierBinary = findLowerTierBinary();
+  if (lowerTierBinary) {
+    getLog().info(
+      { binaryPath: lowerTierBinary.path, source: lowerTierBinary.source },
+      'codex.binary_resolved'
+    );
+    return lowerTierBinary;
   }
 
   // 5. Not found — throw with install instructions
   const vendorPath = `~/.archon/${CODEX_VENDOR_DIR}/`;
-  throw new Error(
+  throw new ClassifiedProviderError(
+    'misconfigured',
     'Codex CLI binary not found. The Codex provider requires a native binary\n' +
       'that cannot be resolved automatically in compiled Archon builds.\n\n' +
       'To fix, choose one of:\n' +
@@ -142,6 +201,65 @@ export async function resolveCodexBinaryWithSource(
       '       codex:\n' +
       '         codexBinaryPath: /path/to/codex\n'
   );
+}
+
+/** The native binary to spawn, and directories its package ships helpers in (ripgrep). */
+export interface CodexBinary {
+  path: string;
+  /** Prepended to the child's PATH, as the package's own launcher does. */
+  pathDirs: string[];
+}
+
+/** Rust target triple per `platform-arch`; the platform package `@openai/codex-<platform-arch>` vendors it. */
+const CODEX_TARGETS: Record<string, string> = {
+  'linux-x64': 'x86_64-unknown-linux-musl',
+  'linux-arm64': 'aarch64-unknown-linux-musl',
+  'darwin-x64': 'x86_64-apple-darwin',
+  'darwin-arm64': 'aarch64-apple-darwin',
+  'win32-x64': 'x86_64-pc-windows-msvc',
+  'win32-arm64': 'aarch64-pc-windows-msvc',
+};
+
+/**
+ * The native binary of the `@openai/codex` package Archon pins, for source installs with
+ * no explicit pin. The package installs one optional platform package holding
+ * `vendor/<target>/bin/codex` and a `codex-path` directory of helpers.
+ */
+export function resolveBundledCodexBinary(): CodexBinary {
+  const platformKey = `${process.platform}-${process.arch}`;
+  const target = CODEX_TARGETS[platformKey];
+  const missing = (detail: string): ClassifiedProviderError =>
+    new ClassifiedProviderError(
+      'misconfigured',
+      `Codex CLI binary not found: ${detail}\n` +
+        'Run `bun install` so @openai/codex installs its platform package, or set CODEX_BIN_PATH.'
+    );
+  if (!target) throw missing(`no Codex build for ${platformKey}`);
+
+  let vendorRoot: string;
+  try {
+    const codexPackageJson = createRequire(import.meta.url).resolve('@openai/codex/package.json');
+    const platformPackageJson = createRequire(codexPackageJson).resolve(
+      `@openai/codex-${platformKey}/package.json`
+    );
+    vendorRoot = join(dirname(platformPackageJson), 'vendor', target);
+  } catch (error) {
+    throw missing(`@openai/codex-${platformKey} is not installed (${(error as Error).message})`);
+  }
+
+  const path = join(vendorRoot, 'bin', CODEX_BINARY_NAME);
+  if (pathKind(path) !== 'file') throw missing(`${path} does not exist`);
+  const helpers = join(vendorRoot, 'codex-path');
+  return { path, pathDirs: pathKind(helpers) === 'directory' ? [helpers] : [] };
+}
+
+/**
+ * The binary a Codex turn spawns: an explicit pin or a compiled build's lower tiers,
+ * else the bundled package. Resolved on every turn, so a changed pin applies to the next one.
+ */
+export async function resolveCodexBinary(configCodexBinaryPath?: string): Promise<CodexBinary> {
+  const pinned = await resolveCodexBinaryPath(configCodexBinaryPath);
+  return pinned ? { path: pinned, pathDirs: [] } : resolveBundledCodexBinary();
 }
 
 /**

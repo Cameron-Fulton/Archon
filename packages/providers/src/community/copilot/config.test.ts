@@ -1,6 +1,10 @@
 import { describe, expect, test } from 'bun:test';
 
-import { parseCopilotConfig } from './config';
+import {
+  parseCopilotConfig,
+  parseCopilotConfigStrict,
+  type CopilotProviderDefaults,
+} from './config';
 
 describe('parseCopilotConfig', () => {
   test('returns empty object for empty input', () => {
@@ -18,7 +22,7 @@ describe('parseCopilotConfig', () => {
   });
 
   test('parses each valid reasoning effort value', () => {
-    for (const v of ['low', 'medium', 'high', 'xhigh'] as const) {
+    for (const v of ['low', 'medium', 'high', 'xhigh', 'max'] as const) {
       expect(parseCopilotConfig({ modelReasoningEffort: v })).toEqual({
         modelReasoningEffort: v,
       });
@@ -26,14 +30,16 @@ describe('parseCopilotConfig', () => {
   });
 
   test('drops unknown reasoning effort value', () => {
-    expect(parseCopilotConfig({ modelReasoningEffort: 'minimal' })).toEqual({});
     expect(parseCopilotConfig({ modelReasoningEffort: 'extreme' })).toEqual({});
     expect(parseCopilotConfig({ modelReasoningEffort: 42 })).toEqual({});
   });
 
-  test('normalizes Archon alias `max` to SDK `xhigh`', () => {
-    expect(parseCopilotConfig({ modelReasoningEffort: 'max' })).toEqual({
-      modelReasoningEffort: 'xhigh',
+  test('clamps the rungs Archon has and the SDK does not', () => {
+    expect(parseCopilotConfig({ modelReasoningEffort: 'persistent' })).toEqual({
+      modelReasoningEffort: 'max',
+    });
+    expect(parseCopilotConfig({ modelReasoningEffort: 'minimal' })).toEqual({
+      modelReasoningEffort: 'low',
     });
   });
 
@@ -95,18 +101,8 @@ describe('parseCopilotConfig', () => {
     expect(() => parseCopilotConfig({ logLevel: null })).not.toThrow();
   });
 
-  test('combines all fields', () => {
-    expect(
-      parseCopilotConfig({
-        model: 'gpt-5-mini',
-        modelReasoningEffort: 'high',
-        copilotCliPath: '/bin/copilot',
-        configDir: '/etc/copilot',
-        enableConfigDiscovery: true,
-        useLoggedInUser: false,
-        logLevel: 'debug',
-      })
-    ).toEqual({
+  test('validates every setting and snapshots only portable settings', () => {
+    const config = {
       model: 'gpt-5-mini',
       modelReasoningEffort: 'high',
       copilotCliPath: '/bin/copilot',
@@ -114,6 +110,13 @@ describe('parseCopilotConfig', () => {
       enableConfigDiscovery: true,
       useLoggedInUser: false,
       logLevel: 'debug',
+    } satisfies Required<CopilotProviderDefaults>;
+    expect(parseCopilotConfig(config)).toEqual(config);
+    expect(parseCopilotConfigStrict(config)).toEqual(config);
+    expect(parseCopilotConfigStrict(config, 'snapshot')).toEqual({
+      model: 'gpt-5-mini',
+      modelReasoningEffort: 'high',
     });
+    expect(() => parseCopilotConfigStrict({ ...config, configDir: 42 }, 'snapshot')).toThrow();
   });
 });

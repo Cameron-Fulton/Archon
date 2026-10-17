@@ -1,3 +1,4 @@
+import { missingProviderMessage } from '@archon/provider-contract';
 /**
  * `archon ai` — per-user AI-provider credentials AND install-wide model config.
  *
@@ -26,6 +27,7 @@
  * $USER/$USERNAME, resolved to a stable Archon user via the 'cli' platform
  * identity so a connected key attaches to the same user across invocations.
  */
+import { providerRegistry } from '@archon/providers';
 import { password, text, isCancel, cancel } from '@clack/prompts';
 import { writeJsonLine } from '../utils/stdout';
 import { createLogger } from '@archon/paths';
@@ -47,19 +49,24 @@ import {
   setUserTiers,
   setUserAliases,
   setUserDefault,
+  isEffortRung,
   type TiersPatch,
+  type EffortRung,
   type UserAiPrefs,
 } from '@archon/core';
-import { isRegisteredProvider, getProviderInfoList } from '@archon/providers';
+import { isRegisteredProvider, getProviderInfoList, getRegistration } from '@archon/providers';
 import {
   TIER_NAMES,
   buildAiProfile,
-  isEffortValidForProvider,
   isTierName as isTierNameStrict,
   validEffortsForProvider,
 } from '@archon/workflows/model-validation';
 import type { TierName, RawAliasEntry } from '@archon/workflows/model-validation';
 import * as userDb from '@archon/core/db/users';
+import {
+  listProviderAttemptHolders,
+  releaseProviderAttemptHolder,
+} from '@archon/core/db/provider-attempts';
 import { resolveCliUserId } from './auth';
 
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -343,17 +350,31 @@ function registeredProvidersList(): string {
 }
 
 /** Validate provider + effort for a tier/alias entry; prints and returns false on error. */
-function validateEntryInputs(provider: string, effort: string | undefined): boolean {
+function validateEntryInputs(
+  provider: string,
+  effort: string | undefined
+): effort is EffortRung | undefined {
   if (!isRegisteredProvider(provider)) {
-    console.error(`Unknown provider '${provider}'. Available: ${registeredProvidersList()}.`);
+    console.error(missingProviderMessage(providerRegistry, provider));
     return false;
   }
-  if (effort !== undefined && !isEffortValidForProvider(provider, effort)) {
-    console.error(
-      `Invalid effort '${effort}' for provider '${provider}'. ` +
-        `Valid: ${validEffortsForProvider(provider)?.join(', ') ?? '(this provider has no effort setting)'}.`
-    );
+  if (effort !== undefined && !isEffortRung(effort)) {
+    console.error(`Invalid effort '${effort}'.`);
     return false;
+  }
+  if (effort !== undefined) {
+    const validEfforts = validEffortsForProvider(providerRegistry, provider);
+    if (validEfforts === null) {
+      console.error(`Provider '${provider}' does not support effort.`);
+      return false;
+    }
+    if (!validEfforts.includes(effort)) {
+      console.error(
+        `Invalid effort '${effort}' for provider '${provider}'. ` +
+          `Valid: ${validEfforts.join(', ')}.`
+      );
+      return false;
+    }
   }
   return true;
 }
@@ -419,7 +440,22 @@ export async function aiTierUnsetCommand(
       const tiers: TiersPatch = {};
       tiers[tier] = null;
       await updateGlobalConfig({ tiers });
-      console.log(`✓ Unset tier '${tier}' (falls back to the built-in default).`);
+      // Only claude and codex ship built-in tier defaults — for any other
+      // default provider an unset install tier resolves to nothing, and
+      // claiming a fallback here would hide the very state the tier
+      // resolution error exists to surface.
+      let builtIn: RawAliasEntry | undefined;
+      try {
+        const config = await loadConfig();
+        builtIn = buildAiProfile(config.assistant).aliases[tier];
+      } catch (err) {
+        getLog().warn({ err: err as Error, tier }, 'cli.ai_tier_unset_default_lookup_failed');
+      }
+      console.log(
+        builtIn
+          ? `✓ Unset tier '${tier}' (falls back to the built-in default: ${builtIn.provider}/${builtIn.model}).`
+          : `✓ Unset tier '${tier}'. No built-in default exists for your default provider — set one with \`archon ai tier set ${tier} <provider> <model>\` before anything uses this tier.`
+      );
     }
     return 0;
   } catch (err) {
@@ -681,7 +717,7 @@ export async function aiDefaultCommand(
     return 1;
   }
   if (!isRegisteredProvider(provider)) {
-    console.error(`Unknown provider '${provider}'. Available: ${registeredProvidersList()}.`);
+    console.error(missingProviderMessage(providerRegistry, provider));
     return 1;
   }
   try {
@@ -704,6 +740,8 @@ export async function aiDefaultCommand(
         console.log(`✓ Default assistant set to '${provider}'.`);
       }
     }
+    const notice = getRegistration(provider).deprecationNotice;
+    if (notice) console.log(`! ${notice}`);
     return 0;
   } catch (err) {
     getLog().error(
@@ -712,5 +750,51 @@ export async function aiDefaultCommand(
     );
     console.error(`✗ ${(err as Error).message}`);
     return 1;
+  }
+}
+
+/**
+ * List provider-attempt slot holders. A holder whose owner is on another host cannot
+ * be proven dead from here, so it stays held until `ai capacity release`.
+ */
+export async function aiCapacityListCommand(json?: boolean): Promise<number> {
+  const holders = await listProviderAttemptHolders();
+  if (json) {
+    await writeJsonLine({ holders });
+    return 0;
+  }
+  if (holders.length === 0) {
+    console.log('No provider attempts hold capacity.');
+    return 0;
+  }
+  console.log('Provider attempts holding capacity:');
+  for (const h of holders) {
+    const owner = h.owner
+      ? `${h.owner.host} pid ${String(h.owner.pid)} (${h.ownerOnThisHost ? 'this host' : 'another host'})`
+      : h.invalidOwner;
+    console.log(`  ${h.provider.padEnd(10)} ${h.attemptId}  ${owner} since ${h.acquiredAt}`);
+  }
+  return 0;
+}
+
+/** Explicitly release one holder whose owner process the operator has verified is gone. */
+export async function aiCapacityReleaseCommand(attemptId: string | undefined): Promise<number> {
+  if (!attemptId) {
+    console.error('Usage: archon ai capacity release <attempt-id>');
+    return 1;
+  }
+  const outcome = await releaseProviderAttemptHolder(attemptId);
+  switch (outcome) {
+    case 'released':
+      console.log(`Released provider attempt ${attemptId}.`);
+      return 0;
+    case 'not_found':
+      console.error(`No provider attempt ${attemptId} holds capacity.`);
+      return 1;
+    case 'owner_running':
+      console.error(
+        `Provider attempt ${attemptId} belongs to a process still running on this host; it was not released.`
+      );
+      return 1;
   }
 }

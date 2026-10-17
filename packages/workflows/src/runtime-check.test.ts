@@ -23,8 +23,7 @@ mock.module('@archon/paths', () => ({
     trace: mock(() => undefined),
   })),
   getCommandFolderSearchPaths: mock(() => ['.archon/commands']),
-  getDefaultCommandsPath: mock(() => '/defaults/commands'),
-  findMarkdownFilesRecursive: mock(async () => []),
+  findCommandFiles: mock(async () => []),
 }));
 
 // Mock defaults and command-validation used by validator

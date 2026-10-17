@@ -8,29 +8,37 @@
  * Lives in @archon/workflows (no @archon/core dependency) so both CLI and
  * REST API can use it.
  */
+import type { ProviderRegistry } from '@archon/provider-contract';
 
-import { dirname, join, resolve, isAbsolute } from 'path';
+import { join } from 'path';
+import { readHomeMcpDirectory } from './compiled-command';
+import { resolveMcpPath, missingMcpConfigMessage } from './mcp-path';
 import { access, readFile, stat } from 'fs/promises';
 import {
   createLogger,
   getCommandFolderSearchPaths,
-  getDefaultCommandsPath,
-  getDefaultWorkflowsPath,
   getHomeCommandsPath,
-  getHomeWorkflowsPath,
-  findMarkdownFilesRecursive,
+  findCommandFiles,
 } from '@archon/paths';
 import { execFileAsync } from '@archon/git';
 import { BUNDLED_COMMANDS, BUNDLED_WORKFLOWS, isBinaryBuild } from './defaults/bundled-defaults';
+import { bundlesPackagedResources } from './defaults/bundle-inventory';
 import { isValidCommandName } from './command-validation';
 import { levenshtein, findSimilar } from './utils/fuzzy-match';
 import {
-  claudeSkillSearchRoots,
   findInstalledSkillNames,
-  getProviderCapabilities,
-  isRegisteredProvider,
+  parseSettingSources,
+  DEFAULT_SETTING_SOURCES,
+  projectSkillSearchRoots,
   skillSearchRoots,
-} from '@archon/providers';
+} from '@archon/paths/skills';
+import { compileOutputSchema } from './structured-output';
+import {
+  declaredSkillRoots,
+  findStrictSchemaIssues,
+  isObjectSchemaNode,
+  mcpServerMap,
+} from '@archon/provider-contract';
 
 /** Lazy-initialized logger */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -39,21 +47,27 @@ function getLog(): ReturnType<typeof createLogger> {
   return cachedLog;
 }
 import {
-  isBashNode,
+  isAgentNode,
+  isExecNode,
   isLoopNode,
   isLoopGroupNode,
-  isScriptNode,
-  isIncludeNode,
+  isIncludeDirective,
+  isOutputFormatEnforced,
+  isWaitNode,
   isWorkflowNode,
+  mcpDeclaration,
 } from './schemas';
-import { parseWorkflow } from './loader';
+import { parseWorkflow, workflowNodeOutputFormatError } from './loader';
+import { PRIOR_OUTPUT_PATH_SOURCE, CURRENT_OUTPUT_PATH_SOURCE } from './output-ref';
 import { resolveWorkflowName } from './router';
-import type { WorkflowDefinition, DagNode, WorkflowSource } from './schemas';
+import { visitNodeTemplateSlots } from './template-walker';
+import type { WorkflowDefinition, DagNode, IncludeDirective, WorkflowSource } from './schemas';
 import type { ScriptRuntime } from './script-discovery';
 import { discoverScriptsForCwd } from './script-discovery';
 import { isInlineScript } from './executor-shared';
 import { buildAiProfile, isLiteralSpec, resolveModelSpec } from './model-validation';
-import { getPackagedResourceDirectory, parsePackagedResourceReference } from './packaged-workflow';
+import { parsePackagedResourceReference } from './packaged-workflow';
+import { liveSourceRoots, packagedWorkflowDirectory } from './workflow-source';
 import type { RawAliasesConfig, RawTiersConfig, ResolvedAiProfile } from './model-validation';
 
 // =============================================================================
@@ -63,6 +77,7 @@ import type { RawAliasesConfig, RawTiersConfig, ResolvedAiProfile } from './mode
 /** A single validation issue with actionable hint */
 export interface ValidationIssue {
   level: 'error' | 'warning';
+  code?: 'shell_output_ref';
   nodeId?: string;
   field: string;
   message: string;
@@ -107,8 +122,10 @@ export interface ValidationConfig {
   assistant?: string;
   aliases?: RawAliasesConfig;
   tiers?: RawTiersConfig;
-  claudeSettingSources?: ('project' | 'user')[];
-  claudeConfigDir?: string;
+  /** Install-level provider defaults, keyed by provider id. */
+  assistants?: Record<string, Record<string, unknown>>;
+  /** The run environment, for provider skill roots named by an environment variable. */
+  env?: Record<string, string>;
 }
 
 // Levenshtein distance and fuzzy matching now live in ./utils/fuzzy-match so lean
@@ -132,7 +149,7 @@ async function fileExists(path: string): Promise<boolean> {
 }
 
 /**
- * Discover all available command names from search paths and bundled defaults.
+ * Discover all available flat command names from the project and home search paths.
  * Returns deduplicated, sorted list of command names.
  */
 export async function discoverAvailableCommands(
@@ -148,7 +165,7 @@ export async function discoverAvailableCommands(
   const searchPaths = getCommandFolderSearchPaths(config?.commandFolder);
   for (const folder of searchPaths) {
     const dirPath = join(cwd, folder);
-    const files = await findMarkdownFilesRecursive(dirPath, '', { maxDepth: 1 });
+    const files = await findCommandFiles(dirPath);
     for (const { commandName } of files) {
       names.add(commandName);
     }
@@ -156,31 +173,15 @@ export async function discoverAvailableCommands(
 
   // 2. Home-scoped commands (~/.archon/commands/) — personal helpers reusable across repos.
   // ENOENT already returns []; we only catch other errors (EACCES/EPERM/EIO) so a broken
-  // home-scope doesn't take down repo/bundled discovery.
+  // home-scope doesn't take down repo discovery.
   const homePath = getHomeCommandsPath();
   try {
-    const homeCommands = await findMarkdownFilesRecursive(homePath, '', { maxDepth: 1 });
+    const homeCommands = await findCommandFiles(homePath);
     for (const { commandName } of homeCommands) {
       names.add(commandName);
     }
   } catch (err) {
     getLog().warn({ err, path: homePath }, 'commands.home_discovery_failed');
-  }
-
-  // 3. Bundled defaults
-  const loadDefaults = config?.loadDefaultCommands !== false;
-  if (loadDefaults) {
-    if (isBinaryBuild()) {
-      for (const name of Object.keys(BUNDLED_COMMANDS)) {
-        if (parsePackagedResourceReference(name) === null) names.add(name);
-      }
-    } else {
-      const defaultsPath = getDefaultCommandsPath();
-      const files = await findMarkdownFilesRecursive(defaultsPath, '', { maxDepth: 1 });
-      for (const { commandName } of files) {
-        names.add(commandName);
-      }
-    }
   }
 
   return [...names].sort();
@@ -196,7 +197,7 @@ export async function discoverAvailableCommands(
  * deterministic walk order wins — duplicates within a scope are a user error.
  */
 async function resolveCommandInDir(rootDir: string, commandName: string): Promise<string | null> {
-  const entries = await findMarkdownFilesRecursive(rootDir, '', { maxDepth: 1 });
+  const entries = await findCommandFiles(rootDir);
   const match = entries.find(e => e.commandName === commandName);
   return match ? join(rootDir, match.relativePath) : null;
 }
@@ -208,7 +209,8 @@ async function resolveCommandInDir(rootDir: string, commandName: string): Promis
  * Resolution precedence (first hit wins):
  *   1. Repo-local — `<cwd>/.archon/commands/` and configured folders
  *   2. Home-scoped — `~/.archon/commands/` (personal helpers, reusable across repos)
- *   3. Bundled defaults — embedded in the binary or the app's defaults folder
+ *
+ * Bundled commands are always packaged (`pack/workflow/name`) and resolve above.
  */
 async function resolveCommand(
   commandName: string,
@@ -222,19 +224,11 @@ async function resolveCommand(
       if (isBinaryBuild()) {
         return commandName in BUNDLED_COMMANDS ? `[bundled:${commandName}]` : null;
       }
+      if (!(await bundlesPackagedResources(packaged.owner.pack))) return null;
     }
-    let workflowsRoot: string;
-    if (packaged.owner.source === 'project') {
-      workflowsRoot = join(cwd, '.archon', 'workflows');
-    } else if (packaged.owner.source === 'global') {
-      workflowsRoot = getHomeWorkflowsPath();
-    } else {
-      workflowsRoot = dirname(getDefaultWorkflowsPath());
-    }
-    const path = join(
-      getPackagedResourceDirectory(workflowsRoot, packaged.owner, 'commands'),
-      `${packaged.name}.md`
-    );
+    const workflowDir = await packagedWorkflowDirectory(liveSourceRoots(cwd), packaged.owner);
+    if (workflowDir === null) return null;
+    const path = join(workflowDir, 'commands', `${packaged.name}.md`);
     try {
       return (await stat(path)).isFile() ? path : null;
     } catch (error) {
@@ -261,25 +255,12 @@ async function resolveCommand(
 
   // 2. Home-scoped commands (~/.archon/commands/).
   // ENOENT on the home dir already returns null; only wrap for other errors so a
-  // broken home-scope doesn't prevent bundled-default resolution.
+  // broken home-scope reads as unresolved rather than failing validation.
   try {
     const homeResolved = await resolveCommandInDir(getHomeCommandsPath(), commandName);
     if (homeResolved) return homeResolved;
   } catch (err) {
     getLog().warn({ err, commandName }, 'commands.home_resolve_failed');
-  }
-
-  // 3. Bundled defaults
-  const loadDefaults = config?.loadDefaultCommands !== false;
-  if (loadDefaults) {
-    if (isBinaryBuild()) {
-      if (commandName in BUNDLED_COMMANDS) {
-        return `[bundled:${commandName}]`;
-      }
-    } else {
-      const defaultsResolved = await resolveCommandInDir(getDefaultCommandsPath(), commandName);
-      if (defaultsResolved) return defaultsResolved;
-    }
   }
 
   return null;
@@ -353,22 +334,24 @@ function resolveValidationProvider(
 }
 
 /**
- * Bundled workflow definitions, parsed once and cached (#2470). Used only by the
+ * Bundled workflow definitions admitted by the supplied registry, parsed once per
+ * registry and cached (#2470). Used only by the
  * bundled-set-only `workflow:` target check below — a bundled workflow's sub-run target
  * must itself resolve within the bundled set (a bundled workflow can't depend on a
  * project/global workflow that may not exist on another install). Resolution reuses the
  * runtime fuzzy `resolveWorkflowName` so a legal suffix/substring ref isn't reported broken.
  * parseWorkflow never expands includes, so `workflow.name` is the authoritative id here.
  */
-let bundledWorkflowDefsCache: WorkflowDefinition[] | undefined;
-function getBundledWorkflowDefs(): WorkflowDefinition[] {
-  if (bundledWorkflowDefsCache) return bundledWorkflowDefsCache;
+const bundledWorkflowDefsCache = new WeakMap<ProviderRegistry, WorkflowDefinition[]>();
+function getBundledWorkflowDefs(providers: ProviderRegistry): WorkflowDefinition[] {
+  const cached = bundledWorkflowDefsCache.get(providers);
+  if (cached) return cached;
   const defs: WorkflowDefinition[] = [];
   for (const [filename, content] of Object.entries(BUNDLED_WORKFLOWS)) {
-    const { workflow } = parseWorkflow(content, filename);
+    const { workflow } = parseWorkflow(content, filename, providers);
     if (workflow) defs.push(workflow);
   }
-  bundledWorkflowDefsCache = defs;
+  bundledWorkflowDefsCache.set(providers, defs);
   return defs;
 }
 
@@ -379,16 +362,21 @@ function getBundledWorkflowDefs(): WorkflowDefinition[] {
  * Call this AFTER parseWorkflow() has passed (Levels 1-2 are prerequisites).
  */
 export async function validateWorkflowResources(
-  workflow: WorkflowDefinition,
+  workflow: Omit<WorkflowDefinition, 'nodes'> & {
+    readonly nodes: readonly (DagNode | IncludeDirective)[];
+  },
   cwd: string,
+  providers: ProviderRegistry,
   config?: ValidationConfig,
   defaultProvider?: string
 ): Promise<ValidationIssue[]> {
   const issues: ValidationIssue[] = [];
   const availableCommands = await discoverAvailableCommands(cwd, config);
   const requiresPortableModelRefs =
-    config?.workflowSource === 'bundled' || config?.workflowSource === 'global';
-  const modelProfileProvider = config?.assistant ?? defaultProvider ?? 'claude';
+    config?.workflowSource === 'bundled' ||
+    config?.workflowSource === 'global' ||
+    config?.workflowSource === 'installed';
+  const modelProfileProvider = config?.assistant ?? defaultProvider;
   let aiProfile: ResolvedAiProfile | undefined;
 
   try {
@@ -401,7 +389,7 @@ export async function validateWorkflowResources(
       level: 'error',
       field: 'model',
       message: (error as Error).message,
-      hint: 'Fix tiers/aliases in .archon/config.yaml, or use literal provider model strings.',
+      hint: 'Fix tiers/aliases in .archon/config.yaml, with `archon ai tier set`, or in the console AI Settings panel — or use literal provider model strings.',
     });
   }
 
@@ -415,7 +403,7 @@ export async function validateWorkflowResources(
         ...(nodeId !== undefined ? { nodeId } : {}),
         field: 'model',
         message: (error as Error).message,
-        hint: 'Fix tiers/aliases in .archon/config.yaml, or use a literal provider model string.',
+        hint: 'Fix tiers/aliases in .archon/config.yaml, with `archon ai tier set`, or in the console AI Settings panel — or use a literal provider model string.',
       });
     }
   };
@@ -442,36 +430,126 @@ export async function validateWorkflowResources(
     }
   }
 
-  // Flatten top-level nodes plus every loop_group body (recursing into nested
-  // loop_groups) so resource checks (commands, mcp, skills, scripts) validate
-  // body nodes too. ID-uniqueness/cycle checks are the loader's job; the validator
-  // only checks referenced resources exist, so flattening is safe here.
-  const allNodes: DagNode[] = [];
-  const collectNodes = (nodes: readonly DagNode[]): void => {
-    for (const n of nodes) {
-      allNodes.push(n);
-      if (isLoopGroupNode(n)) collectNodes(n.loop_group.nodes);
+  // Flatten top-level nodes plus every loop_group body while carrying the provider
+  // scope execution gives each group. Body nodes inherit the group's resolved
+  // provider/model unless they override it themselves.
+  const allNodes: {
+    node: DagNode | IncludeDirective;
+    provider: string | undefined;
+  }[] = [];
+  const collectNodes = (
+    nodes: readonly (DagNode | IncludeDirective)[],
+    inheritedProvider: string | undefined
+  ): void => {
+    for (const node of nodes) {
+      const provider = isIncludeDirective(node)
+        ? inheritedProvider
+        : resolveValidationProvider(node, inheritedProvider, defaultProvider, aiProfile);
+      allNodes.push({ node, provider });
+      if (!isIncludeDirective(node) && isLoopGroupNode(node)) {
+        collectNodes(node.loop_group.nodes, provider);
+      }
     }
   };
-  collectNodes(workflow.nodes);
+  collectNodes(workflow.nodes, effectiveWorkflowProvider);
 
-  for (const node of allNodes) {
-    // Include nodes carry no resources to check — the target workflow is resolved and
-    // inlined at DISCOVERY time (see include-expander.ts), so discovery-fed validation
-    // (CLI `validate workflows`) sees the already-expanded nodes and checks their
-    // commands/mcp/skills normally. This skip is DEFENSIVE-ONLY: no current caller reaches
-    // it with an unexpanded include node (POST /api/workflows/validate only runs
-    // parseWorkflow, not this resource pass). Kept so a future raw caller can't crash here.
-    if (isIncludeNode(node)) continue;
+  for (const { node, provider } of allNodes) {
+    // Include directives carry no resources to check — the target workflow is resolved
+    // and inlined at DISCOVERY time (see include-expander.ts), so discovery-fed
+    // validation (CLI `validate workflows`) sees the already-expanded nodes and checks
+    // their commands/mcp/skills normally. This skip is DEFENSIVE-ONLY: no current
+    // caller reaches it with an unexpanded include (POST /api/workflows/validate only
+    // runs parseWorkflow, not this resource pass). Kept so a future raw caller can't
+    // crash here.
+    if (isIncludeDirective(node)) continue;
 
-    const provider = resolveValidationProvider(
-      node,
-      effectiveWorkflowProvider,
-      defaultProvider,
-      aiProfile
-    );
-    const providerCaps =
-      provider && isRegisteredProvider(provider) ? getProviderCapabilities(provider) : undefined;
+    // --- Declared contract belongs to a producer, and compiles (#2453) ---
+    // parseWorkflow already rejects both an `output_format` on a `workflow:` node and
+    // an uncompilable one on an enforced node, so a file-fed caller never reaches these
+    // branches. They are kept for the callers that hand this pass a definition built in
+    // memory (tests, and any future synthesized or programmatically-assembled
+    // workflow), which would otherwise validate clean and then fail at the node
+    // boundary after the spend. Same predicate as the loader, so the two gates cannot
+    // disagree on an inert schema.
+    const ownershipError = workflowNodeOutputFormatError(node);
+    const outputSchema =
+      ownershipError === null && isOutputFormatEnforced(node) ? node.output_format : undefined;
+    const compileError = outputSchema === undefined ? null : compileOutputSchema(outputSchema);
+    if (ownershipError !== null) {
+      issues.push({
+        level: 'error',
+        nodeId: node.id,
+        field: 'output_format',
+        message: ownershipError,
+        hint: "Move the schema to the child workflow's returns: node — its declared fields travel back with the result.",
+      });
+    } else if (compileError !== null) {
+      issues.push({
+        level: 'error',
+        nodeId: node.id,
+        field: 'output_format',
+        message: `Node '${node.id}' declares an output_format that cannot be compiled: ${compileError}`,
+        hint: 'Fix the JSON Schema — a declared contract is enforced against the node output, so it cannot be skipped.',
+      });
+    }
+
+    const providerDescriptor = provider ? providers.get(provider) : undefined;
+    const providerCaps = providerDescriptor?.capabilities;
+
+    // --- Strict-schema compatibility (#2945, #3557) ---
+    // A schema with a bare object or incomplete 'required' coverage is rejected
+    // by a provider that enforces OpenAI strict mode (Codex) at the first turn
+    // with HTTP 400 invalid_json_schema. Report it at validation time so `archon
+    // validate workflows` catches it before a live run burns setup costs. The
+    // set of provider-invoking kinds is the same one the launch preflight uses:
+    // every node kind that both enforces output_format
+    // (isOutputFormatEnforced) AND sends the schema to a provider (agent and
+    // loop; not exec/bash/script, and not a wait's engine-injected schema).
+    const strictSchemaIssues =
+      !isExecNode(node) &&
+      !isWaitNode(node) &&
+      outputSchema !== undefined &&
+      providerCaps?.requiresAllPropertiesRequired
+        ? findStrictSchemaIssues(outputSchema, 'output_format')
+        : [];
+    for (const issue of strictSchemaIssues) {
+      if (issue.kind === 'missing-properties') {
+        issues.push({
+          level: 'error',
+          nodeId: node.id,
+          field: 'output_format',
+          message: `Node '${node.id}' declares an object schema without 'properties' at '${issue.schemaPath}'. Provider '${provider}' enforces OpenAI strict mode and will reject this schema (HTTP 400 invalid_json_schema).`,
+          hint: 'Declare the object properties and list every property in required. When the value may be absent, use a nullable object such as type: ["object","null"].',
+        });
+      } else {
+        issues.push({
+          level: 'error',
+          nodeId: node.id,
+          field: 'output_format',
+          message: `Node '${node.id}' declares properties not in 'required' at '${issue.schemaPath}': ${issue.missing.join(', ')}. Provider '${provider}' enforces OpenAI strict mode and will reject this schema (HTTP 400 invalid_json_schema).`,
+          hint: 'List every property key in the required array. Express optionality inside the type (e.g. a ["string","null"] union or an enum sentinel like "none").',
+        });
+      }
+    }
+
+    if (
+      !isWaitNode(node) &&
+      compileError === null &&
+      strictSchemaIssues.length === 0 &&
+      outputSchema !== undefined &&
+      isObjectSchemaNode(outputSchema) &&
+      outputSchema.properties !== undefined &&
+      !(Array.isArray(outputSchema.required) && outputSchema.required.length > 0) &&
+      outputSchema.additionalProperties !== false
+    ) {
+      issues.push({
+        level: 'warning',
+        nodeId: node.id,
+        field: 'output_format',
+        message: `Node '${node.id}' declares output_format properties without a non-empty required array or additionalProperties: false. Missing fields or a schema-echo response can validate successfully.`,
+        hint: 'List fields that downstream nodes need in required, or set additionalProperties: false to reject undeclared fields. Keep the schema loose only when every field is intentionally optional.',
+      });
+    }
 
     if (requiresPortableModelRefs && 'model' in node && node.model?.startsWith('@')) {
       issues.push({
@@ -495,7 +573,7 @@ export async function validateWorkflowResources(
       let resolvedTarget: WorkflowDefinition | undefined;
       let ambiguityMessage: string | undefined;
       try {
-        resolvedTarget = resolveWorkflowName(node.workflow, getBundledWorkflowDefs());
+        resolvedTarget = resolveWorkflowName(node.workflow, getBundledWorkflowDefs(providers));
       } catch (err) {
         ambiguityMessage = (err as Error).message;
       }
@@ -519,30 +597,31 @@ export async function validateWorkflowResources(
     }
 
     // --- Command nodes: check file exists ---
-    if ('command' in node && typeof node.command === 'string') {
-      if (!isValidCommandName(node.command)) {
+    if (isAgentNode(node) && node.source.kind === 'command') {
+      const commandName = node.source.name;
+      if (!isValidCommandName(commandName)) {
         issues.push({
           level: 'error',
           nodeId: node.id,
           field: 'command',
-          message: `Invalid command name '${node.command}' — must not contain '/', '\\', '..', or start with '.'`,
+          message: `Invalid command name '${commandName}' — must not contain '/', '\\', '..', or start with '.'`,
           hint: 'Use a simple name like "my-command" (without path separators or the .md extension)',
         });
         continue;
       }
 
-      const resolved = await resolveCommand(node.command, cwd, config);
+      const resolved = await resolveCommand(commandName, cwd, config);
       if (!resolved) {
-        const similar = findSimilar(node.command, availableCommands);
+        const similar = findSimilar(commandName, availableCommands);
         const issue: ValidationIssue = {
           level: 'error',
           nodeId: node.id,
           field: 'command',
-          message: `Command '${node.command}' not found`,
-          hint: `Create .archon/commands/${node.command}.md or use an existing command name`,
+          message: `Command '${commandName}' not found`,
+          hint: `Create .archon/commands/${commandName}.md or use an existing command name`,
         };
         if (similar.length > 0) {
-          issue.hint = `Did you mean: ${similar.map(s => `'${s}'`).join(', ')}? Or create .archon/commands/${node.command}.md`;
+          issue.hint = `Did you mean: ${similar.map(s => `'${s}'`).join(', ')}? Or create .archon/commands/${commandName}.md`;
           issue.suggestions = similar;
         }
         issues.push(issue);
@@ -581,29 +660,40 @@ export async function validateWorkflowResources(
     }
 
     // --- MCP nodes: check config file exists and is valid JSON ---
-    if ('mcp' in node && typeof node.mcp === 'string') {
-      const mcpPath = isAbsolute(node.mcp) ? node.mcp : resolve(cwd, node.mcp);
+    // An optional declaration is expected to be absent for most users of a portable
+    // workflow, so only a file that exists and is broken is an issue; the run records
+    // the absence instead.
+    const mcp = 'mcp' in node ? mcpDeclaration(node.mcp) : undefined;
+    if (mcp !== undefined) {
+      const selected = await resolveMcpPath(mcp.path, cwd, readHomeMcpDirectory(node));
 
-      if (!(await fileExists(mcpPath))) {
+      if (selected.kind === 'missing') {
+        if (!mcp.optional) {
+          issues.push({
+            level: 'error',
+            nodeId: node.id,
+            field: 'mcp',
+            message: missingMcpConfigMessage(mcp.path, selected.attemptedPaths),
+            hint: `Create the file at ${selected.attemptedPaths[0]} with MCP server definitions (JSON format). Example:\n  {"server-name": {"command": "npx", "args": ["-y", "@package/name"], "env": {}}}`,
+          });
+        }
+      } else if (selected.kind === 'read_error') {
         issues.push({
           level: 'error',
           nodeId: node.id,
           field: 'mcp',
-          message: `MCP config file not found: '${node.mcp}'`,
-          hint: `Create the file at ${mcpPath} with MCP server definitions (JSON format). Example:\n  {"server-name": {"command": "npx", "args": ["-y", "@package/name"], "env": {}}}`,
+          message: `Failed to read MCP config file '${selected.path}': ${String(selected.error)}`,
         });
       } else {
-        // File exists — check it's valid JSON
         try {
-          const content = await readFile(mcpPath, 'utf-8');
-          const parsed = JSON.parse(content);
-          if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+          const serverMap = mcpServerMap(JSON.parse(selected.content));
+          if (!serverMap.ok) {
             issues.push({
               level: 'error',
               nodeId: node.id,
               field: 'mcp',
-              message: `MCP config file '${node.mcp}' must be a JSON object (Record<string, ServerConfig>)`,
-              hint: 'The file should contain a JSON object where each key is a server name',
+              message: `${serverMap.error}: '${mcp.path}'`,
+              hint: 'The file should contain a JSON object where each key is a server name, optionally wrapped as { "mcpServers": { ... } }',
             });
           }
         } catch (e) {
@@ -612,20 +702,19 @@ export async function validateWorkflowResources(
             level: 'error',
             nodeId: node.id,
             field: 'mcp',
-            message: `MCP config file '${node.mcp}' contains invalid JSON: ${err.message}`,
+            message: `MCP config file '${mcp.path}' contains invalid JSON: ${err.message}`,
             hint: 'Fix the JSON syntax in the MCP config file',
           });
         }
       }
 
-      // Warn if using MCP with a provider that doesn't support it
-      if (providerCaps?.mcp === false) {
+      if (providerCaps?.mcp === false && !mcp.optional) {
         issues.push({
-          level: 'warning',
+          level: 'error',
           nodeId: node.id,
           field: 'mcp',
-          message: `MCP servers are not supported by provider '${provider}' — this will be ignored`,
-          hint: 'Remove the mcp field or switch to a provider that supports MCP',
+          message: `Provider '${provider}' cannot load MCP servers — the run would fail before any node starts`,
+          hint: `Remove the mcp field, declare it optional (mcp: { path: '${mcp.path}', optional: true }), or switch to a provider whose mcp capability is true`,
         });
       }
     }
@@ -637,91 +726,108 @@ export async function validateWorkflowResources(
       // match Archon's shared four-root resolver, so accepting a `.claude`
       // match here would falsely imply that Codex can invoke it.
       if (providerCaps?.skills !== false) {
-        const settingSources =
-          'settingSources' in node && node.settingSources !== undefined
-            ? node.settingSources
-            : (config?.claudeSettingSources ?? ['project', 'user']);
-        const searchRoots =
-          provider === 'claude'
-            ? claudeSkillSearchRoots(cwd, {
-                ...(config?.claudeConfigDir ? { userConfigDir: config.claudeConfigDir } : {}),
-                includeProject: settingSources.includes('project'),
-                includeUser: settingSources.includes('user'),
-              })
-            : skillSearchRoots(cwd);
+        const discovery = providerDescriptor?.skillDiscovery;
+        const env = config?.env;
+        const nodeSources = 'settingSources' in node ? node.settingSources : undefined;
+        const sources =
+          provider !== undefined && providerCaps?.settingSources
+            ? (nodeSources ??
+              parseSettingSources(config?.assistants?.[provider]?.settingSources) ??
+              DEFAULT_SETTING_SOURCES)
+            : undefined;
+        const searchRoots = discovery
+          ? declaredSkillRoots(discovery, cwd, {
+              includeProject: sources?.includes('project') ?? true,
+              includeUser: sources?.includes('user') ?? true,
+              env,
+            })
+          : skillSearchRoots(cwd);
+        const projectRoots = discovery
+          ? declaredSkillRoots(discovery, cwd, { includeUser: false, env })
+          : projectSkillSearchRoots(cwd);
         for (const skillName of node.skills) {
           let found = false;
           for (const root of searchRoots) {
             const skillPath = join(root, skillName, 'SKILL.md');
             if (await fileExists(skillPath)) {
               found = true;
+              if (!projectRoots.includes(root)) {
+                issues.push({
+                  level: 'warning',
+                  nodeId: node.id,
+                  field: 'skills',
+                  message: `Skill '${skillName}' is available only in a host user directory`,
+                  hint: 'Execution scope is not known during validation. Container runs may not load host user skills; provider preflight checks availability for the run.',
+                });
+              }
               break;
             }
           }
 
           if (!found) {
-            // Mirror the provider's rule (claude/provider.ts): a Claude skill
-            // that exists under some other root is installed but unreachable, so
-            // it is an error. A name that exists nowhere on disk may be one of
-            // Claude's built-in or `plugin:skill` entries, which no filesystem
-            // root contains — warn there rather than failing a workflow that runs.
-            // Same helper the provider preflight uses, over the same roots, so
-            // validation and execution always agree on which case this is.
+            // Mirror the declaring provider's rule (e.g. claude/provider.ts): a
+            // skill that exists under some other root is installed but
+            // unreachable, so it is an error. A name that exists nowhere on disk
+            // may be a built-in or `plugin:skill` entry the provider resolves
+            // itself — warn there rather than failing a workflow that runs. Same
+            // helper checks host paths; execution preflight owns run availability.
             const installedButUnusable =
-              provider === 'claude' &&
+              discovery !== undefined &&
               findInstalledSkillNames(
                 [
                   ...searchRoots,
                   ...skillSearchRoots(cwd),
-                  ...claudeSkillSearchRoots(cwd, {
-                    ...(config?.claudeConfigDir ? { userConfigDir: config.claudeConfigDir } : {}),
-                    includeProject: true,
-                    includeUser: true,
-                  }),
+                  ...declaredSkillRoots(discovery, cwd, { env }),
                 ],
                 [skillName]
               ).length > 0;
 
             if (installedButUnusable) {
+              const displayName = providerDescriptor?.displayName ?? provider;
+              const everyDeclaredRoot = declaredSkillRoots(discovery, cwd, { env });
               issues.push({
                 level: 'error',
                 nodeId: node.id,
                 field: 'skills',
-                message: `Claude skill '${skillName}' not found in an enabled .claude/skills/ directory, though it is installed elsewhere`,
-                hint: `Claude reads .claude/skills/ only (never .agents/skills/), and only from scopes settingSources enables. Ensure .claude/skills/${skillName}/SKILL.md exists in an enabled scope`,
+                message: `${displayName} skill '${skillName}' not found in an enabled skill directory, though it is installed elsewhere`,
+                hint: `${displayName} loads skills only from ${everyDeclaredRoot.join(', ')}${providerCaps?.settingSources ? ', in the scopes settingSources enables' : ''}. A skill is a directory containing SKILL.md`,
               });
             } else {
               issues.push({
                 level: 'warning',
                 nodeId: node.id,
                 field: 'skills',
-                message:
-                  provider === 'claude'
-                    ? `Claude skill '${skillName}' not found on disk — expected for built-in and plugin-qualified skills, which Claude resolves itself`
-                    : `Skill '${skillName}' not found in .agents/skills/ or .claude/skills/ (project or user scope)`,
-                hint:
-                  provider === 'claude'
-                    ? `If this is not a built-in or plugin:skill name, check the spelling or create .claude/skills/${skillName}/SKILL.md`
-                    : `Install with: npx skills add <repo> — or create manually at .agents/skills/${skillName}/SKILL.md`,
+                message: `Skill '${skillName}' not found in ${searchRoots.join(', ') || 'any enabled skill directory'}`,
+                hint: `Create ${join(searchRoots[0] ?? '<skill directory>', skillName, 'SKILL.md')} or check the spelling. Names the provider resolves itself, such as built-in or plugin skills, have no directory; a plugin:skill name also needs its plugin under plugins:`,
               });
             }
           }
         }
       }
 
-      // Warn if using skills with a provider that doesn't support them
       if (providerCaps?.skills === false && node.skills.length > 0) {
         issues.push({
-          level: 'warning',
+          level: 'error',
           nodeId: node.id,
           field: 'skills',
-          message: `The skills field is not supported by provider '${provider}' — this will be ignored`,
+          message: `Provider '${provider}' cannot load named skills — the run would fail before any node starts`,
           hint:
             provider === 'codex'
-              ? 'Invoke an installed Codex skill explicitly in the command or prompt with $skill-name'
-              : 'Remove the skills field or switch to a provider that supports skills',
+              ? 'Remove the skills field and invoke an installed Codex skill explicitly in the command or prompt with $skill-name'
+              : 'Remove the skills field or switch to a provider whose skills capability is true',
         });
       }
+    }
+
+    // --- Plugins: an error like mcp and skills — the engine refuses to run it ---
+    if ('plugins' in node && node.plugins?.length && providerCaps?.plugins === false) {
+      issues.push({
+        level: 'error',
+        nodeId: node.id,
+        field: 'plugins',
+        message: `Provider '${provider}' cannot load named plugins — the run would fail before any node starts`,
+        hint: 'Remove the plugins field or switch to a provider whose plugins capability is true',
+      });
     }
 
     // --- Capability-driven warnings for hooks and tool restrictions ---
@@ -815,7 +921,7 @@ export async function validateWorkflowResources(
     }
 
     // --- Script nodes: check named script file exists + runtime available ---
-    if (isScriptNode(node)) {
+    if (isExecNode(node) && node.runtime !== 'sh') {
       const script = node.script;
 
       // Named script: validate file exists in repo or home scope.
@@ -863,43 +969,130 @@ export async function validateWorkflowResources(
       }
     }
 
-    // In bash node bodies (and loop `until_bash`, which substitutes the same way),
-    // $node.output values are injected PRE-QUOTED by Archon: small values are
-    // single-quoted inline ('the value'), large outputs (>32 KB) spill to a temp
-    // file as $(cat '/path'). Wrapping the substitution in double quotes breaks the
-    // SMALL case — var="$n.output" becomes var="'value'", embedding the literal
-    // single-quote chars as data. (For the large $(cat ...) case double-quoting is
-    // actually fine, but the author can't predict the size at write time, so the
-    // rule is unconditional: never double-quote.) Numeric/boolean FIELD values are
-    // injected raw, so double-quoting is harmless for those — which is why the bug
-    // is intermittent and easy to miss.
-    //   wrong="$n.output.field" → wrong="'ok'" (single quotes become part of the value)
-    //   right=$n.output.field   → right='ok' → bash assigns: ok
-    //
-    // The `(?:^|[=\s])"` prefix requires the opening `"` to be an operand (line
-    // start, after `=`, or after whitespace) so a *closing* quote of an unrelated
-    // earlier string doesn't cause a false positive (e.g. `echo "hi"; x=$a.output`).
-    // `[^"\n]` excludes newlines — a double-quote spanning lines is pathological.
-    const doubleQuotedOutputRef = /(?:^|[=\s])"[^"\n]*\$[a-zA-Z_][a-zA-Z0-9_-]*\.output/m;
-    const warnDoubleQuoted = (body: string, field: string): void => {
-      if (doubleQuotedOutputRef.test(body)) {
+    visitNodeTemplateSlots(
+      node,
+      slot => {
+        if (slot.surface !== 'shell') return;
+        const { quoted, bare } = shellOutputRefWarnings(slot.value);
+        if (bare) {
+          issues.push({
+            level: 'warning',
+            code: 'shell_output_ref',
+            nodeId: node.id,
+            field: slot.path,
+            message:
+              'A bare $nodeId.output / $LOOP_PREV.nodeId.output substitution can word-split and expand globs when a large output spills to a file',
+            hint: 'Assign, then quote the variable: `var=$node.output.field; printf "%s" "$var"` (or `var=$LOOP_PREV.node.output.field`). The reference must be the whole assignment value.',
+          });
+        }
+        if (!quoted) return;
         issues.push({
           level: 'warning',
+          code: 'shell_output_ref',
           nodeId: node.id,
-          field,
+          field: slot.path,
           message:
-            '`"$nodeId.output"` — double-quoting a substitution that is already shell-quoted by Archon produces the wrong value',
-          hint: 'Use `var=$node.output.field` (unquoted) — the substitution is injected already quoted. (Numeric/boolean fields are injected raw, so double-quoting is harmless for those, but the rule is uniform.)',
+            '`"$nodeId.output"` / `\'$nodeId.output\'` / `"$LOOP_PREV.nodeId.output"` / `\'$LOOP_PREV.nodeId.output\'` — wrapping a substitution that is already shell-quoted by Archon produces the wrong value',
+          hint: 'Assign, then quote the variable: `var=$node.output.field; printf "%s" "$var"` or `var=$LOOP_PREV.node.output.field; printf "%s" "$var"`. Numeric/boolean fields are injected raw, but the rule is uniform.',
         });
-      }
-    };
-    if (isBashNode(node)) warnDoubleQuoted(node.bash, 'bash');
-    if (isLoopNode(node) && node.loop.until_bash) {
-      warnDoubleQuoted(node.loop.until_bash, 'loop.until_bash');
-    }
+      },
+      // Body nodes of a loop_group are already in `allNodes`; recursing would double-report.
+      { recursive: false }
+    );
   }
 
   return issues;
+}
+
+// Shell slots share the executor's size-dependent substitution contract. This is a
+// line-local lint, not a shell parser: preserve operand-boundary quote tracking and
+// leave heredoc contents alone, including refs inside a quoted $(cat <<EOF) wrapper.
+// `#` starts a comment only at a word start, and `<<` inside `((...))` is a shift.
+function shellOutputRefWarnings(body: string): { quoted: boolean; bare: boolean } {
+  let quoted = false;
+  let bare = false;
+  const heredocs: { delimiter: string; stripTabs: boolean }[] = [];
+  const refFinder = new RegExp(`${PRIOR_OUTPUT_PATH_SOURCE}|${CURRENT_OUTPUT_PATH_SOURCE}`, 'g');
+  for (const line of body.split('\n')) {
+    const heredoc = heredocs[0];
+    if (heredoc !== undefined) {
+      if ((heredoc.stripTabs ? line.replace(/^\t+/, '') : line) === heredoc.delimiter)
+        heredocs.shift();
+      continue;
+    }
+    const refs = new Map(Array.from(line.matchAll(refFinder), match => [match.index, match[0]]));
+    let quote: string | undefined;
+    let openedAtBoundary = false;
+    let wordStart = 0;
+    const words: string[] = [];
+    let escaped = false;
+    let commandSubstitutions = 0;
+    let arithmetic = 0;
+    for (let index = 0; index < line.length; index += 1) {
+      const character = line[index];
+      const previous = line[index - 1];
+      const operandBoundary = previous === undefined || previous === '=' || /\s/.test(previous);
+      const wordBoundary = previous === undefined || /[\s;&|(]/.test(previous);
+      if (!escaped && quote === undefined && character === '#' && wordBoundary) break;
+      if (!escaped && (quote === undefined || !openedAtBoundary)) {
+        if (/[;&|()]/.test(character)) {
+          words.length = 0;
+          wordStart = index + 1;
+        } else if (/\s/.test(character)) {
+          if (wordStart < index) words.push(line.slice(wordStart, index));
+          wordStart = index + 1;
+        }
+      }
+      if (!escaped && quote !== "'") {
+        if (character === '$' && line[index + 1] === '(') commandSubstitutions += 1;
+        else if (character === ')' && commandSubstitutions > 0) commandSubstitutions -= 1;
+        if (character === '(' && line[index + 1] === '(' && previous !== '(') arithmetic += 1;
+        else if (character === ')' && line[index + 1] === ')' && previous !== ')' && arithmetic > 0)
+          arithmetic -= 1;
+      }
+      if (
+        !escaped &&
+        character === '<' &&
+        line[index + 1] === '<' &&
+        line[index - 1] !== '<' &&
+        arithmetic === 0 &&
+        (quote === undefined || (quote === '"' && commandSubstitutions > 0))
+      ) {
+        const opener = /^<<(-?)[ \t]*(?:'([^']+)'|"([^"\n]+)"|\\?([a-zA-Z_][a-zA-Z0-9_]*))/.exec(
+          line.slice(index)
+        );
+        if (opener !== null) {
+          heredocs.push({
+            delimiter: opener[2] ?? opener[3] ?? opener[4],
+            stripTabs: opener[1] === '-',
+          });
+        }
+      }
+      const ref = refs.get(index);
+      if (ref !== undefined) {
+        if (quote !== undefined && openedAtBoundary) quoted = true;
+        else {
+          const precedingAssignments =
+            words[0] === 'export' || words[0] === 'local' ? words.slice(1) : words;
+          const assignment =
+            /^[a-zA-Z_][a-zA-Z0-9_]*=$/.test(line.slice(wordStart, index)) &&
+            precedingAssignments.every(word => /^[a-zA-Z_][a-zA-Z0-9_]*=/.test(word));
+          const next = line[index + ref.length];
+          if (!assignment || (next !== undefined && !/[\s;&|)<>]/.test(next))) bare = true;
+        }
+      }
+      if (!escaped && quote === undefined) {
+        if (character === '"' || character === "'") {
+          quote = character;
+          openedAtBoundary = operandBoundary;
+        }
+      } else if (!escaped && character === quote) {
+        quote = undefined;
+      }
+      escaped = !escaped && character === '\\' && quote !== "'";
+    }
+  }
+  return { quoted, bare };
 }
 
 // =============================================================================

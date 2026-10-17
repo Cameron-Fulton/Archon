@@ -5,8 +5,8 @@
  */
 import type { Issue } from '../types';
 import { makeIssue } from '../validation/make-issue';
-import { HttpError } from '../../lib/http';
-import type { WorkflowSource, WorkflowSaveSource } from '../../skills/workflows';
+import { HttpError, serverErrorMessage } from '../../lib/http';
+import type { WorkflowSaveSource } from '../../skills/workflows';
 
 /** A client-side instant error for the panel (name validation, save gate). */
 export function clientIssue(rule: string, message: string): Issue {
@@ -21,23 +21,9 @@ function serverIssue(rule: string, message: string): Issue {
 /**
  * Map a failed `PUT`/`DELETE` (`HttpError`) into a single `source:'server'`
  * issue for the panel.
- *
- * `HttpError.bodySnippet` is apiError's JSON `{ error, detail? }`, but it is the
- * server body capped at 200 chars of content (a `...` suffix is appended when
- * cut off, so up to ~203 chars) — `JSON.parse` may therefore throw on a
- * truncated body. Guard it and fall back to the raw snippet.
  */
 export function serverErrorToIssues(err: HttpError): Issue[] {
-  let message = err.bodySnippet || `Request failed (${String(err.status)})`;
-  try {
-    const parsed = JSON.parse(err.bodySnippet) as { error?: string; detail?: string };
-    if (parsed.error) {
-      message = parsed.detail ? `${parsed.error}: ${parsed.detail}` : parsed.error;
-    }
-  } catch {
-    /* truncated/non-JSON body — keep the raw snippet */
-  }
-  return [serverIssue('server.validation', message)];
+  return [serverIssue('server.validation', serverErrorMessage(err))];
 }
 
 /**
@@ -64,13 +50,6 @@ export function validationFailureToIssues(errors: readonly string[] | undefined)
   ];
 }
 
-/** Best-effort human detail from a thrown error (the server message for an HttpError). */
-export function errorDetail(e: unknown): string {
-  if (e instanceof HttpError) return serverErrorToIssues(e)[0]?.message ?? e.bodySnippet;
-  if (e instanceof Error) return e.message;
-  return String(e);
-}
-
 /** Map a thrown error to panel issues: HttpError → server detail, else a fallback. */
 export function errorToIssues(e: unknown, rule: string, fallback: string): Issue[] {
   if (e instanceof HttpError) return serverErrorToIssues(e);
@@ -82,17 +61,27 @@ export function blockingErrors(issues: readonly Issue[]): Issue[] {
   return issues.filter(i => i.severity === 'error');
 }
 
-/** Bundled workflows open read-only; everything else is editable in place. */
-export function isReadOnlySource(source: WorkflowSource): boolean {
-  return source === 'bundled';
+/**
+ * Bundled and installed-pack workflows open read-only (an installed pack is changed with
+ * `archon plugin update`, or copied with `archon plugin copy`); everything else is
+ * editable in place. The
+ * parameter is widened to `string` so an unrecognised `Workflow.source` (#2578,
+ * `WorkflowSource | (string & {})`) can pass through without a cast at the
+ * call site — the comparison is the same either way.
+ */
+export function isReadOnlySource(source: string): boolean {
+  return source === 'bundled' || source === 'installed';
 }
 
 /**
  * The write scope for a save. A `global` workflow saves back to global; a
  * `project` workflow stays project; a `bundled` (read-only) workflow saves as a
- * project override (Save-as).
+ * project override (Save-as). The parameter is widened to `string` for the
+ * same reason `isReadOnlySource` is (#2578): an unrecognised source is not
+ * `global`, so it falls to `'project'`, which is the "most permissive"
+ * interpretation the issue explicitly defends.
  */
-export function saveTargetFor(source: WorkflowSource): WorkflowSaveSource {
+export function saveTargetFor(source: string): WorkflowSaveSource {
   return source === 'global' ? 'global' : 'project';
 }
 

@@ -2,8 +2,12 @@ import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
 import { mkdir, mkdtemp, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
+import type { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
+import { makeTestWorkflowWithSource } from '@archon/workflows/test-utils';
 
-const mockDiscoverWorkflowsWithConfig = mock(() => Promise.resolve({ workflows: [], errors: [] }));
+const mockDiscoverWorkflowsWithConfig = mock<typeof discoverWorkflowsWithConfig>(() =>
+  Promise.resolve({ workflows: [], errors: [] })
+);
 
 mock.module('@archon/workflows/workflow-discovery', () => ({
   discoverWorkflowsWithConfig: mockDiscoverWorkflowsWithConfig,
@@ -25,7 +29,11 @@ mock.module('@archon/core', () => ({
   loadRepoConfig: mockLoadRepoConfig,
 }));
 
+import { registerBuiltinProviders } from '@archon/providers/in-process';
 import { validateWorkflowsCommand } from './validate';
+
+// The CLI entrypoint registers providers before any command runs.
+registerBuiltinProviders();
 
 describe('validateWorkflowsCommand', () => {
   const originalLog = console.log;
@@ -67,14 +75,14 @@ describe('validateWorkflowsCommand', () => {
     });
     mockDiscoverWorkflowsWithConfig.mockResolvedValue({
       workflows: [
-        {
-          source: 'project',
-          workflow: {
+        makeTestWorkflowWithSource(
+          {
             name: 'custom-skill-workflow',
             provider: 'claude',
             nodes: [{ id: 'step1', prompt: 'hello', skills: ['custom-skill'] }],
           },
-        },
+          'project'
+        ),
       ],
       errors: [],
     });
@@ -99,14 +107,14 @@ describe('validateWorkflowsCommand', () => {
     });
     mockDiscoverWorkflowsWithConfig.mockResolvedValue({
       workflows: [
-        {
-          source: 'project',
-          workflow: {
+        makeTestWorkflowWithSource(
+          {
             name: 'excluded-user-skill',
             provider: 'claude',
             nodes: [{ id: 'step1', prompt: 'hello', skills: ['user-only'] }],
           },
-        },
+          'project'
+        ),
       ],
       errors: [],
     });
@@ -115,21 +123,80 @@ describe('validateWorkflowsCommand', () => {
 
     expect(exitCode).toBe(1);
     expect(JSON.stringify(mockConsoleLog.mock.calls)).toContain(
-      "Claude skill 'user-only' not found"
+      "skill 'user-only' not found in an enabled skill directory"
     );
+  });
+
+  test('loose output schema warns and exits successfully', async () => {
+    mockDiscoverWorkflowsWithConfig.mockResolvedValueOnce({
+      workflows: [
+        makeTestWorkflowWithSource(
+          {
+            name: 'loose-output',
+            provider: 'claude',
+            nodes: [
+              {
+                id: 'classify',
+                prompt: 'decide',
+                output_format: {
+                  type: 'object',
+                  properties: { verdict: { type: 'string', enum: ['review', 'skip'] } },
+                },
+              },
+            ],
+          },
+          'project'
+        ),
+      ],
+      errors: [],
+    });
+
+    expect(await validateWorkflowsCommand(validationCwd)).toBe(0);
+    const output = JSON.stringify(mockConsoleLog.mock.calls);
+    expect(output).toContain("Node 'classify'");
+    expect(output).toContain('required');
+    expect(output).toContain('additionalProperties: false');
+    expect(output).toContain('1 valid, 0 with errors');
+  });
+
+  test('renders conditional-join load warnings and exits successfully', async () => {
+    const warning =
+      "Node 'join': its only dependency 'gate' has a 'when', and 'none_failed_min_one_success' needs a successful dependency. Use 'all_done'.";
+    mockDiscoverWorkflowsWithConfig.mockResolvedValueOnce({
+      workflows: [
+        {
+          ...makeTestWorkflowWithSource(
+            {
+              name: 'conditional-join',
+              nodes: [{ id: 'join', bash: 'echo joined' }],
+            },
+            'project'
+          ),
+          parseWarnings: [warning],
+        },
+      ],
+      errors: [],
+    });
+
+    expect(await validateWorkflowsCommand(validationCwd)).toBe(0);
+    const output = JSON.stringify(mockConsoleLog.mock.calls);
+    expect(output).toContain(warning);
+    expect(output).toContain('WARNINGS');
+    expect(output).toContain('WARNING');
+    expect(output).toContain('1 valid, 0 with errors, 1 with warnings');
   });
 
   test('rejects bundled @custom model refs via discovered source', async () => {
     mockDiscoverWorkflowsWithConfig.mockResolvedValueOnce({
       workflows: [
-        {
-          source: 'bundled',
-          workflow: {
+        makeTestWorkflowWithSource(
+          {
             name: 'bad-bundled',
             model: '@custom',
             nodes: [{ id: 'step1', prompt: 'hello' }],
           },
-        },
+          'bundled'
+        ),
       ],
       errors: [],
     });

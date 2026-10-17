@@ -9,12 +9,15 @@ import {
   afterEach,
   spyOn,
 } from 'bun:test';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'fs';
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
+import { buildWebTarball, FIXTURE_INDEX_HTML } from '../test-support/web-tarball';
 
 // Mock @archon/paths BEFORE importing the module under test.
-// This sets BUNDLED_IS_BINARY = false (dev mode) so serveCommand rejects.
+// BUNDLED_IS_BINARY = false puts serveCommand on its source-checkout path, and
+// getSourceWebDistDir is redirected at a temp tree so a test can decide whether
+// `bun run build:web` has been run without depending on this checkout's state.
 const mockLogger = {
   fatal: mock(() => undefined),
   error: mock(() => undefined),
@@ -23,15 +26,30 @@ const mockLogger = {
   debug: mock(() => undefined),
   trace: mock(() => undefined),
 };
+let sourceWebDistDir = '/tmp/test-archon/unset-source-web-dist';
+const paths = { ...(await import('@archon/paths')) };
 mock.module('@archon/paths', () => ({
+  ...paths,
   createLogger: mock(() => mockLogger),
   getWebDistDir: mock((version: string) => `/tmp/test-archon/web-dist/${version}`),
+  getServerDistDir: mock((version: string) => `/tmp/test-archon/server/${version}`),
+  getSourceServerEntry: () => '/checkout/packages/server/src/bin.ts',
+  getLogLevel: () => 'debug',
+  getSourceWebDistDir: mock(() => sourceWebDistDir),
   BUNDLED_IS_BINARY: false,
   BUNDLED_VERSION: 'dev',
   BUNDLED_WEB_DIST_SHA256: '',
+  BUNDLED_SERVER_SHA256: '',
 }));
 
-import { serveCommand, parseChecksum, parseEmbeddedChecksum, downloadWebDist } from './serve';
+import { trackTempRoots, removeTempTree } from '@archon/paths/test-utils';
+import {
+  serveCommand,
+  parseChecksum,
+  parseEmbeddedChecksum,
+  downloadWebDist,
+  resolveTarBin,
+} from './serve';
 
 describe('parseChecksum', () => {
   const validHash = 'a'.repeat(64);
@@ -98,84 +116,47 @@ describe('parseEmbeddedChecksum', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// In-process tar.gz fixture builder.
-//
-// downloadWebDist shells out to `tar xzf -`, so the fixture it is fed has to be
-// a genuine gzipped tar — but BUILDING that fixture does not need a subprocess.
-// Spawning `tar czf -` here used to make the beforeAll hook the one thing in
-// this file that could hang on a child process, which is exactly how it failed
-// on windows CI (#2306). Emitting the ~1.1 KB ustar archive directly is
-// deterministic, platform-independent, and needs no `tar` on PATH.
-// ---------------------------------------------------------------------------
+describe('resolveTarBin', () => {
+  // Windows ships bsdtar at System32\tar.exe, but Git for Windows puts GNU tar
+  // on PATH ahead of it, and GNU tar cannot open a drive-letter operand: it
+  // mangles the `-C C:\Users\...` operand into a colon-escaped path and exits 2.
+  // Leaving the binary to PATH makes extraction depend on which shell launched
+  // Archon, so these cases pin the choice on every host — CI runs them off Windows.
+  const SYSTEM32_TAR = /[/\\]System32[/\\]tar\.exe$/;
 
-/** Write ASCII into a fixed-width header field (NUL padding comes from the zeroed buffer). */
-function writeField(header: Uint8Array, offset: number, value: string, width: number): void {
-  header.set(new TextEncoder().encode(value).subarray(0, width), offset);
-}
+  it('pins the Windows system tar when it is present', () => {
+    const probed: string[] = [];
 
-/** Write a ustar numeric field: zero-padded octal followed by a trailing NUL. */
-function writeOctalField(header: Uint8Array, offset: number, value: number, width: number): void {
-  writeField(header, offset, value.toString(8).padStart(width - 1, '0'), width - 1);
-}
+    const bin = resolveTarBin('win32', path => {
+      probed.push(path);
+      return true;
+    });
 
-/** One 512-byte ustar header block. `typeflag` is '0' (file) or '5' (directory). */
-function tarHeader(name: string, size: number, typeflag: '0' | '5', mode: number): Uint8Array {
-  const header = new Uint8Array(512);
-  writeField(header, 0, name, 100);
-  writeOctalField(header, 100, mode, 8);
-  writeOctalField(header, 108, 0, 8); // uid
-  writeOctalField(header, 116, 0, 8); // gid
-  writeOctalField(header, 124, size, 12);
-  writeOctalField(header, 136, 0, 12); // mtime — fixed so the fixture is byte-stable
-  header.fill(0x20, 148, 156); // checksum field reads as 8 spaces while summing
-  header[156] = typeflag.charCodeAt(0);
-  writeField(header, 257, 'ustar', 6); // magic (NUL-terminated by the zeroed buffer)
-  writeField(header, 263, '00', 2); // version
-  let checksum = 0;
-  for (const byte of header) checksum += byte;
-  writeField(header, 148, checksum.toString(8).padStart(6, '0'), 6);
-  header[154] = 0x00;
-  header[155] = 0x20;
-  return header;
-}
+    expect(bin).not.toBe('tar');
+    expect(bin).toMatch(SYSTEM32_TAR);
+    // The probe must ask about the path it returns, not some other file.
+    expect(probed).toEqual([bin]);
+  });
 
-/** Concatenate blocks into one buffer. */
-function concatBytes(blocks: Uint8Array[]): Uint8Array {
-  const total = blocks.reduce((sum, block) => sum + block.length, 0);
-  const out = new Uint8Array(total);
-  let offset = 0;
-  for (const block of blocks) {
-    out.set(block, offset);
-    offset += block.length;
-  }
-  return out;
-}
+  it('falls back to PATH when Windows has no bundled tar', () => {
+    // Pre-1803 Windows ships no tar. Returning the absolute path anyway would
+    // spawn a file that does not exist, which is a worse failure than a PATH miss.
+    expect(resolveTarBin('win32', () => false)).toBe('tar');
+  });
 
-/**
- * The exact bytes the fixture claims to carry. Every test that extracts asserts
- * the file lands with THIS content, not merely that a file exists — a hand-rolled
- * binary format that nothing validates is a worse trap than the hang it replaced.
- * A `size` field short by a few bytes, dropped padding, or a missing terminator
- * all still produce an `index.html` and a `tar` exit 0; only comparing content
- * catches them.
- */
-const FIXTURE_INDEX_HTML = '<html>ok</html>';
+  it('leaves the binary to PATH off Windows', () => {
+    const probed: string[] = [];
 
-/** `web/` + `web/index.html`, tarred and gzipped — the shape `archon serve` downloads. */
-function buildWebTarball(indexHtml: string): Uint8Array {
-  const body = new TextEncoder().encode(indexHtml);
-  const padding = new Uint8Array((512 - (body.length % 512)) % 512);
-  return Bun.gzipSync(
-    concatBytes([
-      tarHeader('web/', 0, '5', 0o755),
-      tarHeader('web/index.html', body.length, '0', 0o644),
-      body,
-      padding,
-      new Uint8Array(1024), // two zero blocks terminate the archive
-    ])
-  );
-}
+    const bin = resolveTarBin('linux', path => {
+      probed.push(path);
+      return true;
+    });
+
+    expect(bin).toBe('tar');
+    // No filesystem probe at all — the POSIX `tar` on PATH is the right one.
+    expect(probed).toEqual([]);
+  });
+});
 
 describe('downloadWebDist', () => {
   let tmpRoot: string;
@@ -196,8 +177,8 @@ describe('downloadWebDist', () => {
     tarballHash = hasher.digest('hex');
   });
 
-  afterAll(() => {
-    rmSync(tmpRoot, { recursive: true, force: true });
+  afterAll(async () => {
+    await removeTempTree(tmpRoot);
   });
 
   beforeEach(() => {
@@ -210,11 +191,24 @@ describe('downloadWebDist', () => {
     consoleLogSpy.mockRestore();
   });
 
+  // The spawn-shape and cleanup assertions ride along here rather than in tests
+  // of their own: each call to downloadWebDist costs a real `tar` spawn, and
+  // spawn count on windows is the whole reason this file gets attention.
   it('verifies against the embedded hash without fetching checksums.txt', async () => {
     fetchSpy.mockImplementation(async () => new Response(tarballBytes));
     const targetDir = join(tmpRoot, 'target-embedded-ok');
+    const spawnSpy = spyOn(Bun, 'spawn');
+    let extractorStdin: unknown;
+    let extractorBin: string | undefined;
 
-    await downloadWebDist('9.9.9', targetDir, tarballHash);
+    try {
+      await downloadWebDist('9.9.9', targetDir, tarballHash);
+      // Read before restoring — mockRestore() clears the recorded calls.
+      extractorStdin = (spawnSpy.mock.calls[0]?.[1] as { stdin?: unknown } | undefined)?.stdin;
+      extractorBin = (spawnSpy.mock.calls[0]?.[0] as string[] | undefined)?.[0];
+    } finally {
+      spawnSpy.mockRestore();
+    }
 
     // Content, not just existence — a truncated or corrupt fixture still yields
     // an index.html and a `tar` exit 0, so only this assertion catches it.
@@ -222,6 +216,20 @@ describe('downloadWebDist', () => {
     // Only the tarball is fetched — checksums.txt must NOT be requested.
     expect(fetchSpy).toHaveBeenCalledTimes(1);
     expect(String(fetchSpy.mock.calls[0]?.[0])).toContain('archon-web.tar.gz');
+    // `tar` must inherit a file descriptor. Passing the bytes as `stdin` instead
+    // leaves the parent owning a channel it has to pump and close, and a stalled
+    // pump blocks `tar` forever — the windows hang in #2924. A BunFile is a Blob;
+    // a Uint8Array is not, which is exactly the regression this catches.
+    expect(extractorStdin).toBeInstanceOf(Blob);
+    // Wiring: extraction must spawn the resolved binary, not the bare name. An
+    // exported-but-uncalled resolver leaves Windows on PATH, which is the bug.
+    if (process.platform === 'win32') {
+      expect(extractorBin).toMatch(/[/\\]System32[/\\]tar\.exe$/);
+    } else {
+      expect(extractorBin).toBe('tar');
+    }
+    // The staged archive is ~2 MB in production — it must not survive extraction.
+    expect(existsSync(`${targetDir}.tmp.tar.gz`)).toBe(false);
   });
 
   it('hard-fails on embedded hash mismatch with a clear error', async () => {
@@ -235,6 +243,76 @@ describe('downloadWebDist', () => {
     expect(existsSync(targetDir)).toBe(false);
     // Still no checksums.txt fetch on the embedded path.
     expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  // The mismatch test above cannot reach this path: verification runs before
+  // anything is staged, so it never leaves temp state behind. Checksum-valid
+  // bytes that are not a gzip stream are the only cheap way in — staging happens,
+  // then `tar` exits non-zero.
+  it('leaves nothing behind when tar exits non-zero', async () => {
+    const notAnArchive = new TextEncoder().encode('checksum-valid, but not gzip');
+    const hasher = new Bun.CryptoHasher('sha256');
+    hasher.update(notAnArchive);
+    fetchSpy.mockImplementation(async () => new Response(notAnArchive));
+    const targetDir = join(tmpRoot, 'target-tar-failure');
+
+    await expect(downloadWebDist('9.9.9', targetDir, hasher.digest('hex'))).rejects.toThrow(
+      'tar extraction failed'
+    );
+
+    expect(existsSync(`${targetDir}.tmp.tar.gz`)).toBe(false);
+    expect(existsSync(`${targetDir}.tmp`)).toBe(false);
+    expect(existsSync(targetDir)).toBe(false);
+  });
+
+  // The bound is the only thing between a stuck `tar` and an `archon serve` that
+  // waits forever, so it is proved against a child that genuinely never exits.
+  // A fake subprocess would have to model kill-ends-the-wait, which is the part
+  // worth doubting: this asserts it instead. The extra child is deliberate spawn
+  // cost on windows (#2924) and it is bounded by the thing under test — 250ms,
+  // then killed.
+  it('bounds a stalled extraction, names the timeout, and leaves no partial tree', async () => {
+    fetchSpy.mockImplementation(async () => new Response(tarballBytes));
+    const targetDir = join(tmpRoot, 'target-extract-stall');
+    const tmpDir = `${targetDir}.tmp`;
+    const partialFile = join(tmpDir, 'index.html');
+    const realSpawn = Bun.spawn.bind(Bun);
+    let partialTreeExisted = false;
+    const spawnSpy = spyOn(Bun, 'spawn').mockImplementation(((
+      _command: string[],
+      options: Parameters<typeof Bun.spawn>[1]
+    ) => {
+      // Written here, not by the child, so a half-extracted tree is present
+      // before the stall rather than racing the timer for its own existence.
+      writeFileSync(partialFile, 'half a tree');
+      partialTreeExisted = existsSync(partialFile);
+      // The child sleeps rather than spinning on a never-resolving promise. Its own 30s
+      // bound is a backstop, not part of the assertion: the 250ms kill is what ends it on
+      // every passing run, and anything past 250ms reads as "never exits" here. The backstop
+      // matters when the runner is killed before that kill lands — the child is orphaned, and
+      // a never-resolving promise would then hold a core at 100% until reboot (oven-sh/bun#14951).
+      return realSpawn(
+        [process.execPath, '-e', 'await new Promise(resolve => setTimeout(resolve, 30_000))'],
+        options
+      );
+    }) as unknown as typeof Bun.spawn);
+
+    try {
+      await expect(downloadWebDist('9.9.9', targetDir, tarballHash, 250)).rejects.toThrow(
+        /Timed out extracting the web UI: tar did not finish within 250ms/
+      );
+    } finally {
+      spawnSpy.mockRestore();
+    }
+
+    expect(partialTreeExisted).toBe(true);
+    // Nothing survives the bound: not the half-extracted tree, not the staged
+    // archive, and above all no target dir that the next run would read as a
+    // complete install.
+    expect(existsSync(partialFile)).toBe(false);
+    expect(existsSync(tmpDir)).toBe(false);
+    expect(existsSync(`${targetDir}.tmp.tar.gz`)).toBe(false);
+    expect(existsSync(targetDir)).toBe(false);
   });
 
   it('falls back to remote checksums.txt when the embedded hash is empty', async () => {
@@ -251,8 +329,8 @@ describe('downloadWebDist', () => {
     expect(readFileSync(join(targetDir, 'index.html'), 'utf8')).toBe(FIXTURE_INDEX_HTML);
     // Remote path fetches both checksums.txt and the tarball.
     expect(fetchSpy).toHaveBeenCalledTimes(2);
-    const urls = fetchSpy.mock.calls.map(call => String(call[0]));
-    expect(urls.some(u => u.includes('checksums.txt'))).toBe(true);
+    const urls = fetchSpy.mock.calls.map((call: Parameters<typeof fetch>) => String(call[0]));
+    expect(urls.some((url: string) => url.includes('checksums.txt'))).toBe(true);
   });
 });
 
@@ -279,6 +357,125 @@ describe('buildWebTarball structural conformance', () => {
   });
 });
 
+const signals = ['SIGINT', 'SIGTERM'] as const;
+function listeners() {
+  return signals.map(signal => process.listeners(signal));
+}
+
+function fakeChild(exitCode = 0) {
+  const kill = mock((_signal?: number | NodeJS.Signals) => {});
+  return { pid: 1234, exited: Promise.resolve(exitCode), kill };
+}
+
+describe('serveCommand in a source checkout', () => {
+  const trackTempRoot = trackTempRoots();
+  let builtDist: string;
+  let fetchSpy: ReturnType<typeof spyOn>;
+  let consoleErrorSpy: ReturnType<typeof spyOn>;
+  beforeEach(() => {
+    builtDist = trackTempRoot(mkdtempSync(join(tmpdir(), 'serve-source-dist-')));
+    writeFileSync(join(builtDist, 'index.html'), '<html>built</html>');
+    sourceWebDistDir = builtDist;
+    fetchSpy = spyOn(globalThis, 'fetch');
+    fetchSpy.mockImplementation(async () => {
+      throw new Error('source checkout must not fetch');
+    });
+    consoleErrorSpy = spyOn(console, 'error').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    fetchSpy.mockRestore();
+    consoleErrorSpy.mockRestore();
+  });
+  it('spawns the source server with launch overrides, inherited stdio and CLI env', async () => {
+    const before = listeners();
+    const child = fakeChild(7);
+    const spawn = mock(
+      (
+        _argv: string[],
+        _options: Bun.SpawnOptions.OptionsObject<'inherit', 'inherit', 'inherit'>
+      ) => child
+    );
+    expect(await serveCommand({ port: 4321 }, spawn)).toBe(7);
+    expect(spawn).toHaveBeenCalledWith(
+      [
+        process.execPath,
+        '--no-env-file',
+        '/checkout/packages/server/src/bin.ts',
+        '--cli-version',
+        'dev',
+        '--port',
+        '4321',
+        '--web-dist',
+        builtDist,
+      ],
+      {
+        stdin: 'inherit',
+        stdout: 'inherit',
+        stderr: 'inherit',
+        env: { ...process.env, LOG_LEVEL: 'debug' },
+      }
+    );
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(listeners()).toEqual(before);
+  });
+  it('leaves SIGINT to the foreground group and forwards SIGTERM once to the recorded child', async () => {
+    const before = listeners();
+    let finish!: (code: number) => void;
+    const child = {
+      ...fakeChild(),
+      exited: new Promise<number>(resolve => {
+        finish = resolve;
+      }),
+    };
+    const pending = serveCommand({}, () => child);
+    for (const [index, signal] of signals.entries()) {
+      const added = process.listeners(signal).filter(listener => !before[index].includes(listener));
+      expect(added).toHaveLength(1);
+      for (const listener of added) listener(signal);
+      if (signal === 'SIGINT') expect(child.kill).not.toHaveBeenCalled();
+    }
+    expect(child.kill).toHaveBeenCalledWith('SIGTERM');
+    expect(child.kill).toHaveBeenCalledTimes(1);
+    finish(0);
+    expect(await pending).toBe(0);
+    expect(listeners()).toEqual(before);
+  });
+  it('reports spawn failure and removes signal handlers', async () => {
+    const before = listeners();
+    expect(
+      await serveCommand({}, () => {
+        throw new Error('spawn refused');
+      })
+    ).toBe(1);
+    expect(consoleErrorSpy.mock.calls.flat().join(' ')).toContain('spawn refused');
+    expect(listeners()).toEqual(before);
+  });
+  it('refuses with a build instruction when the dist is missing', async () => {
+    sourceWebDistDir = join(builtDist, 'missing');
+    const spawn = mock(
+      (
+        _argv: string[],
+        _options: Bun.SpawnOptions.OptionsObject<'inherit', 'inherit', 'inherit'>
+      ) => fakeChild()
+    );
+    expect(await serveCommand({}, spawn)).toBe(1);
+    expect(spawn).not.toHaveBeenCalled();
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(consoleErrorSpy.mock.calls.flat().join(' ')).toContain('bun run build:web');
+  });
+  it('refuses --download-only in source mode', async () => {
+    const spawn = mock(
+      (
+        _argv: string[],
+        _options: Bun.SpawnOptions.OptionsObject<'inherit', 'inherit', 'inherit'>
+      ) => fakeChild()
+    );
+    expect(await serveCommand({ downloadOnly: true }, spawn)).toBe(1);
+    expect(spawn).not.toHaveBeenCalled();
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+});
+
 describe('serveCommand', () => {
   let consoleErrorSpy: ReturnType<typeof spyOn>;
 
@@ -288,19 +485,6 @@ describe('serveCommand', () => {
 
   afterEach(() => {
     consoleErrorSpy.mockRestore();
-  });
-
-  it('should reject in dev mode (non-binary)', async () => {
-    const exitCode = await serveCommand({});
-    expect(exitCode).toBe(1);
-    expect(consoleErrorSpy).toHaveBeenCalledWith(
-      'Error: `archon serve` is for compiled binaries only.'
-    );
-  });
-
-  it('should reject with downloadOnly in dev mode', async () => {
-    const exitCode = await serveCommand({ downloadOnly: true });
-    expect(exitCode).toBe(1);
   });
 
   it('should reject invalid port (NaN)', async () => {

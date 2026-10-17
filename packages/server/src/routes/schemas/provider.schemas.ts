@@ -2,33 +2,19 @@
  * Zod schemas for provider API endpoints.
  */
 import { z } from '@hono/zod-openapi';
-
-/** Provider capability flags. */
-const providerCapabilitiesSchema = z
-  .object({
-    sessionResume: z.boolean(),
-    mcp: z.boolean(),
-    hooks: z.boolean(),
-    skills: z.boolean(),
-    toolRestrictions: z.boolean(),
-    // Mirrors ProviderCapabilities.structuredOutput: 'enforced' | 'best-effort' | false.
-    structuredOutput: z.union([z.literal('enforced'), z.literal('best-effort'), z.literal(false)]),
-    envInjection: z.boolean(),
-    costControl: z.boolean(),
-    effortControl: z.boolean(),
-    thinkingControl: z.boolean(),
-    fallbackModel: z.boolean(),
-    sandbox: z.boolean(),
-  })
-  .openapi('ProviderCapabilities');
+import { EFFORT_LADDER } from '@archon/provider-contract';
+import { providerCapabilitiesSchema } from '@archon/provider-contract';
 
 /** A single provider info entry (API-safe projection of ProviderRegistration). */
 export const providerInfoSchema = z
   .object({
     id: z.string(),
     displayName: z.string(),
-    capabilities: providerCapabilitiesSchema,
+    // Rebuilt from its shape: zod copies `.openapi` onto a schema only when it is created
+    // after `@hono/zod-openapi` loads, and the providers load the contract package first.
+    capabilities: z.object(providerCapabilitiesSchema.shape).openapi('ProviderCapabilities'),
     builtIn: z.boolean(),
+    effortLevels: z.array(z.enum(EFFORT_LADDER)).optional(),
   })
   .openapi('ProviderInfo');
 

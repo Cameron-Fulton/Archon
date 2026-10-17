@@ -3,7 +3,8 @@ import { OpenAPIHono } from '@hono/zod-openapi';
 import type { ConversationLockManager } from '@archon/core';
 import type { WebAdapter } from '../adapters/web';
 import { validationErrorHook } from './openapi-defaults';
-import { mockAllWorkflowModules } from '../test/workflow-mock-factories';
+import { makeIdleLockStats } from '../test/conversation-lock-fixtures';
+import { makeListDashboardRunsMock, mockAllWorkflowModules } from '../test/workflow-mock-factories';
 
 // ---------------------------------------------------------------------------
 // Mock setup — must precede the dynamic import of ./api below. Exercises the
@@ -31,6 +32,7 @@ mock.module('../auth', () => ({
   isWebAuthEnabled: () => false,
   getSignupMode: () => 'disabled',
   isApiGateEnabled: () => false,
+  isConversationOwnershipEnforced: () => false,
 }));
 
 // --- Identity resolution (X-Archon-User → user) ---
@@ -102,10 +104,16 @@ mock.module('@archon/core', () => ({
   handleMessage: mock(async () => {}),
   getDatabaseType: () => 'postgresql',
   loadConfig: mock(async () => ({})),
+  ProjectRegistrationError: class ProjectRegistrationError extends Error {},
+  inspectProjectBaseBranch: mock(async () => ({
+    kind: 'repo',
+    defaultBranch: 'dev',
+    reason: null,
+  })),
   cloneRepository: mock(async () => ({ codebaseId: 'x', alreadyExisted: false })),
   registerRepository: mock(async () => ({ codebaseId: 'x', alreadyExisted: false })),
   ConversationNotFoundError: class ConversationNotFoundError extends Error {},
-  generateAndSetTitle: mock(async () => {}),
+  generateTitleForUser: mock(async () => {}),
   resolveTitleRequest: mock(async () => ({ provider: 'claude', options: {} })),
   isPerUserGitHubEnabled: () => false,
   getArchonWorkspacesPath: () => '/tmp/.archon/workspaces',
@@ -129,11 +137,11 @@ mock.module('@archon/core', () => ({
 }));
 
 mock.module('@archon/paths', () => ({
+  canonicalizeProjectPath: async (path: string) => path,
   createLogger: noopLogger,
   getWorkflowFolderSearchPaths: mock(() => ['.archon/workflows']),
   getCommandFolderSearchPaths: mock(() => ['.archon/commands']),
-  getDefaultCommandsPath: mock(() => '/tmp/.archon-test-nonexistent/commands/defaults'),
-  getDefaultWorkflowsPath: mock(() => '/tmp/.archon-test-nonexistent/workflows/defaults'),
+  getBundledWorkflowsPath: mock(() => '/tmp/.archon-test-nonexistent/workflows'),
   getArchonWorkspacesPath: () => '/tmp/.archon/workspaces',
   getArchonHome: () => '/tmp/.archon',
   getRunArtifactsPath: (owner: string, repo: string, runId: string): string =>
@@ -170,11 +178,7 @@ mock.module('@archon/core/db/isolation-environments', () => ({
 
 mock.module('@archon/core/db/workflows', () => ({
   listWorkflowRuns: mock(async () => []),
-  listDashboardRuns: mock(async () => ({
-    runs: [],
-    total: 0,
-    counts: { all: 0, running: 0, completed: 0, failed: 0, cancelled: 0, pending: 0 },
-  })),
+  listDashboardRuns: makeListDashboardRunsMock(),
   getWorkflowRun: mock(async () => null),
   getWorkflowRunByWorkerPlatformId: mock(async () => null),
 }));
@@ -190,12 +194,12 @@ mock.module('@archon/core/db/messages', () => ({
 }));
 
 mock.module('@archon/core/utils/commands', () => ({
-  findMarkdownFilesRecursive: mock(async () => []),
+  findCommandFiles: mock(async () => []),
 }));
 
 import { registerApiRoutes } from './api';
 import { isArchonOwnedAuthPath } from '../auth/config';
-import { registerBuiltinProviders } from '@archon/providers';
+import { registerBuiltinProviders } from '@archon/providers/in-process';
 
 // The route validates tier/alias providers against the real registry, which is
 // empty until the server bootstrap registers built-ins — do it here (idempotent).
@@ -213,7 +217,7 @@ function makeApp(): OpenAPIHono {
       await fn();
       return { status: 'started' };
     }),
-    getStats: mock(() => ({ active: 0, queued: 0 })),
+    getStats: mock(makeIdleLockStats),
   } as unknown as ConversationLockManager;
   registerApiRoutes(app, mockWebAdapter, mockLockManager);
   return app;
@@ -306,10 +310,23 @@ describe('PATCH /api/auth/me/ai-prefs/tiers', () => {
       method: 'PATCH',
       headers: JSON_HEADERS,
       body: JSON.stringify({
-        tiers: { large: { provider: 'claude', model: 'opus', effort: 'ultra' } },
+        tiers: { large: { provider: 'claude', model: 'opus', effort: 'extreme' } },
       }),
     });
     expect(res.status).toBe(400);
+    expect(mockSetTiers).not.toHaveBeenCalled();
+  });
+
+  test('retired thinking config → 400 naming effort', async () => {
+    const res = await makeApp().request('/api/auth/me/ai-prefs/tiers', {
+      method: 'PATCH',
+      headers: JSON_HEADERS,
+      body: JSON.stringify({
+        tiers: { large: { provider: 'claude', model: 'opus', thinking: 'adaptive' } },
+      }),
+    });
+    expect(res.status).toBe(400);
+    expect(JSON.stringify(await res.json())).toContain('effort:');
     expect(mockSetTiers).not.toHaveBeenCalled();
   });
 

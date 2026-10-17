@@ -4,7 +4,7 @@ import type {
   PiModelInfo,
   ProviderInfo,
   ProviderKeyList,
-  SafeConfigTiers,
+  SafeConfig,
   TiersForm,
   TierName,
   TierRowForm,
@@ -17,13 +17,14 @@ import { K } from '../store/keys';
 import { providerOptionHint } from '../lib/agent-status';
 import { effortOptionsForAgent, normalizeEffortForAgent } from '../lib/model-options';
 import { useCancelledRef } from '../lib/use-cancelled-ref';
+import { errorDetail } from '../lib/http';
 import { SettingsSection } from './SettingsSection';
-import { ScopeToggle } from './ScopeToggle';
+import { UserScopeSlot, userScopeStatus } from './ScopeToggle';
 import { SELECT_CLASS, SelectShell } from './SettingsFormPrimitives';
 import { ModelPickerField } from './ModelPickerField';
 
 /** Seed the editable tier form from a tier map (configured tiers only). */
-function seedTiers(tiers: SafeConfigTiers['tiers']): TiersForm {
+function seedTiers(tiers: SafeConfig['tiers']): TiersForm {
   const row = (t: TierName): TierRowForm => {
     const set = tiers?.[t];
     return { provider: set?.provider ?? '', model: set?.model ?? '', effort: set?.effort ?? '' };
@@ -34,15 +35,17 @@ function seedTiers(tiers: SafeConfigTiers['tiers']): TiersForm {
 /**
  * "provider/model" hint for an unset tier. Install scope falls back to the
  * built-in default; user scope falls back to the install tier first (that's
- * what an unset per-user tier resolves to), then the built-in default.
+ * what an unset per-user tier resolves to), then the built-in default. Only
+ * claude and codex ship built-ins — for any other provider an unset tier
+ * resolves to nothing, and the hint must say so instead of implying a fallback.
  */
-function defaultHint(cfg: SafeConfigTiers, t: TierName, scope: SettingsScope): string {
+function defaultHint(cfg: SafeConfig, t: TierName, scope: SettingsScope): string {
   if (scope === 'user') {
     const installSet = cfg.tiers?.[t];
     if (installSet) return `${installSet.provider}/${installSet.model}`;
   }
   const d = cfg.tierDefaults?.[t];
-  return d ? `${d.provider}/${d.model}` : 'built-in default';
+  return d ? `${d.provider}/${d.model}` : 'no built-in — set a model';
 }
 
 /**
@@ -51,7 +54,8 @@ function defaultHint(cfg: SafeConfigTiers, t: TierName, scope: SettingsScope): s
  * (ungated; works on solo installs), "Just me" writes the caller's per-user
  * prefs row via PATCH /api/auth/me/ai-prefs/tiers (highest precedence at run
  * time). The "Just me" scope is hidden when GET /api/auth/me/ai-prefs 401s (no
- * web identity — solo-PAT or logged out), mirroring AgentsPanel.
+ * web identity — solo-PAT or logged out), mirroring AgentsPanel; any other
+ * failure of that read is shown in its place.
  * A row left on "Default" is sent as an unset and falls back to the next layer.
  */
 export function ModelTiersPanel(): ReactElement {
@@ -75,20 +79,18 @@ export function ModelTiersPanel(): ReactElement {
     skill.listProviderKeys
   );
 
-  // No web identity (401) or any other prefs read failure → install scope only,
-  // so the editor never mislabels install values as "Just me".
-  const userScopeAvailable = userPrefsError === undefined;
-  const [scope, setScope] = useState<SettingsScope>('install');
+  const userScope = userScopeStatus(userPrefsError);
+  const [selectedScope, setScope] = useState<SettingsScope>('install');
+  // Without per-user prefs the editor is install-only, so it never labels
+  // install values as "Just me".
+  const scope: SettingsScope = userScope.kind === 'available' ? selectedScope : 'install';
 
   const [form, setForm] = useState<TiersForm | null>(null);
   const baselineRef = useRef('');
   useEffect(() => {
     if (config === undefined) return;
     if (scope === 'user' && userPrefs === undefined) return;
-    const seeded =
-      scope === 'user'
-        ? seedTiers(userPrefs?.tiers)
-        : seedTiers((config.config as SafeConfigTiers).tiers);
+    const seeded = scope === 'user' ? seedTiers(userPrefs?.tiers) : seedTiers(config.config.tiers);
     setForm(seeded);
     baselineRef.current = JSON.stringify(seeded);
   }, [config, userPrefs, scope]);
@@ -115,7 +117,7 @@ export function ModelTiersPanel(): ReactElement {
     );
   }
 
-  const cfg = config.config as SafeConfigTiers;
+  const cfg = config.config;
   const dirty = JSON.stringify(form) !== baselineRef.current;
 
   const setRow = (t: TierName, partial: Partial<TierRowForm>): void => {
@@ -137,7 +139,7 @@ export function ModelTiersPanel(): ReactElement {
       }
     } catch (e: unknown) {
       if (cancelledRef.current) return;
-      setSaveError(e instanceof Error ? e.message : 'Failed to save tiers.');
+      setSaveError(e instanceof Error ? errorDetail(e) : 'Failed to save tiers.');
     } finally {
       if (!cancelledRef.current) setSaving(false);
     }
@@ -152,14 +154,14 @@ export function ModelTiersPanel(): ReactElement {
           these models. Leave a row on “Default” to use the next layer’s preset.
           {scope === 'user' ? ' Your rows override the install rows for runs you start.' : ''}
         </p>
-        {userScopeAvailable ? <ScopeToggle scope={scope} onChange={setScope} /> : null}
+        <UserScopeSlot status={userScope} scope={scope} onChange={setScope} />
       </div>
 
       <div className="flex flex-col gap-[11px]">
         {TIER_ORDER.map(tier => {
           const row = form[tier];
           const unset = row.provider === '';
-          const effortOptions = effortOptionsForAgent(row.provider);
+          const effortOptions = effortOptionsForAgent(row.provider, providers);
           return (
             <div
               key={tier}
@@ -178,7 +180,7 @@ export function ModelTiersPanel(): ReactElement {
                     const provider = e.target.value;
                     setRow(tier, {
                       provider,
-                      effort: normalizeEffortForAgent(provider, row.effort),
+                      effort: normalizeEffortForAgent(provider, row.effort, providers),
                     });
                   }}
                   className={SELECT_CLASS}
@@ -203,7 +205,9 @@ export function ModelTiersPanel(): ReactElement {
                 }}
                 disabled={unset}
                 placeholder={
-                  unset ? `default: ${defaultHint(cfg, tier, scope)}` : 'model (e.g. opus, gpt-5.5)'
+                  unset
+                    ? `default: ${defaultHint(cfg, tier, scope)}`
+                    : 'model (e.g. opus, gpt-5.6-terra)'
                 }
                 ariaLabel={`${tier} model`}
                 className="min-w-[160px] flex-1"
@@ -215,7 +219,9 @@ export function ModelTiersPanel(): ReactElement {
                   <select
                     value={row.effort}
                     onChange={e => {
-                      setRow(tier, { effort: e.target.value });
+                      setRow(tier, {
+                        effort: effortOptions.find(option => option === e.target.value) ?? '',
+                      });
                     }}
                     // Currently unreachable while disabled (unset rows have no
                     // effort vocabulary), but every row control rides the

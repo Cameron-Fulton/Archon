@@ -26,7 +26,9 @@ function variantHint(variant: VariantId): string {
     case 'loop':
       return 'Iterate until a signal';
     case 'approval':
-      return 'Human gate (interactive)';
+      return 'Human gate, pauses the run';
+    case 'wait':
+      return 'Pause until time or event';
     case 'cancel':
       return 'Stop the run';
   }

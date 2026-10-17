@@ -3,13 +3,16 @@
  * detection, and resume logic.  These run before DAG dispatch and are exercised
  * with minimal DAG workflow fixtures.
  */
+import { providerRegistry } from '@archon/providers';
+import type { CheckoutObservation } from './schemas/checkout-observation';
 import { describe, it, expect, mock, beforeEach, afterEach } from 'bun:test';
 import { mkdtemp, rm } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import type { WorkflowDeps, IWorkflowPlatform, WorkflowConfig } from './deps';
 import type { IWorkflowStore } from './store';
-import type { WorkflowDefinition, WorkflowRun } from './schemas';
+import type { ResolvedWorkflow, WorkflowDefinition, WorkflowRun } from './schemas';
+import { resolveWorkflow } from './graph-plan';
 
 // ---------------------------------------------------------------------------
 // Mock logger (must precede all module-under-test imports)
@@ -41,6 +44,7 @@ mock.module('@archon/paths', () => ({
 
 mock.module('@archon/git', () => ({
   getDefaultBranch: mock(async () => 'main'),
+  getDefaultRemote: mock(async () => 'origin'),
   toRepoPath: mock((p: string) => p),
 }));
 
@@ -59,6 +63,7 @@ mock.module('./dag-executor', () => ({
 
 mock.module('./logger', () => ({
   logWorkflowStart: mock(async () => {}),
+  logWorkflowResume: mock(async () => {}),
   logWorkflowError: mock(async () => {}),
 }));
 
@@ -75,7 +80,8 @@ mock.module('./event-emitter', () => ({
 // Bootstrap provider registry (executor calls isRegisteredProvider at workflow level)
 // ---------------------------------------------------------------------------
 
-import { registerBuiltinProviders, clearRegistry } from '@archon/providers';
+import { clearRegistry } from '@archon/providers';
+import { registerBuiltinProviders } from '@archon/providers/in-process';
 clearRegistry();
 registerBuiltinProviders();
 
@@ -91,22 +97,188 @@ import { executeWorkflow } from './executor';
 
 function makeStore(overrides: Partial<IWorkflowStore> = {}): IWorkflowStore {
   return {
+    getWorkflowEventHead: mock<IWorkflowStore['getWorkflowEventHead']>(() => {
+      throw new Error('Unexpected event feed read');
+    }),
+    readWorkflowEventsAfter: mock<IWorkflowStore['readWorkflowEventsAfter']>(() => {
+      throw new Error('Unexpected event feed read');
+    }),
+    getStateDocument: mock<IWorkflowStore['getStateDocument']>(() => {
+      throw new Error('Unexpected getStateDocument');
+    }),
+    putStateDocument: mock<IWorkflowStore['putStateDocument']>(() => {
+      throw new Error('Unexpected putStateDocument');
+    }),
+    patchStateDocument: mock<IWorkflowStore['patchStateDocument']>(() => {
+      throw new Error('Unexpected patchStateDocument');
+    }),
+    deleteStateDocument: mock<IWorkflowStore['deleteStateDocument']>(() => {
+      throw new Error('Unexpected deleteStateDocument');
+    }),
+    listStateRevisions: mock<IWorkflowStore['listStateRevisions']>(() => {
+      throw new Error('Unexpected listStateRevisions');
+    }),
+    listStateDocuments: mock<IWorkflowStore['listStateDocuments']>(() => {
+      throw new Error('Unexpected listStateDocuments');
+    }),
+    getStateDocuments: mock<IWorkflowStore['getStateDocuments']>(() => {
+      throw new Error('Unexpected getStateDocuments');
+    }),
+    pruneStateRevisions: mock<IWorkflowStore['pruneStateRevisions']>(() => {
+      throw new Error('Unexpected pruneStateRevisions');
+    }),
+    admitResourceStart: mock<IWorkflowStore['admitResourceStart']>(() => {
+      throw new Error('Unexpected admitResourceStart');
+    }),
+    drainResourceStarts: mock<IWorkflowStore['drainResourceStarts']>(() => {
+      throw new Error('Unexpected drainResourceStarts');
+    }),
+    hasStartReceiptForDelivery: mock<IWorkflowStore['hasStartReceiptForDelivery']>(() => {
+      throw new Error('Unexpected hasStartReceiptForDelivery');
+    }),
+    acceptStartReceipt: mock<IWorkflowStore['acceptStartReceipt']>(() => {
+      throw new Error('Unexpected acceptStartReceipt');
+    }),
+    getStartReceipt: mock<IWorkflowStore['getStartReceipt']>(() => {
+      throw new Error('Unexpected getStartReceipt');
+    }),
+    listStartReceipts: mock<IWorkflowStore['listStartReceipts']>(() => {
+      throw new Error('Unexpected listStartReceipts');
+    }),
+    listPendingStartBindings: mock<IWorkflowStore['listPendingStartBindings']>(() => {
+      throw new Error('Unexpected listPendingStartBindings');
+    }),
+    getResourceStartRequest: mock<IWorkflowStore['getResourceStartRequest']>(() => {
+      throw new Error('Unexpected getResourceStartRequest');
+    }),
+    listQueuedResourceStartsForHost: mock<IWorkflowStore['listQueuedResourceStartsForHost']>(() => {
+      throw new Error('Unexpected listQueuedResourceStartsForHost');
+    }),
+    withdrawQueuedResourceStart: mock<IWorkflowStore['withdrawQueuedResourceStart']>(() => {
+      throw new Error('Unexpected withdrawQueuedResourceStart');
+    }),
+    claimStartBindingPreparation: mock<IWorkflowStore['claimStartBindingPreparation']>(() => {
+      throw new Error('Unexpected claimStartBindingPreparation');
+    }),
+    completeStartBindingPreparation: mock<IWorkflowStore['completeStartBindingPreparation']>(() => {
+      throw new Error('Unexpected completeStartBindingPreparation');
+    }),
+    failStartBindingPreparation: mock<IWorkflowStore['failStartBindingPreparation']>(() => {
+      throw new Error('Unexpected failStartBindingPreparation');
+    }),
+    resetStartBindingPreparation: mock<IWorkflowStore['resetStartBindingPreparation']>(() => {
+      throw new Error('Unexpected resetStartBindingPreparation');
+    }),
+    listDueWorkflowContinuations: mock<IWorkflowStore['listDueWorkflowContinuations']>(() => {
+      throw new Error('Unexpected listDueWorkflowContinuations');
+    }),
+    deferWorkflowContinuation: mock<IWorkflowStore['deferWorkflowContinuation']>(() => {
+      throw new Error('Unexpected deferWorkflowContinuation');
+    }),
+    releaseRunForUnreadableSource: mock<IWorkflowStore['releaseRunForUnreadableSource']>(() => {
+      throw new Error('Unexpected releaseRunForUnreadableSource');
+    }),
+    releasePausedRunSlot: mock<IWorkflowStore['releasePausedRunSlot']>(() =>
+      Promise.resolve({ released: false })
+    ),
+    answerAttentionWait: mock<IWorkflowStore['answerAttentionWait']>(() => {
+      throw new Error('Unexpected answerAttentionWait');
+    }),
+    labelAttentionWait: mock<IWorkflowStore['labelAttentionWait']>(() => {
+      throw new Error('Unexpected labelAttentionWait');
+    }),
+    listAttentionQueueRows: mock<IWorkflowStore['listAttentionQueueRows']>(() => {
+      throw new Error('Unexpected listAttentionQueueRows');
+    }),
+    signalWorkflowWait: mock<IWorkflowStore['signalWorkflowWait']>(() => {
+      throw new Error('Unexpected signalWorkflowWait');
+    }),
+    resolveApprovalGate: mock<IWorkflowStore['resolveApprovalGate']>(() => {
+      throw new Error('Unexpected resolveApprovalGate');
+    }),
+    resolveAndCancelApprovalGate: mock<IWorkflowStore['resolveAndCancelApprovalGate']>(() => {
+      throw new Error('Unexpected resolveAndCancelApprovalGate');
+    }),
+    cancelResumableRunsForConversation: mock<IWorkflowStore['cancelResumableRunsForConversation']>(
+      () => {
+        throw new Error('Unexpected cancelResumableRunsForConversation');
+      }
+    ),
+    deleteWorkflowNodeSessions: mock<IWorkflowStore['deleteWorkflowNodeSessions']>(() => {
+      throw new Error('Unexpected deleteWorkflowNodeSessions');
+    }),
+    findOpenWorkRuns: mock<IWorkflowStore['findOpenWorkRuns']>(async () => {
+      throw new Error('Not used by this test');
+    }),
+    findAdoptingRuns: mock<IWorkflowStore['findAdoptingRuns']>(async () => {
+      throw new Error('Not used by this test');
+    }),
+    deleteOldWorkflowRuns: mock<IWorkflowStore['deleteOldWorkflowRuns']>(async () => {
+      throw new Error('Not used by this test');
+    }),
+    listWorkflowEvents: mock<IWorkflowStore['listWorkflowEvents']>(async () => {
+      throw new Error('Not used by this test');
+    }),
+    listEventsForRuns: mock<IWorkflowStore['listEventsForRuns']>(async () => {
+      throw new Error('Not used by this test');
+    }),
+    findWorkflowRunsByIdPrefix: mock<IWorkflowStore['findWorkflowRunsByIdPrefix']>(async () => []),
+    listWorkflowRuns: mock<IWorkflowStore['listWorkflowRuns']>(() => {
+      throw new Error('Unexpected listWorkflowRuns');
+    }),
     getActiveWorkflowRunByPath: mock(async () => null),
-    failOrphanedRuns: mock(async () => ({ count: 0 })),
+    findChildRuns: mock(async () => []),
+    getRunAncestry: mock(async () => []),
     createWorkflowRun: mock(async () => makeRun()),
+    claimPendingWorkflowRun: mock(async () => makeRun()),
+    recordWorkflowRunCheckoutBaseline: mock(
+      async (_id: string, baseline: CheckoutObservation) => baseline
+    ),
     updateWorkflowRun: mock(async () => {}),
-    failWorkflowRun: mock(async () => {}),
+    failWorkflowRun: mock(async () => ({ failed: true })),
     getWorkflowRun: mock(async () => ({ ...makeRun(), status: 'completed' as const })),
     getWorkflowRunStatus: mock(async () => 'completed' as const),
+    setToolCallAttention: mock<IWorkflowStore['setToolCallAttention']>(async () => true),
     createWorkflowEvent: mock(async () => {}),
+    persistWorkflowEvent: mock(async () => {}),
+    persistWorkflowEventIfRunning: mock(async () => ({ persisted: true })),
     findResumableRun: mock(async () => null),
+    listProviderEvents: mock(async () => []),
     getDagResumeSnapshot: mock(async () => ({
-      completedNodeOutputs: new Map<string, string>(),
+      completedNodeOutputs: new Map<string, { output: string }>(),
+      fanOutSnapshots: new Map(),
+      unresolvedNodeStarts: new Set<string>(),
+      budget: { workUnits: 0, spendUsd: 0 },
       tokens: { input: 0, output: 0 },
+      costUsd: 0,
     })),
     resumeWorkflowRun: mock(async () => makeRun()),
+    recoverCancelledFanOutRun: mock(async () => makeRun()),
     getCodebase: mock(async () => null),
     getCodebaseEnvVars: mock(async () => ({})),
+    updateWorkflowActivity: mock(async () => {}),
+    completeWorkflowRun: mock(async () => {}),
+    pauseWorkflowRun: mock(async () => {}),
+    pauseWorkflowRunForWait: mock(async () => {}),
+    clearWorkflowWaitContext: mock(
+      async (id: string, _wait: unknown, completion: { stepName: string }) => ({
+        cleared: true as const,
+        nodeEvent: {
+          workflow_run_id: id,
+          event_type: 'node_completed' as const,
+          step_name: completion.stepName,
+          data: {},
+        },
+      })
+    ),
+    claimWriteback: mock(async () => ({ claimed: true })),
+    releaseWritebackClaim: mock(async () => {}),
+    cancelWorkflowRun: mock(async () => ({ cancelled: false })),
+    cancelFanOutRun: mock(async () => ({ cancelled: false })),
+    listWorkflowNodeSessions: mock(async () => []),
+    listWorkflowRunNodeSessions: mock(async () => []),
+    upsertWorkflowRunNodeSession: mock(async () => {}),
+    upsertWorkflowNodeSession: mock(async () => {}),
     ...overrides,
   };
 }
@@ -120,6 +292,7 @@ function makePlatform(): IWorkflowPlatform & { sendMessage: ReturnType<typeof mo
 
 function makeDeps(store?: IWorkflowStore): WorkflowDeps {
   return {
+    providers: providerRegistry,
     store: store ?? makeStore(),
     loadConfig: mock(
       async (): Promise<WorkflowConfig> => ({
@@ -136,23 +309,36 @@ function makeDeps(store?: IWorkflowStore): WorkflowDeps {
 }
 
 /** Minimal DAG workflow fixture — the preamble doesn't care about node details */
-function makeWorkflow(overrides: Partial<WorkflowDefinition> = {}): WorkflowDefinition {
-  return {
+function makeWorkflow(overrides: Partial<WorkflowDefinition> = {}): ResolvedWorkflow {
+  return resolveWorkflow({
     name: 'test-workflow',
     description: 'Test',
-    nodes: [{ id: 'test', command: 'test' }],
+    nodes: [{ id: 'test', kind: 'agent', source: { kind: 'command', name: 'test' } }],
     ...overrides,
-  };
+  });
 }
 
 function makeRun(overrides: Partial<WorkflowRun> = {}): WorkflowRun {
   return {
+    origin: { conversationId: 'conv-1' },
     id: 'run-123',
     workflow_name: 'test-workflow',
     conversation_id: 'conv-1',
+    parent_conversation_id: null,
+    codebase_id: null,
     status: 'running',
-    started_at: new Date().toISOString(),
+    outcome: null,
+    user_message: 'test',
     metadata: {},
+    started_at: new Date(),
+    completed_at: null,
+    last_activity_at: null,
+    working_path: null,
+    user_id: null,
+    parent_run_id: null,
+    output_root: null,
+    checkout_baseline: null,
+    adopted_from_run_id: null,
     ...overrides,
   };
 }
@@ -201,17 +387,17 @@ describe('executeWorkflow preamble', () => {
 
   describe('concurrent run guard', () => {
     it('should block new workflow when a running workflow exists on the same path', async () => {
-      const recentTime = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+      const recentTime = new Date(Date.now() - 5 * 60 * 1000);
       const activeRun = makeRun({
         id: 'active-workflow-id',
         workflow_name: 'active-workflow',
         started_at: recentTime,
         status: 'running',
       });
-      const updateSpy = mock(async () => {});
+      const cancelSpy = mock(async () => ({ cancelled: true }));
       const store = makeStore({
         getActiveWorkflowRunByPath: mock(async () => activeRun),
-        updateWorkflowRun: updateSpy,
+        cancelWorkflowRun: cancelSpy,
       });
       const deps = makeDeps(store);
       const platform = makePlatform();
@@ -223,10 +409,11 @@ describe('executeWorkflow preamble', () => {
         '/tmp',
         makeWorkflow(),
         'User message',
-        'db-conv-id'
+        { conversationId: 'db-conv-id' }
       );
 
       expect(result.success).toBe(false);
+      if (result.success) throw new Error('Expected active-workflow rejection');
       expect(result.error).toContain('already active');
 
       // Actionable rejection message was sent (mentions worktree-in-use,
@@ -242,10 +429,7 @@ describe('executeWorkflow preamble', () => {
       // cancelled — preventing zombie pending rows that would block future
       // dispatches.
       expect((store.createWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(1);
-      const cancelCall = updateSpy.mock.calls.find(
-        (call: unknown[]) => (call[1] as { status?: string })?.status === 'cancelled'
-      );
-      expect(cancelCall).toBeDefined();
+      expect(cancelSpy).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -266,7 +450,7 @@ describe('executeWorkflow preamble', () => {
         '/tmp',
         makeWorkflow(),
         'new workflow',
-        'db-conv-123'
+        { conversationId: 'db-conv-123' }
       );
 
       expect(
@@ -289,8 +473,8 @@ describe('executeWorkflow preamble', () => {
         '/tmp',
         makeWorkflow(),
         'test message',
-        'db-conv-456',
-        'codebase-789'
+        { conversationId: 'db-conv-456' },
+        { codebaseId: 'codebase-789' }
       );
 
       const activeCheckCalls = (store.getActiveWorkflowRunByPath as ReturnType<typeof mock>).mock
@@ -316,10 +500,11 @@ describe('executeWorkflow preamble', () => {
         '/tmp',
         makeWorkflow(),
         'test message',
-        'db-conv-123'
+        { conversationId: 'db-conv-123' }
       );
 
       expect(result.success).toBe(false);
+      if (result.success) throw new Error('Expected active-workflow lookup failure');
       expect(result.error).toContain('Database error');
 
       // The row is created BEFORE the guard runs (so the guard can exclude
@@ -344,7 +529,7 @@ describe('executeWorkflow preamble', () => {
       // to executeWorkflow. The executor must NOT touch findResumableRun on
       // its own — that decision lives at the caller.
       const resumedRun = makeRun({ id: 'prior-run', status: 'running' });
-      const priorCompletedNodes = new Map([['node-a', 'output from node-a']]);
+      const priorCompletedNodes = new Map([['node-a', { output: 'output from node-a' }]]);
 
       const findSpy = mock(async () => null);
       const store = makeStore({ findResumableRun: findSpy });
@@ -358,7 +543,7 @@ describe('executeWorkflow preamble', () => {
         '/tmp',
         makeWorkflow(),
         'User message',
-        'db-conv-id',
+        { conversationId: 'db-conv-id' },
         { preCreatedRun: resumedRun, priorCompletedNodes }
       );
 
@@ -376,7 +561,7 @@ describe('executeWorkflow preamble', () => {
 
     it('sends interactive-loop notification when priorCompletedNodes is empty (paused approval gate)', async () => {
       const resumedRun = makeRun({ id: 'paused-loop-run', status: 'running' });
-      const priorCompletedNodes = new Map<string, string>();
+      const priorCompletedNodes = new Map<string, { output: string }>();
 
       const store = makeStore();
       const deps = makeDeps(store);
@@ -389,7 +574,7 @@ describe('executeWorkflow preamble', () => {
         '/tmp',
         makeWorkflow(),
         'User message',
-        'db-conv-id',
+        { conversationId: 'db-conv-id' },
         { preCreatedRun: resumedRun, priorCompletedNodes }
       );
 
@@ -403,15 +588,9 @@ describe('executeWorkflow preamble', () => {
       const deps = makeDeps(store);
       const platform = makePlatform();
 
-      await executeWorkflow(
-        deps,
-        platform,
-        'conv-123',
-        '/tmp',
-        makeWorkflow(),
-        'User message',
-        'db-conv-id'
-      );
+      await executeWorkflow(deps, platform, 'conv-123', '/tmp', makeWorkflow(), 'User message', {
+        conversationId: 'db-conv-id',
+      });
 
       // Fresh runs must not trigger the resume copy.
       const resumeMsg = findMessage(platform, 'Resuming');

@@ -51,6 +51,18 @@ export interface IDatabase {
 }
 
 /**
+ * The Postgres `NOTIFY` channel carrying one workflow-event insert, payload = the
+ * bare `workflow_run_id`. Named once here because it is a wire value with a producer
+ * (the trigger in `postgres.ts`) and several consumers, and a hand-copied literal in
+ * each is how they drift.
+ *
+ * The name is a misnomer — it carries every workflow event, not only dashboard ones —
+ * and is deliberately NOT renamed: an older binary sharing the same database listens
+ * on this exact string, so a rename would need a dual-notify transition for nothing.
+ */
+export const WORKFLOW_EVENT_NOTIFY_CHANNEL = 'archon_dashboard_event';
+
+/**
  * Optional capability for databases that support push notifications
  * (Postgres `LISTEN/NOTIFY`). Kept as a NARROW interface separate from
  * `IDatabase` — only the Postgres adapter implements it; SQLite has no
@@ -86,19 +98,12 @@ export interface SqlDialect {
   now(): string;
 
   /**
-   * SQL expression for JSON merge (existing || new)
+   * SQL expression for a top-level JSON merge (existing || new). A null value in the
+   * patch removes that key on every dialect, so `{ key: null }` is how a caller clears it.
    * @param column - Column name
    * @param paramIndex - Parameter placeholder index
    */
   jsonMerge(column: string, paramIndex: number): string;
-
-  /**
-   * SQL expression to check if JSON array contains value
-   * @param column - Column name containing JSON
-   * @param path - JSON path to array (e.g., 'related_issues')
-   * @param paramIndex - Parameter placeholder index for value
-   */
-  jsonArrayContains(column: string, path: string, paramIndex: number): string;
 
   /**
    * SQL expression for interval subtraction from now
@@ -111,4 +116,32 @@ export interface SqlDialect {
    * @param column - Timestamp column name
    */
   daysSince(column: string): string;
+
+  /**
+   * SQL expression reading the JSON value at a dotted key path (`approval.nodeId`).
+   * A JSON string reads as its unquoted text on both dialects, and a JSON null or an
+   * absent key reads as SQL NULL. Postgres returns every scalar as text; SQLite
+   * returns numbers and booleans as SQL numbers.
+   * @param column - JSON column, optionally table-qualified (`r.metadata`)
+   * @param path - Dot-separated object keys
+   */
+  jsonText(column: string, path: string): string;
+
+  /**
+   * SQL expression for a JSON object with the given top-level keys removed.
+   * @param column - JSON object expression
+   * @param keys - Top-level keys to remove
+   */
+  jsonRemove(column: string, ...keys: string[]): string;
+
+  /**
+   * Suffix for a SELECT whose rows a later write in the same transaction depends on:
+   * ` FOR UPDATE` on Postgres (` FOR UPDATE OF <table>` when named), empty on SQLite.
+   * SQLite needs no row lock: the adapter serializes transactions on one connection,
+   * and a cross-process writer that commits between the read and the write fails the
+   * deferred transaction's read-to-write upgrade with SQLITE_BUSY, which the adapter
+   * answers by rerunning the whole transaction.
+   * @param table - Table or alias to lock when the SELECT joins others
+   */
+  rowLock(table?: string): string;
 }

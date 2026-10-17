@@ -35,17 +35,23 @@ let cachedCatalog: PiModelInfo[] | null = null;
 /**
  * List Pi's model catalog. Cached per process (the built-in catalog is a
  * static snapshot; models.json edits need a restart to show in the hint —
- * acceptable for a hint surface). Returns `[]` on any failure: this powers
+ * acceptable for a hint surface). Returns `[]` on non-cancellation failures: this powers
  * a UI hint, so degrading to "no hint" beats failing the settings page.
  */
-export async function listPiModels(): Promise<PiModelInfo[]> {
+export async function listPiModels(signal: AbortSignal): Promise<PiModelInfo[]> {
+  signal.throwIfAborted();
   if (cachedCatalog !== null) return cachedCatalog;
+  let next: PiModelInfo[] = [];
   try {
     ensurePiPackageDirShim();
     const piCodingAgent = await import('@earendil-works/pi-coding-agent');
-    const authStorage = piCodingAgent.AuthStorage.create();
-    const registry = piCodingAgent.ModelRegistry.create(authStorage);
-    cachedCatalog = registry.getAll().map(m => ({
+    // pi-coding-agent 0.84.0 replaced the AuthStorage/ModelRegistry pair with
+    // ModelRuntime. `getModels()` returns the same merged snapshot
+    // (built-in models.dev catalog + the user's ~/.pi/agent/models.json) that
+    // ModelRegistry.getAll() returned pre-0.84.
+    const modelRuntime = await piCodingAgent.ModelRuntime.create({ signal });
+    signal.throwIfAborted();
+    next = modelRuntime.getModels().map(m => ({
       ref: `${m.provider}/${m.id}`,
       provider: m.provider,
       id: m.id,
@@ -54,10 +60,12 @@ export async function listPiModels(): Promise<PiModelInfo[]> {
       cost: { input: m.cost.input, output: m.cost.output },
       contextWindow: m.contextWindow,
     }));
-    return cachedCatalog;
   } catch (err) {
+    signal.throwIfAborted();
     // Intentional fallback: the catalog is a hint, not a dependency.
     getLog().warn({ err: err as Error }, 'pi.model_catalog_list_failed');
     return [];
   }
+  cachedCatalog = next;
+  return cachedCatalog;
 }

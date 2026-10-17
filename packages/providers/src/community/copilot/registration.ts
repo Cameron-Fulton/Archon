@@ -1,6 +1,9 @@
+import { singleVendorCatalog } from '../../credential-catalog';
 import { isRegisteredProvider, registerProvider } from '../../registry';
+import { unownedProviderNotice } from '../deprecation';
 
 import { COPILOT_CAPABILITIES } from './capabilities';
+import { parseCopilotConfigStrict } from './config';
 import { CopilotProvider } from './provider';
 
 /**
@@ -20,15 +23,12 @@ export function registerCopilotProvider(): void {
     factory: () => new CopilotProvider(),
     capabilities: COPILOT_CAPABILITIES,
     builtIn: false,
-    credentials: {
-      kind: 'static',
-      specs: [
-        {
-          vendor: 'github-copilot',
-          displayName: 'GitHub Copilot',
-          kinds: ['api_key', 'subscription'],
-        },
-      ],
-    },
+    deprecationNotice: unownedProviderNotice('Copilot'),
+    parseConfig: parseCopilotConfigStrict,
+    credentials: singleVendorCatalog({
+      vendor: 'github-copilot',
+      displayName: 'GitHub Copilot',
+      kinds: ['api_key', 'subscription'],
+    }),
   });
 }

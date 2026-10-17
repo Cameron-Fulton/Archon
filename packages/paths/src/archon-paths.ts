@@ -6,14 +6,16 @@
  * ├── workspaces/<project>/              # Project-centric layout, where <project> is
  * │   │                                  #   <owner>/<repo>   registered repo with a remote
  * │   │                                  #   _local/<basename>  no-remote local git repo
- * │   │                                  #   _folder/<slug>     folder project (non-git)
+ * │   │                                  #   _folder/<slug>     folder project (runs in place)
  * │   │                                  #   _cwd/<basename>    unregistered working dir
  * │   ├── source/                        # Clone or symlink → local path (repo kinds only)
  * │   ├── worktrees/                     # Git worktrees for this project (repo kinds only)
  * │   ├── artifacts/runs/{workflow-id}/  # Workflow artifacts (NEVER in git)
  * │   ├── logs/{workflow-id}.jsonl       # Workflow execution logs
  * │   └── state/                         # $STATE_DIR — cross-run state, shared per project
+ * ├── temp/                              # Ephemeral scratch (per-simulation dry-run dirs)
  * ├── worktrees/                         # Legacy global worktrees (for repos not in workspaces/)
+ * ├── install.json                       # Last compiled CLI invoked
  * └── config.yaml                        # Global config
  *
  * `resolveProjectStorageKey` + `getProjectStoragePaths` are the single source of
@@ -22,7 +24,18 @@
  * For Docker: /.archon/
  */
 
-import { join, dirname, normalize, basename, sep } from 'path';
+import {
+  join,
+  dirname,
+  normalize,
+  basename,
+  resolve,
+  sep,
+  relative,
+  isAbsolute,
+  parse,
+} from 'path';
+import type { PlatformPath } from 'path';
 import { homedir } from 'os';
 import { access, mkdir, symlink, lstat, readdir, readlink, realpath, rm, stat } from 'fs/promises';
 import { readFileSync } from 'fs';
@@ -47,13 +60,50 @@ export function expandTilde(path: string): string {
 }
 
 /**
+ * Canonicalize a directory path into the single form stored in and looked up
+ * from `remote_agent_codebases.default_cwd`.
+ *
+ * Every writer and every reader of that column MUST resolve through this one
+ * function. The column is matched by exact string equality (and by a
+ * separator-anchored prefix), so two call sites using two different
+ * canonicalizers silently stop finding each other's rows. That is issue #2927:
+ * on Windows `fs/promises.realpath` expands an 8.3 short component
+ * (`C:\Users\RUNNER~1\…` → `C:\Users\runneradmin\…`) while `fs.realpathSync`
+ * does not, so a folder project registered by the CLI became invisible to every
+ * later command run in that same directory.
+ *
+ * `fs/promises.realpath` is the chosen implementation for two reasons. It is the
+ * only variant whose Windows short-name behaviour has actually been observed
+ * here (`fs.realpathSync.native` is believed equivalent but is unverified on
+ * Windows, so nothing depends on it). And expansion is what makes this a
+ * canonicalization at all: the long name is the one name a directory has, so
+ * the non-expanding variant would leave two spellings of one directory able to
+ * register two rows.
+ *
+ * Fail-safe: a path that cannot be resolved (missing, unreadable parent, race)
+ * canonicalizes to its own absolute form rather than throwing, so a lookup still
+ * gets an answer to reject. Nothing is swallowed — callers that require the path
+ * to exist detect it immediately afterwards (`registerFolder` stats the result;
+ * a reader misses the lookup and reports an unregistered directory).
+ */
+export async function canonicalizeProjectPath(path: string): Promise<string> {
+  const absolute = resolve(expandTilde(path));
+  try {
+    return await realpath(absolute);
+  } catch (err) {
+    getLog().debug({ err, path: absolute }, 'paths.canonicalize_project_path_failed');
+    return absolute;
+  }
+}
+
+/**
  * Detect if running in Docker container
  */
-export function isDocker(): boolean {
+export function isDocker(env: NodeJS.ProcessEnv = process.env): boolean {
   return (
-    process.env.WORKSPACE_PATH === '/workspace' ||
-    (process.env.HOME === '/root' && Boolean(process.env.WORKSPACE_PATH)) ||
-    process.env.ARCHON_DOCKER === 'true'
+    env.WORKSPACE_PATH === '/workspace' ||
+    (env.HOME === '/root' && Boolean(env.WORKSPACE_PATH)) ||
+    env.ARCHON_DOCKER === 'true'
   );
 }
 
@@ -103,12 +153,12 @@ export function getWSLDistroName(): string | undefined {
  * - Docker: /.archon
  * - Local: ~/.archon (or ARCHON_HOME env var)
  */
-export function getArchonHome(): string {
-  if (isDocker()) {
+export function getArchonHome(env: NodeJS.ProcessEnv = process.env): string {
+  if (isDocker(env)) {
     return '/.archon';
   }
 
-  const envHome = process.env.ARCHON_HOME;
+  const envHome = env.ARCHON_HOME;
   if (envHome) {
     if (envHome === 'undefined') {
       throw new Error(
@@ -128,6 +178,67 @@ export function getArchonHome(): string {
  */
 export function getArchonWorkspacesPath(): string {
   return join(getArchonHome(), 'workspaces');
+}
+
+type PathSemantics = Pick<
+  PlatformPath,
+  'resolve' | 'relative' | 'isAbsolute' | 'sep' | 'normalize' | 'parse'
+>;
+
+const hostPathSemantics: PathSemantics = { resolve, relative, isAbsolute, sep, normalize, parse };
+
+export interface PathInsideOptions {
+  /** Count `candidate` naming `root` itself as inside. Default: only descendants are inside. */
+  includeRoot?: boolean;
+  /**
+   * Compare the normalized spellings instead of resolved paths: no resolution
+   * against the process cwd (a relative path is never inside an absolute root)
+   * and exact case on every platform. Guards whose contract has always been a
+   * spelling comparison use this so moving onto the shared helper cannot make
+   * them admit a path they rejected before, such as a case variant on Windows
+   * that a case-sensitive directory would resolve somewhere else.
+   */
+  lexical?: boolean;
+  /** Defaults to this host; tests pass `path.win32` or `path.posix` to evaluate another platform. */
+  pathApi?: PathSemantics;
+}
+
+/**
+ * True when `candidate` is inside `root`, compared segment by segment so a
+ * sibling such as `workspaces-old` or a `.archon/workspaces` fragment under
+ * another root never matches.
+ *
+ * By default both paths are resolved, so on Windows either separator works and
+ * the comparison ignores case. See {@link PathInsideOptions.lexical} for the
+ * spelling comparison.
+ */
+export function isPathInside(
+  root: string,
+  candidate: string,
+  { includeRoot = false, lexical = false, pathApi = hostPathSemantics }: PathInsideOptions = {}
+): boolean {
+  if (lexical) {
+    const base = trimTrailingSep(pathApi.normalize(root), pathApi);
+    const target = trimTrailingSep(pathApi.normalize(candidate), pathApi);
+    if (target === base) return includeRoot;
+    return target.startsWith(base.endsWith(pathApi.sep) ? base : base + pathApi.sep);
+  }
+  const rel = pathApi.relative(pathApi.resolve(root), pathApi.resolve(candidate));
+  if (rel === '') return includeRoot;
+  return rel !== '..' && !rel.startsWith(`..${pathApi.sep}`) && !pathApi.isAbsolute(rel);
+}
+
+/** Drop one trailing separator (normalize has already collapsed repeats), keeping a filesystem root such as `/` or `C:\`. */
+function trimTrailingSep(p: string, pathApi: PathSemantics): string {
+  return p.endsWith(pathApi.sep) && p.length > pathApi.parse(p).root.length ? p.slice(0, -1) : p;
+}
+
+/**
+ * True when `candidate` is inside this host's Archon workspaces root, the tree
+ * Archon clones into and manages. The one answer to "is this path Archon-managed".
+ */
+export function isInsideArchonWorkspaces(candidate: string): boolean {
+  return isPathInside(getArchonWorkspacesPath(), candidate);
 }
 
 /**
@@ -150,10 +261,24 @@ export function getArchonWorktreesPath(): string {
 }
 
 /**
+ * Get the ephemeral scratch area (~/.archon/temp/).
+ * Contents are per-process throwaway — each consumer creates a uniquely named
+ * subdirectory and removes it when done (currently: dry-run simulations).
+ */
+export function getArchonTempPath(): string {
+  return join(getArchonHome(), 'temp');
+}
+
+/**
  * Get the global config file path
  */
-export function getArchonConfigPath(): string {
-  return join(getArchonHome(), 'config.yaml');
+export function getArchonConfigPath(archonHome: string = getArchonHome()): string {
+  return join(archonHome, 'config.yaml');
+}
+
+/** Path to the compiled CLI discovery manifest (`<ARCHON_HOME>/install.json`). */
+export function getInstallManifestPath(): string {
+  return join(getArchonHome(), 'install.json');
 }
 
 /** Path where the auto-provisioned encryption key is stored (~/.archon/credential-key). */
@@ -208,8 +333,8 @@ export function getLegacyHomeWorkflowsPath(): string {
  * Get the home-scope archon env file path (~/.archon/.env).
  * This is the archon-owned env location loaded by every entry point.
  */
-export function getArchonEnvPath(): string {
-  return join(getArchonHome(), '.env');
+export function getArchonEnvPath(env: NodeJS.ProcessEnv = process.env): string {
+  return join(getArchonHome(env), '.env');
 }
 
 /**
@@ -229,21 +354,16 @@ export function getRepoArchonEnvPath(cwd: string): string {
  * Returns folders in priority order (first match wins)
  *
  * Order:
- * 1. .archon/commands (always - user's custom commands)
- * 2. .archon/commands/defaults (bundled default commands)
- * 3. configuredFolder (if specified in config)
+ * 1. .archon/commands (always - user's custom commands, one subfolder deep)
+ * 2. configuredFolder (if specified in config)
  *
  * @param configuredFolder - Optional additional folder from config
  */
 export function getCommandFolderSearchPaths(configuredFolder?: string): string[] {
-  const paths = ['.archon/commands', '.archon/commands/defaults'];
+  const paths = ['.archon/commands'];
 
   // Add configured folder if specified (and not already in paths)
-  if (
-    configuredFolder &&
-    configuredFolder !== '.archon/commands' &&
-    configuredFolder !== '.archon/commands/defaults'
-  ) {
+  if (configuredFolder && configuredFolder !== '.archon/commands') {
     paths.push(configuredFolder);
   }
 
@@ -266,15 +386,34 @@ export function getWorkflowFolderSearchPaths(): string[] {
  * the number of folder boundaries between `rootPath` and the file — so at
  * `maxDepth: 1`, files at `rootPath/file.md` (depth 0) and `rootPath/group/file.md`
  * (depth 1) are included, but `rootPath/group/sub/file.md` (depth 2) is not.
- * Default is `Infinity` (no cap) for backwards compatibility with callers that
- * want to copy arbitrary subtrees (e.g. clone handlers).
+ * Default is `Infinity` (no cap). Command consumers use `findCommandFiles`
+ * to apply the executable-command depth and duplicate-selection policy.
+ *
+ * Results are in a defined order: siblings are visited in code-unit order by
+ * name, and a directory's own results appear where that directory sorts among
+ * its siblings. Callers may rely on the order being the same on every machine
+ * and on every call; they must not sort again to obtain it.
  */
 export async function findMarkdownFilesRecursive(
   rootPath: string,
   relativePath = '',
-  options?: { maxDepth?: number }
+  options?: { maxDepth?: number; onMissing?: (path: string, error: unknown) => void }
 ): Promise<{ commandName: string; relativePath: string }[]> {
   return findMarkdownFilesRecursiveImpl(rootPath, relativePath, options, new Set<string>());
+}
+
+/** Discover executable commands in one scope: one folder deep, first name wins. */
+export async function findCommandFiles(
+  rootPath: string,
+  onMissing?: (path: string, error: unknown) => void
+): ReturnType<typeof findMarkdownFilesRecursive> {
+  const entries = await findMarkdownFilesRecursive(rootPath, '', { maxDepth: 1, onMissing });
+  const seen = new Set<string>();
+  return entries.filter(({ commandName }) => {
+    if (seen.has(commandName)) return false;
+    seen.add(commandName);
+    return true;
+  });
 }
 
 function shouldSkipSymlinkTargetError(err: NodeJS.ErrnoException): boolean {
@@ -283,7 +422,8 @@ function shouldSkipSymlinkTargetError(err: NodeJS.ErrnoException): boolean {
 
 async function getEntryKind(
   entryPath: string,
-  entry: { isSymbolicLink(): boolean; isDirectory(): boolean; isFile(): boolean }
+  entry: { isSymbolicLink(): boolean; isDirectory(): boolean; isFile(): boolean },
+  onMissing?: (path: string, error: unknown) => void
 ): Promise<'directory' | 'file' | 'other' | null> {
   if (entry.isSymbolicLink()) {
     try {
@@ -293,6 +433,7 @@ async function getEntryKind(
       return 'other';
     } catch (e) {
       const err = e as NodeJS.ErrnoException;
+      if (err.code === 'ENOENT') onMissing?.(entryPath, e);
       if (shouldSkipSymlinkTargetError(err)) return null;
       throw err;
     }
@@ -303,11 +444,15 @@ async function getEntryKind(
   return 'other';
 }
 
-async function getReachableRealPath(path: string): Promise<string | null> {
+async function getReachableRealPath(
+  path: string,
+  onMissing?: (path: string, error: unknown) => void
+): Promise<string | null> {
   try {
     return await realpath(path);
   } catch (e) {
     const err = e as NodeJS.ErrnoException;
+    if (err.code === 'ENOENT') onMissing?.(path, e);
     if (shouldSkipSymlinkTargetError(err)) return null;
     throw err;
   }
@@ -316,7 +461,7 @@ async function getReachableRealPath(path: string): Promise<string | null> {
 async function findMarkdownFilesRecursiveImpl(
   rootPath: string,
   relativePath: string,
-  options: { maxDepth?: number } | undefined,
+  options: Parameters<typeof findMarkdownFilesRecursive>[2],
   visitedRealPaths: Set<string>
 ): Promise<{ commandName: string; relativePath: string }[]> {
   const maxDepth = options?.maxDepth ?? Infinity;
@@ -329,7 +474,10 @@ async function findMarkdownFilesRecursiveImpl(
       visitedRealPaths.add(await realpath(fullPath));
     } catch (e) {
       const err = e as NodeJS.ErrnoException;
-      if (err.code === 'ENOENT') return results;
+      if (err.code === 'ENOENT') {
+        options?.onMissing?.(fullPath, e);
+        return results;
+      }
       throw err;
     }
   }
@@ -339,9 +487,20 @@ async function findMarkdownFilesRecursiveImpl(
     entries = await readdir(fullPath, { withFileTypes: true });
   } catch (e) {
     const err = e as NodeJS.ErrnoException;
-    if (err.code === 'ENOENT') return results;
+    if (err.code === 'ENOENT') {
+      options?.onMissing?.(fullPath, e);
+      return results;
+    }
     throw err;
   }
+
+  // `readdir` returns entries in filesystem order, which differs between
+  // machines and can differ between calls on one machine. Every consumer of
+  // this walk inherits that order, and `GET /api/commands` renders it to an
+  // operator. Order is defined once here, at the only owner, rather than at
+  // each call site. The comparison is on code units, not `localeCompare`,
+  // so the result does not vary with the host locale.
+  entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 
   for (const entry of entries) {
     if (entry.name.startsWith('.') || entry.name === 'node_modules') {
@@ -349,7 +508,7 @@ async function findMarkdownFilesRecursiveImpl(
     }
 
     const entryPath = join(fullPath, entry.name);
-    const entryKind = await getEntryKind(entryPath, entry);
+    const entryKind = await getEntryKind(entryPath, entry, options?.onMissing);
     if (entryKind === null) continue;
 
     if (entryKind === 'directory') {
@@ -358,7 +517,7 @@ async function findMarkdownFilesRecursiveImpl(
       // folders support one level of grouping like `defaults/`).
       if (currentDepth >= maxDepth) continue;
 
-      const realChild = await getReachableRealPath(entryPath);
+      const realChild = await getReachableRealPath(entryPath, options?.onMissing);
       if (!realChild) continue;
       if (visitedRealPaths.has(realChild)) continue;
 
@@ -384,6 +543,17 @@ async function findMarkdownFilesRecursiveImpl(
 }
 
 /**
+ * Root of the checkout this build runs from.
+ *
+ * This file is at packages/paths/src/archon-paths.ts, so the repo root is three
+ * levels up from `import.meta.dir` (src → paths → packages → root). In Docker
+ * that is /app.
+ */
+function getSourceRepoRoot(): string {
+  return dirname(dirname(dirname(import.meta.dir)));
+}
+
+/**
  * Get the path to the app's base directory
  * This is where default commands/workflows are stored for copying to new repos
  *
@@ -391,25 +561,46 @@ async function findMarkdownFilesRecursiveImpl(
  * Locally: {repo_root}/.archon
  */
 export function getAppArchonBasePath(): string {
-  // This file is at packages/paths/src/archon-paths.ts
-  // Go up from src → paths → packages → repo root
-  // import.meta.dir = packages/paths/src
-  const repoRoot = dirname(dirname(dirname(import.meta.dir)));
-  return join(repoRoot, '.archon');
+  return join(getSourceRepoRoot(), '.archon');
 }
 
 /**
- * Get the path to the app's bundled default commands directory
+ * Where a source checkout keeps its built web UI: the output of
+ * `bun run build:web`. Owns that location for every consumer, so the CLI's
+ * pre-flight check and the server's default cannot drift apart.
+ *
+ * A compiled binary has no checkout to build in and caches a downloaded copy
+ * under `getWebDistDir(version)` instead.
  */
-export function getDefaultCommandsPath(): string {
-  return join(getAppArchonBasePath(), 'commands', 'defaults');
+export function getSourceWebDistDir(): string {
+  return join(getSourceRepoRoot(), 'packages', 'web', 'dist');
+}
+
+export function getSourceProviderEntry(id: string): string {
+  return join(
+    getSourceRepoRoot(),
+    'packages',
+    'providers',
+    'src',
+    ...(id === 'pi' ? ['community', 'pi'] : [id]),
+    'plugin.ts'
+  );
+}
+
+export function getSourceServerEntry(): string {
+  return join(getSourceRepoRoot(), 'packages', 'server', 'src', 'bin.ts');
+}
+
+export function getServerDistDir(version: string): string {
+  return join(getArchonHome(), 'server', version);
 }
 
 /**
- * Get the path to the app's bundled default workflows directory
+ * The bundled packs root in a source checkout. Every bundled pack, with its
+ * commands and scripts, lives in a folder beneath it.
  */
-export function getDefaultWorkflowsPath(): string {
-  return join(getAppArchonBasePath(), 'workflows', 'defaults');
+export function getBundledWorkflowsPath(): string {
+  return join(getAppArchonBasePath(), 'workflows');
 }
 
 /**
@@ -425,7 +616,14 @@ export function getWebDistDir(version: string): string {
 // =============================================================================
 
 /** Valid characters for owner/repo segments (GitHub-compatible, no path traversal) */
-const SAFE_NAME = /^[a-zA-Z0-9._-]+$/;
+const SAFE_NAME_CHARS = 'a-zA-Z0-9._-';
+const SAFE_NAME = new RegExp(`^[${SAFE_NAME_CHARS}]+$`);
+const UNSAFE_NAME_CHAR = new RegExp(`[^${SAFE_NAME_CHARS}]`, 'g');
+
+/** Replace each character {@link parseOwnerRepo} rejects in a segment with `-`. */
+export function toSafeNameSegment(value: string): string {
+  return value.replace(UNSAFE_NAME_CHAR, '-');
+}
 
 /**
  * Parse "owner/repo" from a codebase name string.
@@ -524,7 +722,7 @@ export function getRunArtifactsPath(owner: string, repo: string, workflowRunId: 
  * Returns: ~/.archon/workspaces/owner/repo/logs/{id}.jsonl
  */
 export function getRunLogPath(owner: string, repo: string, workflowRunId: string): string {
-  return join(getProjectLogsPath(owner, repo), `${workflowRunId}.jsonl`);
+  return getRunLogPathForRoot(getProjectRoot(owner, repo), workflowRunId);
 }
 
 /**
@@ -584,8 +782,8 @@ export type ProjectStorageKey =
   | { kind: 'cwd'; cwd: string };
 
 /**
- * The four output roots every project kind has. Composed from one project root
- * so the tree is identical no matter which key resolved it.
+ * The output roots every project kind has. Composed from one project root so
+ * the tree is identical no matter which key resolved it.
  */
 export interface ProjectStoragePaths {
   /** `~/.archon/workspaces/<...>/` — the project root all output hangs off. */
@@ -596,6 +794,15 @@ export interface ProjectStoragePaths {
   logsDir: string;
   /** `$STATE_DIR` — per-PROJECT cross-run state, shared by every workflow. */
   stateRoot: string;
+  /**
+   * Parent of the `runs/<run-id>/` layout holding each run's frozen workflow source.
+   *
+   * A sibling of `artifactsRoot`, deliberately not inside it: `$ARTIFACTS_DIR` is the
+   * run's output channel, handed to every node and listed for humans, and the frozen
+   * pack is neither an output nor something a node should be able to reach by that
+   * path.
+   */
+  workflowSourceRoot: string;
 }
 
 /**
@@ -643,14 +850,12 @@ export function resolveProjectStorageKey(
  * showed them. Relocating it is a breaking change accepted in #2200 so that
  * EVERY run's output is retrievable from one tree.
  *
- * COLLISIONS: distinct working directories sharing a basename share a project
- * root. For `artifacts/` and `logs/` that is benign — both are keyed by run id,
- * so the two projects' runs never touch the same file. `stateRoot` is NOT:
- * `$STATE_DIR` is per project by design and has no run-id segment, so two local
- * repos both called `api` share one `state/` and therefore one
- * `triage-state.json`. Register a colliding project with a distinct name, or
- * namespace inside `$STATE_DIR` (`$STATE_DIR/<something-unique>/`), if that
- * matters. Same caveat applies to `_folder` slug collisions.
+ * COLLISIONS: registration gives every registered project its own root (a new
+ * project whose root is taken registers under a suffixed name). The `'cwd'` key is
+ * not registered, so unregistered working directories sharing a basename share
+ * `_cwd/<basename>`. For `artifacts/` and `logs/` that is benign — both are keyed
+ * by run id. `stateRoot` is NOT: `$STATE_DIR` is per project by design and has no
+ * run-id segment, so those runs share one `state/` and every file in it.
  */
 export function getProjectStoragePaths(key: ProjectStorageKey): ProjectStoragePaths {
   let root: string;
@@ -679,12 +884,51 @@ export function getProjectStoragePaths(key: ProjectStorageKey): ProjectStoragePa
  * on it would let a relative or whitespace root scatter a run's artifacts AND
  * its shared state under whatever the server's cwd happens to be.
  *
- * Rejects relative paths implicitly — they cannot start with the absolute home.
+ * A lexical comparison: a relative path is never inside the absolute home, and
+ * case must match exactly even on Windows.
  */
 export function isInsideArchonHome(candidate: string): boolean {
-  const home = normalize(getArchonHome());
-  const normalised = normalize(candidate);
-  return normalised === home || normalised.startsWith(home + sep);
+  return isPathInside(getArchonHome(), candidate, { includeRoot: true, lexical: true });
+}
+
+/**
+ * Resolve the durable project root for a persisted run.
+ *
+ * A trusted persisted root preserves the run's original project identity. An
+ * out-of-tree root is stale or corrupt, so readers re-derive the project under
+ * the current ARCHON_HOME when the run still has a codebase row.
+ */
+export function resolveRunStorageRoot(
+  run: { output_root?: string | null },
+  codebase: { kind?: string | null; name: string; default_cwd: string } | null | undefined
+): string | null {
+  if (run.output_root && isInsideArchonHome(run.output_root)) return run.output_root;
+  if (!codebase?.name) return null;
+  return getProjectStoragePaths(resolveProjectStorageKey(codebase, codebase.default_cwd)).root;
+}
+
+/**
+ * The project key a storage root is filed under: its path below the workspaces
+ * directory with `/` separators (`owner/repo`, `_folder/<slug>`, `_cwd/<name>`).
+ * Project-scoped state documents use it as their identity, so every surface that
+ * names a project derives it here. A root outside the workspaces directory has
+ * no key and throws rather than yielding a `..` path.
+ */
+export function projectKeyForStorageRoot(root: string): string {
+  const workspaces = getArchonWorkspacesPath();
+  if (!isPathInside(workspaces, root))
+    throw new Error(`Project storage root is not inside the workspaces directory: ${root}`);
+  return relative(resolve(workspaces), resolve(root)).split('\\').join('/');
+}
+
+/** {@link projectKeyForStorageRoot} for a codebase row, or for an unregistered `cwd`. */
+export function projectKeyForCodebase(
+  codebase: { kind?: string | null; name: string; default_cwd: string } | null | undefined,
+  cwd: string
+): string {
+  return projectKeyForStorageRoot(
+    getProjectStoragePaths(resolveProjectStorageKey(codebase, cwd)).root
+  );
 }
 
 /**
@@ -704,6 +948,7 @@ export function getStoragePathsForRoot(root: string): ProjectStoragePaths {
     artifactsRoot: join(root, 'artifacts'),
     logsDir: join(root, 'logs'),
     stateRoot: join(root, 'state'),
+    workflowSourceRoot: join(root, 'workflow-source'),
   };
 }
 
@@ -730,11 +975,49 @@ export function getRunArtifactsDirForRoot(root: string, workflowRunId: string): 
   return join(getStoragePathsForRoot(root).artifactsRoot, 'runs', workflowRunId);
 }
 
+/**
+ * The engine-private child of a run's artifacts directory.
+ *
+ * The executor keeps its own bookkeeping here — typed-artifact listings, node
+ * output spills — so a workflow's own files stay at the root of
+ * `$ARTIFACTS_DIR`. It is the single name shared by the WRITERS that put state
+ * under it and the READERS that list a run's artifacts for a person: a writer
+ * that chose its own name would land in a listing no reader excludes.
+ */
+export const RUN_ARTIFACTS_ENGINE_SUBDIR = '.archon';
+
+/**
+ * Whether an entry in a run's artifacts directory is the engine's own store,
+ * which every listing shown to a person (CLI `workflow get`, the console's
+ * artifacts route) leaves out. `parentRel` is the entry's parent directory
+ * relative to `$ARTIFACTS_DIR`, `''` at the root.
+ *
+ * Only the root child is engine-owned. Any other name, dot-prefixed or not and
+ * at any depth, was written by the workflow and is its output, so it is listed.
+ */
+export function isRunArtifactsEngineEntry(parentRel: string, name: string): boolean {
+  return parentRel === '' && name === RUN_ARTIFACTS_ENGINE_SUBDIR;
+}
+
+/** Get a run's JSONL transcript from an already-resolved project root. */
+export function getRunLogPathForRoot(root: string, workflowRunId: string): string {
+  return join(getStoragePathsForRoot(root).logsDir, `${workflowRunId}.jsonl`);
+}
+
+/**
+ * Get a run's frozen workflow source directory from an already-resolved project root:
+ * `<workflowSourceRoot>/runs/<id>`. The same `runs/<id>` shape as artifacts, keyed by
+ * the same run id, so one run's source and output are siblings under one project.
+ */
+export function getRunWorkflowSourceDirForRoot(root: string, workflowRunId: string): string {
+  return join(getStoragePathsForRoot(root).workflowSourceRoot, 'runs', workflowRunId);
+}
+
 // =============================================================================
 // Folder-project ("_folder") path functions
 // =============================================================================
 //
-// Folder projects (kind: 'folder') are non-git workspaces — a multi-repo root
+// Folder projects (kind: 'folder') run without Archon-managed git — a multi-repo root
 // or a plain ops folder. They run in place at their real directory, so there is
 // no `source/` symlink and no `worktrees/` directory. Their named artifact and
 // log storage lives under a `_folder` pseudo-owner, mirroring the `_local`
@@ -747,11 +1030,8 @@ export function getRunArtifactsDirForRoot(root: string, workflowRunId: string): 
  * {@link SAFE_NAME}. Falls back to `'folder'` when the name slugifies to empty
  * (e.g. a name that is entirely separators or unicode).
  *
- * Note: distinct display names can collide (e.g. "My App" and "my-app" both →
- * "my-app"). Run artifacts and logs stay separated by run-id subdirectories, so
- * a collision only co-mingles listing-level artifacts — but `state/` has no
- * run-id segment, so colliding projects genuinely SHARE their `$STATE_DIR`
- * files. Accepted for now — see plan Questionables.
+ * Distinct display names can slugify alike (e.g. "My App" and "my-app" both →
+ * "my-app"); registration suffixes a new project's name until its slug is free.
  */
 export function slugifyFolderName(name: string): string {
   const slug = name
@@ -803,21 +1083,15 @@ export async function ensureFolderProjectStructure(slug: string): Promise<void> 
   await Promise.all(dirs.map(dir => mkdir(dir, { recursive: true })));
 }
 
-/**
- * Resolve the project root path from a working directory path.
- * If the path is under ~/.archon/workspaces/owner/repo/..., returns the project root.
- * Returns null if the path is not under the workspaces directory.
- */
-export function resolveProjectRootFromCwd(cwd: string): string | null {
-  const workspacesPath = getArchonWorkspacesPath();
-  if (!cwd.startsWith(workspacesPath)) return null;
-
-  // Path after workspaces/: "owner/repo/..." or "owner/repo"
-  const relative = cwd.substring(workspacesPath.length + 1); // +1 for trailing slash
-  const parts = relative.split(/[/\\]/).filter(p => p.length > 0);
-  if (parts.length < 2) return null;
-
-  return join(workspacesPath, parts[0], parts[1]);
+/** A project's `source` path already holds something other than the requested checkout. */
+export class ProjectSourceOccupiedError extends Error {
+  constructor(
+    readonly sourcePath: string,
+    message: string
+  ) {
+    super(message);
+    this.name = 'ProjectSourceOccupiedError';
+  }
 }
 
 /**
@@ -825,14 +1099,25 @@ export function resolveProjectRootFromCwd(cwd: string): string | null {
  * Safe to call multiple times - uses recursive mkdir.
  */
 export async function ensureProjectStructure(owner: string, repo: string): Promise<void> {
+  const source = getProjectSourcePath(owner, repo);
   const dirs = [
-    getProjectSourcePath(owner, repo),
     getProjectWorktreesPath(owner, repo),
     getProjectArtifactsPath(owner, repo),
     getProjectLogsPath(owner, repo),
   ];
 
-  await Promise.all(dirs.map(dir => mkdir(dir, { recursive: true })));
+  await Promise.all([
+    mkdir(source, { recursive: true }).catch((error: unknown) => {
+      if (error instanceof Error && 'code' in error && error.code === 'EEXIST') {
+        throw new ProjectSourceOccupiedError(
+          source,
+          `Source path at ${source} is occupied by a file or broken link`
+        );
+      }
+      throw error;
+    }),
+    ...dirs.map(dir => mkdir(dir, { recursive: true })),
+  ]);
 }
 
 /**
@@ -847,33 +1132,33 @@ export async function createProjectSourceSymlink(
 ): Promise<void> {
   const linkPath = getProjectSourcePath(owner, repo);
 
-  try {
-    const stats = await lstat(linkPath);
-    if (stats.isSymbolicLink()) {
-      // Symlink already exists - check if it points to the right place
-      const existing = await readlink(linkPath);
-      if (normalize(existing) === normalize(targetPath)) {
-        return; // Already correct
-      }
-      throw new Error(
-        `Source symlink at ${linkPath} already points to ${existing}, expected ${targetPath}`
+  const stats = await lstat(linkPath).catch((error: unknown) => {
+    if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) throw error;
+    return null;
+  });
+  if (stats?.isSymbolicLink()) {
+    const existing = await readlink(linkPath);
+    if (normalize(existing) === normalize(targetPath)) return;
+    throw new ProjectSourceOccupiedError(
+      linkPath,
+      `Source symlink at ${linkPath} already points to ${existing}, expected ${targetPath}`
+    );
+  }
+  if (stats) {
+    if (!stats.isDirectory()) {
+      throw new ProjectSourceOccupiedError(
+        linkPath,
+        `Source path at ${linkPath} already contains a file; expected ${targetPath}`
       );
     }
-    if (stats.isDirectory()) {
-      // Check if it's a real clone (has contents) vs empty dir from ensureProjectStructure
-      const entries = await readdir(linkPath);
-      if (entries.length > 0) {
-        // Real directory with contents (e.g., from /clone) - don't overwrite
-        return;
-      }
-      // Empty directory from ensureProjectStructure - will be replaced with symlink below
+    const entries = await readdir(linkPath);
+    if (entries.length > 0) {
+      if ((await realpath(linkPath)) === (await realpath(targetPath))) return;
+      throw new ProjectSourceOccupiedError(
+        linkPath,
+        `Source directory at ${linkPath} already contains another checkout; expected ${targetPath}`
+      );
     }
-  } catch (error) {
-    const err = error as NodeJS.ErrnoException;
-    if (err.code !== 'ENOENT') {
-      throw error;
-    }
-    // ENOENT is expected - symlink doesn't exist yet
   }
 
   // Remove the empty directory created by ensureProjectStructure (force handles ENOENT)
@@ -894,22 +1179,14 @@ export function logArchonPaths(): void {
 }
 
 /**
- * Validate that app defaults paths exist and are accessible (for startup)
- * Logs verification status and warnings if paths don't exist
+ * Validate that the bundled packs root exists and is accessible (for startup).
+ * Every bundled pack, with its commands and scripts, lives under it.
  */
 export async function validateAppDefaultsPaths(): Promise<void> {
-  const commandsPath = getDefaultCommandsPath();
-  const workflowsPath = getDefaultWorkflowsPath();
-
-  const commandsOk = await checkPathAccessible(commandsPath, 'commands');
-  const workflowsOk = await checkPathAccessible(workflowsPath, 'workflows');
-
-  if (!commandsOk && !workflowsOk) {
-    getLog().warn('app_defaults_not_available');
-  } else if (commandsOk && workflowsOk) {
-    getLog().info({ commands: commandsPath, workflows: workflowsPath }, 'app_defaults_verified');
+  const workflowsPath = getBundledWorkflowsPath();
+  if (await checkPathAccessible(workflowsPath, 'workflows')) {
+    getLog().info({ workflows: workflowsPath }, 'app_defaults_verified');
   }
-  // Partial availability already logged warnings above for individual paths
 }
 
 /**

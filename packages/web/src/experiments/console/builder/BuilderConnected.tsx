@@ -4,7 +4,8 @@
  * loads a real workflow via the `loadWorkflow` skill verb, renders the
  * controlled `BuilderPage`, and persists edits through `saveWorkflow` with full
  * create / rename / delete. Bundled workflows open read-only and Save-as writes
- * a project override.
+ * a project override. An installed-pack workflow has no authored form to edit, so
+ * it gets a read-only notice instead of the editor.
  *
  * Nav guard: the app is a non-data `<BrowserRouter>`, so `useBlocker` is
  * unavailable. We use `beforeunload` (reload/close) plus a
@@ -32,7 +33,6 @@ import { useBuilderProject } from './connect/use-builder-project';
 import {
   blockingErrors,
   clientIssue,
-  errorDetail,
   errorToIssues,
   isReadOnlySource,
   isValidWorkflowName,
@@ -41,21 +41,27 @@ import {
   saveTargetFor,
   validationFailureToIssues,
 } from './connect/save-logic';
-import type { BuilderWorkflow, Issue, WireWorkflowDefinition } from './types';
+import type {
+  BuilderWorkflow,
+  BuilderWorkflowDefinition,
+  Issue,
+  WireWorkflowDefinition,
+} from './types';
 import {
   loadWorkflow,
   saveWorkflow,
   deleteWorkflow,
   validateWorkflow,
   listWorkflows,
-  type LoadedWorkflow,
-  type WorkflowSource,
+  isInstalledPackWorkflow,
+  type WorkflowLoad,
 } from '../skills/workflows';
 import { listProjects, type WorkflowListResult } from '../skills';
 import { useEntity, invalidate } from '../store/cache';
 import { K } from '../store/keys';
-import { HttpError } from '../lib/http';
+import { HttpError, errorDetail } from '../lib/http';
 import type { Project } from '../primitives/project';
+import type { Workflow } from '../primitives/workflow';
 
 /** Router navigation state carried into the connected route. */
 interface BuilderNavState {
@@ -118,33 +124,40 @@ export function BuilderConnected(): ReactElement {
   const idle = name === undefined || cwd === undefined || isCreateMode;
   const loadKey =
     idle || cwd === undefined || name === undefined ? 'builder:idle' : K.workflow(cwd, name);
-  const loadView = useEntity<LoadedWorkflow | null>(loadKey, () =>
+  const loadView = useEntity<WorkflowLoad | null>(loadKey, () =>
     idle || cwd === undefined || name === undefined
-      ? Promise.resolve<LoadedWorkflow | null>(null)
+      ? Promise.resolve<WorkflowLoad | null>(null)
       : loadWorkflow(name, cwd)
   );
+  const loaded = loadView.data ?? null;
+  const installedPack = loaded !== null && isInstalledPackWorkflow(loaded);
+  const loadedDefinition = loaded !== null && !isInstalledPackWorkflow(loaded) ? loaded : null;
 
   // Resolve the workflow under edit (seed in create mode, else the server load).
   // Memoized on stable inputs (location-state seed, cache object) so it does NOT
   // produce a fresh identity every render — that would thrash the reset effect.
-  const loadedSource: WorkflowSource = isCreateMode
+  // Widened to `Workflow['source']` (#2578) so an unrecognised wire value passes
+  // through to `effectiveSource` (and the downstream `isReadOnlySource` /
+  // `saveTargetFor` helpers) without a cast at this seam.
+  const loadedSource: Workflow['source'] = isCreateMode
     ? 'project'
-    : (loadView.data?.source ?? 'project');
+    : (loadedDefinition?.source ?? 'project');
 
   const imported = useMemo<{ workflow: BuilderWorkflow; issues: Issue[] } | null>(() => {
     if (isCreateMode && createSeed !== undefined) return { workflow: createSeed, issues: [] };
-    if (loadView.data?.definition !== undefined) {
-      return fromWorkflowDefinition(loadView.data.definition);
-    }
+    if (loadedDefinition !== null) return fromWorkflowDefinition(loadedDefinition.definition);
     return null;
-  }, [isCreateMode, createSeed, loadView.data]);
+  }, [isCreateMode, createSeed, loadedDefinition]);
 
   // Editing state — reset whenever the imported workflow changes (workflow switch).
   const [currentWorkflow, setCurrentWorkflow] = useState<BuilderWorkflow | null>(null);
   const [dirty, setDirty] = useState(false);
   const [serverIssues, setServerIssues] = useState<Issue[]>([]);
   // Source can flip after a bundled Save-as (bundled → project override).
-  const [sourceOverride, setSourceOverride] = useState<WorkflowSource | null>(null);
+  // Widened to `Workflow['source']` (#2578) to match `loadedSource` /
+  // `LoadedWorkflow.source` — `saveWorkflow` returns whatever the server put on
+  // the response, which is `Workflow['source']`-typed.
+  const [sourceOverride, setSourceOverride] = useState<Workflow['source'] | null>(null);
   const [busy, setBusy] = useState(false);
 
   const effectiveSource = sourceOverride ?? loadedSource;
@@ -215,7 +228,7 @@ export function BuilderConnected(): ReactElement {
   const doSave = useCallback(async (): Promise<void> => {
     if (currentWorkflow === null || cwd === undefined || name === undefined) return;
     // Force the in-YAML name to match the route name so filename and `name:` stay in sync.
-    const definition: WireWorkflowDefinition = { ...toWorkflowDefinition(currentWorkflow), name };
+    const draft: BuilderWorkflowDefinition = { ...toWorkflowDefinition(currentWorkflow), name };
 
     const blocking = blockingErrors(runValidation(currentWorkflow));
     if (blocking.length > 0) {
@@ -230,11 +243,13 @@ export function BuilderConnected(): ReactElement {
 
     setBusy(true);
     try {
-      const validation = await validateWorkflow(definition);
+      const validation = await validateWorkflow(draft);
       if (!validation.valid) {
         setServerIssues(validationFailureToIssues(validation.errors));
         return;
       }
+      // The server validated this exact draft against the workflow wire schema.
+      const definition = draft as WireWorkflowDefinition;
       const saved = await saveWorkflow(name, definition, {
         cwd,
         source: saveTargetFor(effectiveSource),
@@ -290,15 +305,17 @@ export function BuilderConnected(): ReactElement {
 
     setBusy(true);
     try {
-      const definition: WireWorkflowDefinition = {
+      const draft: BuilderWorkflowDefinition = {
         ...toWorkflowDefinition(currentWorkflow),
         name: to,
       };
-      const validation = await validateWorkflow(definition);
+      const validation = await validateWorkflow(draft);
       if (!validation.valid) {
         setServerIssues(validationFailureToIssues(validation.errors));
         return;
       }
+      // The server validated this exact draft against the workflow wire schema.
+      const definition = draft as WireWorkflowDefinition;
       // New-then-old: the new file is authoritative even if the old delete fails.
       await saveWorkflow(to, definition, { cwd, source: saveTargetFor(effectiveSource) });
       let notices: Issue[] = [];
@@ -590,6 +607,17 @@ export function BuilderConnected(): ReactElement {
               start editing, or create a new one.
             </EmptyState>
           )
+        ) : installedPack ? (
+          <EmptyState>
+            <p>
+              <span className="font-mono">{name}</span> is installed from a pack — read-only.
+            </p>
+            <p className="mt-2">
+              The builder cannot edit it. Update the pack with{' '}
+              <span className="font-mono">archon plugin update</span>, or make an editable project
+              copy with <span className="font-mono">archon plugin copy</span>.
+            </p>
+          </EmptyState>
         ) : imported !== null && currentWorkflow !== null ? (
           <BuilderPage
             key={editorKey}

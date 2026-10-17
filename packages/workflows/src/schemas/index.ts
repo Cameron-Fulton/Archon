@@ -5,7 +5,7 @@
  * Types are derived from schemas via `z.infer<typeof Schema>` (WorkflowDefinition
  * uses `Omit<z.infer<...>, 'nodes'>` because node parsing happens per-node in loader.ts).
  *
- * Import `z` from `@hono/zod-openapi` in all schema files (project convention).
+ * Import `z` from plain `zod`; name OpenAPI components with `.meta({ id })`.
  */
 
 // Retry configuration
@@ -25,50 +25,130 @@ export {
 } from './hooks';
 export type { WorkflowHookEvent, WorkflowHookMatcher, WorkflowNodeHooks } from './hooks';
 
+export { effortLevelSchema, EFFORT_LEVELS } from './effort';
+export type { EffortLevel } from './effort';
+
+// Model binding profiles and durable run metadata
+export {
+  TIER_NAMES,
+  tierNameSchema,
+  modelAliasPresetSchema,
+  rawAliasesConfigSchema,
+  runAliasesConfigSchema,
+  rawTiersConfigSchema,
+  resolvedRunModelOverridesSchema,
+  resolvedAiProfileSchema,
+  runModelBindingsMetadataSchema,
+} from './model-binding';
+export type {
+  TierName,
+  ModelAliasPreset,
+  RawAliasEntry,
+  RawAliasesConfig,
+  RawTiersConfig,
+  ResolvedRunModelOverrides,
+  ResolvedAiProfile,
+  RunModelBindingsMetadata,
+} from './model-binding';
+
+// Sparse, durable configuration for one workflow invocation
+export {
+  workflowRunContinuationConfigSchema,
+  workflowRunConfigLayerSchema,
+  workflowRunConfigSourceSchema,
+  workflowRunConfigInputSchema,
+  workflowRunConfigMetadataSchema,
+} from './run-config';
+
+export {
+  preparedWorkflowLaunchSchema,
+  resourceStartIntentSchema,
+  resourceStartDispositionSchema,
+  sourceReceiptInputSchema,
+  resourceStartBindingIntentSchema,
+} from './resource-start';
+export type {
+  PreparedWorkflowLaunch,
+  ResourceStartIntent,
+  ResourceStartDisposition,
+  SourceReceiptInput,
+  ResourceStartBindingIntent,
+} from './resource-start';
+export type {
+  WorkflowRunConfigLayer,
+  WorkflowRunConfigSource,
+  WorkflowRunConfigInput,
+  WorkflowRunConfigMetadata,
+} from './run-config';
+
 // DAG node types
 export {
   triggerRuleSchema,
   TRIGGER_RULES,
   dagNodeBaseSchema,
-  commandNodeSchema,
-  promptNodeSchema,
-  bashNodeSchema,
+  nodeContextSchema,
+  nodeMcpSchema,
+  mcpDeclaration,
+  promptSourceSchema,
+  agentNodeSchema,
+  execNodeSchema,
   loopNodeSchema,
   loopGroupNodeSchema,
   loopGroupNodeConfigSchema,
-  approvalNodeSchema,
+  decisionOptionSchema,
+  gateNodeSchema,
   approvalOnRejectSchema,
-  cancelNodeSchema,
-  scriptNodeSchema,
-  includeNodeSchema,
+  haltNodeSchema,
+  MAX_DURABLE_WAIT_MS,
+  waitConfigSchema,
+  waitUntilTimestampSchema,
+  waitNodeSchema,
+  waitCondition,
+  workflowWaitResultSchema,
+  WAIT_NODE_OUTPUT_FORMAT,
+  includeDirectiveSchema,
   workflowNodeSchema,
   fanOutConfigSchema,
+  composeFanOutConfigSchema,
+  composeFanOutNodeSchema,
   dagNodeSchema,
   INPUT_NAME_SOURCE,
   inputEnvKey,
-  isCommandNode,
-  isBashNode,
+  bindingDirectiveSchema,
+  isBindingDirective,
+  isAgentNode,
+  isExecNode,
+  isGateNode,
+  isHaltNode,
+  isWaitNode,
   isLoopNode,
   isLoopGroupNode,
-  isApprovalNode,
-  isCancelNode,
-  isScriptNode,
-  isIncludeNode,
+  definedOutputPaths,
+  loopGroupOutputNodes,
+  loopGroupSoleTerminalSink,
   isWorkflowNode,
+  isComposeFanOutNode,
+  isIncludeDirective,
+  ignoredFieldsForNode,
+  isOutputFormatEnforced,
   isPersistableNode,
+  nodeUsesPersistedScope,
+  runMayPersistSessions,
+  persistedSessionHandling,
+  isNodeContextResume,
   isTriggerRule,
   BASH_NODE_AI_FIELDS,
   SCRIPT_NODE_AI_FIELDS,
   LOOP_NODE_AI_FIELDS,
   LOOP_GROUP_NODE_AI_FIELDS,
   INCLUDE_NODE_IGNORED_FIELDS,
+  WAIT_NODE_IGNORED_FIELDS,
   WORKFLOW_NODE_IGNORED_FIELDS,
+  GATE_AND_HALT_IGNORED_FIELDS,
   KNOWN_DAG_NODE_KEYS,
   KNOWN_NODE_NESTED_KEYS,
   approvalConfigSchema,
   dagNodeFlatSchema,
-  effortLevelSchema,
-  thinkingConfigSchema,
   sandboxSettingsSchema,
   agentDefinitionSchema,
   piNodeConfigSchema,
@@ -76,22 +156,29 @@ export {
 export type {
   TriggerRule,
   DagNodeBase,
-  CommandNode,
-  PromptNode,
-  BashNode,
+  NodeContext,
+  NodeMcp,
+  McpDeclaration,
+  BindingDirective,
+  PromptSource,
+  AgentNode,
+  ExecNode,
   LoopNode,
   LoopGroupNode,
   LoopGroupNodeConfig,
-  ApprovalNode,
+  DecisionOption,
+  GateNode,
   ApprovalOnReject,
-  CancelNode,
-  ScriptNode,
-  IncludeNode,
+  HaltNode,
+  WaitConfig,
+  WaitNode,
+  WaitCondition,
+  WorkflowWaitResult,
+  IncludeDirective,
   WorkflowNode,
+  ComposeFanOutNode,
   FanOutConfig,
   DagNode,
-  EffortLevel,
-  ThinkingConfig,
   SandboxSettings,
   AgentDefinition,
   PiNodeConfig,
@@ -104,6 +191,7 @@ export {
   webSearchModeSchema,
   workflowRequirementSchema,
   workflowEvidencePolicySchema,
+  workflowRunBudgetSchema,
   workflowInputSpecSchema,
   workflowBaseSchema,
   workflowDefinitionSchema,
@@ -116,6 +204,7 @@ export type {
   WebSearchMode,
   WorkflowRequirement,
   WorkflowEvidencePolicy,
+  WorkflowRunBudget,
   WorkflowInputSpec,
   WorkflowBase,
   WorkflowDefinition,
@@ -124,46 +213,125 @@ export type {
 // Workflow run state
 export {
   workflowRunStatusSchema,
+  workflowRunOutcomeSchema,
+  workflowWaitContextSchema,
+  sessionCursorSchema,
+  bodySessionCursorsSchema,
+  bodySessionCursorAncestrySchema,
+  type BodySessionCursorAncestry,
+  scheduledWorkflowResumeSchema,
   workflowStepStatusSchema,
   nodeStateSchema,
+  skipCauseSchema,
+  nodeSkipReasonSchema,
   nodeOutputSchema,
   workflowRunSchema,
   artifactTypeSchema,
   TERMINAL_WORKFLOW_STATUSES,
   RESUMABLE_WORKFLOW_STATUSES,
   isApprovalContext,
+  isGateResolved,
+  isTerminalRunStatus,
+  runAttention,
+  isWorkflowWaitContext,
+  pendingWorkflowWaitDeadline,
+  pausedUsageLimitWait,
+  workflowWaitStepName,
+  isScheduledWorkflowResume,
+  readSourceRelease,
   isRunBlockedOnChild,
+  isFanOutBlockReleased,
+  suspendReasonSchema,
+  isRecognizedSuspendReason,
+  reRunsOwnNodeOnResume,
   SUBRUN_METADATA_KEYS,
   readSubrunMetadata,
+  RUN_METADATA_KEYS,
+  readIdentityUnresolved,
+  WORKFLOW_SOURCE_METADATA_KEY,
+  workflowSourceConfigSchema,
+  workflowSourceMetadataSchema,
+  readWorkflowSourceState,
+  CONTINUATION_METADATA_KEY,
+  readContinuationMode,
+  EXECUTION_OWNER_METADATA_KEY,
+  readExecutionOwner,
+  RUN_DISPATCH_METADATA_KEY,
+  runDispatchMetadataSchema,
+  readRunDispatchMetadata,
 } from './workflow-run';
 export type {
   WorkflowRunStatus,
+  WorkflowRunOutcome,
   WorkflowStepStatus,
   NodeState,
+  SkipCause,
+  NodeSkipReason,
   NodeOutput,
   WorkflowRun,
   ArtifactType,
   ApprovalContext,
+  WorkflowAttentionWaitContext,
+  WorkflowDeadlineWaitContext,
+  WorkflowUsageLimitWaitContext,
+  WorkflowWaitContext,
+  ScheduledWorkflowResume,
+  SuspendReason,
+  RunTerminalStatus,
+  RunAttention,
+  RunAttentionInput,
+  RunAttentionUnreadableReason,
+  GateAddress,
   LoopGateRunMetadata,
+  WorkflowSourceMetadata,
+  WorkflowSourceConfig,
+  WorkflowSourceState,
+  ContinuationMode,
+  ExecutionOwnerRecord,
+  RunDispatchMetadata,
 } from './workflow-run';
 
 // Per-node persisted provider sessions
-export { workflowNodeSessionSchema } from './workflow-node-session';
+export { workflowNodeSessionSchema, persistScopeKey } from './workflow-node-session';
 export type { WorkflowNodeSession } from './workflow-node-session';
 
+// Private provider session handles scoped to one workflow run
+export { workflowRunNodeSessionSchema } from './workflow-run-node-session';
+export type { WorkflowRunNodeSession } from './workflow-run-node-session';
+
 // Node typed-output artifacts (output_type metadata)
-export { nodeArtifactSchema } from './node-artifact';
-export type { NodeArtifact } from './node-artifact';
+export { nodeArtifactSchema, nodeArtifactLoopFrameSchema } from './node-artifact';
+export type { NodeArtifact, NodeArtifactLoopFrame } from './node-artifact';
 
 // Result types (non-schema hand-written types)
 export type {
   LoadCommandResult,
   WorkflowExecutionResult,
   WorkflowLoadError,
+  ParsedWorkflowLoadError,
   WorkflowLoadResult,
+  GraphPlan,
+  ResolvedWorkflow,
   WorkflowSource,
   WorkflowWithSource,
+  DeclaredWorkflowConfig,
 } from './workflow';
 
 // DagWorkflow — alias kept for backward compatibility
 export type { WorkflowDefinition as DagWorkflow } from './workflow';
+
+export * from './workflow-run-listing';
+
+export { workflowRunOriginSchema } from './workflow-run';
+export type { WorkflowRunOrigin } from './workflow-run';
+
+export * from './workflow-event';
+
+export {
+  TOOL_CALL_ATTENTION_METADATA_KEY,
+  toolCallAttentionSchema,
+  toolCallAttentionArraySchema,
+  type ToolCallAttention,
+} from './workflow-run';
+
+export type { SessionCursor } from './workflow-run';

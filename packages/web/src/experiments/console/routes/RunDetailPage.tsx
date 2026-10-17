@@ -10,7 +10,7 @@ import {
 import { useNavigate, useParams } from 'react-router';
 import { useKeymap, type Binding } from '../lib/keymap';
 import { RunDetailHeader } from '../components/RunDetailHeader';
-import { RunStream } from '../components/RunStream';
+import { RunStream, runToolCalls } from '../components/RunStream';
 import { RunActionBar } from '../components/RunActionBar';
 import { StreamToolbar, type DetailView } from '../components/StreamToolbar';
 import { ApprovalContext } from '../components/ApprovalContext';
@@ -20,19 +20,17 @@ import { ArtifactPanel } from '../components/ArtifactPanel';
 import { RunStartedLine, RunFinishedLine } from '../components/RunLifecycle';
 import { StreamContextProvider } from '../lib/stream-context';
 import { useRunStreamSSE } from '../lib/sse';
+import { providerEventStore, useRunProviderEvents } from '../lib/provider-events';
 import { useEntity, invalidate } from '../store/cache';
 import { K } from '../store/keys';
 import * as skill from '../skills';
-import { runMessageConversationId, type Run } from '../primitives/run';
-import { foldNodeRuns, type RunEvent } from '../primitives/event';
+import { runMessageConversationId } from '../primitives/run';
+import { foldNodeRuns } from '../primitives/event';
 import type { Message } from '../primitives/message';
 import type { Project } from '../primitives/project';
 import type { ArtifactFile } from '../skills/runs';
 
-interface RunDetailView {
-  run: Run;
-  events: RunEvent[];
-}
+type RunDetailView = Awaited<ReturnType<typeof skill.getRun>>;
 
 /**
  * Run detail — the "logs" page, promoted out of a hidden tab.
@@ -55,6 +53,8 @@ const TOGGLE_KEYS = {
   view: 'archon.console.detailView',
   node: 'archon.console.runNodeFilter',
 } as const;
+
+const NEAR_BOTTOM_PX = 120;
 
 function readToggle(key: string, defaultOn: boolean): boolean {
   try {
@@ -108,7 +108,7 @@ function writeNodeFilter(v: string): void {
 }
 
 export function RunDetailPage(): ReactElement {
-  const { projectId, runId } = useParams<{ projectId: string; runId: string }>();
+  const { runId } = useParams<{ projectId: string; runId: string }>();
   const navigate = useNavigate();
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const [showToolCalls, setShowToolCalls] = useState<boolean>(() =>
@@ -121,25 +121,40 @@ export function RunDetailPage(): ReactElement {
   const [selectedNodeId, setSelectedNodeId] = useState<string>(() => readNodeFilter());
 
   // Hoisted above any early returns so the hook order stays stable.
-  const scrollToNode = useCallback((nodeId: string): void => {
-    const el = document.getElementById(`node-transition-${nodeId}`);
-    if (el !== null) {
-      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    }
+  const scrollToNode = useCallback((nodeId: string): boolean => {
+    const scroller = scrollRef.current;
+    const target = document.getElementById(`node-transition-${nodeId}`);
+    if (scroller === null || target === null) return false;
+
+    const scrollerRect = scroller.getBoundingClientRect();
+    const targetRect = target.getBoundingClientRect();
+    const centeredTop =
+      scroller.scrollTop +
+      targetRect.top +
+      targetRect.height / 2 -
+      (scrollerRect.top + scroller.clientHeight / 2);
+    const destination = Math.min(
+      scroller.scrollHeight - scroller.clientHeight,
+      Math.max(0, centeredTop)
+    );
+    const willMove = Math.abs(destination - scroller.scrollTop) > 1;
+
+    target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    return willMove;
   }, []);
 
   // `Project | null` / `RunDetailView | null` rather than the `as unknown as T`
   // casts the original sentinel used — keeps the null path honest for
   // downstream readers (they can guard explicitly instead of meeting a
   // mis-typed value).
-  const { data: project } = useEntity<Project | null>(
-    projectId !== undefined ? K.project(projectId) : 'noop:no-project-id',
-    () => (projectId !== undefined ? skill.getProject(projectId) : Promise.resolve(null))
-  );
-
   const { data: detail, error: detailError } = useEntity<RunDetailView | null>(
     runId !== undefined ? K.run(runId) : 'noop:no-run-id',
     () => (runId !== undefined ? skill.getRun(runId) : Promise.resolve(null))
+  );
+  const projectId = detail?.run.projectId ?? undefined;
+  const { data: project, error: projectError } = useEntity<Project | null>(
+    projectId !== undefined ? K.project(projectId) : 'noop:no-project-id',
+    () => (projectId !== undefined ? skill.getProject(projectId) : Promise.resolve(null))
   );
 
   // Messages are tied to the run's conversation — and the /messages endpoint
@@ -179,6 +194,7 @@ export function RunDetailPage(): ReactElement {
       if (conversationPlatformId !== null) {
         invalidate(K.messages(conversationPlatformId));
       }
+      providerEventStore.catchUp(runId);
     }, 30000);
     return (): void => {
       clearInterval(id);
@@ -197,9 +213,21 @@ export function RunDetailPage(): ReactElement {
   // Distinct nodes drive the node-filter dropdown — derived from the same fold
   // the stream renders, so the options match the dividers exactly.
   const nodeOptions = useMemo(
-    () => foldNodeRuns(detail?.events ?? []).map(r => ({ id: r.nodeId, name: r.nodeName })),
-    [detail?.events]
+    () =>
+      foldNodeRuns(detail?.events ?? [], detail?.nodes ?? []).map(r => ({
+        id: r.nodeId,
+        name: r.nodeName,
+      })),
+    [detail?.events, detail?.nodes]
   );
+
+  // Each node's provider events load once, when the node first appears; live frames
+  // are appended after that (lib/provider-events.ts).
+  const providerEvents = useRunProviderEvents(runId ?? null);
+  useEffect(() => {
+    if (runId === undefined) return;
+    for (const node of nodeOptions) providerEventStore.load(runId, node.id);
+  }, [runId, nodeOptions]);
 
   // Drop a persisted node selection that doesn't apply to this run (e.g. after
   // navigating to a different workflow). Guarded on the run being loaded so the
@@ -214,20 +242,74 @@ export function RunDetailPage(): ReactElement {
     }
   }, [detail, nodeOptions, selectedNodeId]);
 
-  // Auto-scroll to bottom on new content IF user is already near the bottom.
+  // Follow intent belongs to user navigation, not post-render geometry. Content
+  // growth can make a pinned viewport look detached before an effect measures it.
   const lastBottomRef = useRef(true);
-  useEffect(() => {
+  const [atBottom, setAtBottom] = useState(true);
+  const pendingNodeIdRef = useRef<string | null>(null);
+
+  const finishNodeReveal = useCallback((nodeId: string): void => {
+    if (pendingNodeIdRef.current !== nodeId) return;
+    pendingNodeIdRef.current = null;
+    lastBottomRef.current = false;
+    setAtBottom(false);
+  }, []);
+
+  // Bind the observer to the conditional content node so it survives loading and
+  // Log remounts. A Graph-selected node takes precedence over the mount's normal
+  // tail position and keeps follow disabled until its reveal settles.
+  const contentRef = useCallback(
+    (node: HTMLDivElement | null): (() => void) | undefined => {
+      if (node === null) return undefined;
+
+      const pendingNodeId = pendingNodeIdRef.current;
+      const followTail = pendingNodeId === null;
+      lastBottomRef.current = followTail;
+      setAtBottom(followTail);
+
+      const observer = new ResizeObserver(() => {
+        if (!lastBottomRef.current) return;
+        const el = scrollRef.current;
+        if (el !== null) el.scrollTop = el.scrollHeight;
+      });
+      observer.observe(node);
+
+      if (pendingNodeId !== null) {
+        requestAnimationFrame(() => {
+          if (pendingNodeIdRef.current !== pendingNodeId) return;
+          if (!scrollToNode(pendingNodeId)) finishNodeReveal(pendingNodeId);
+        });
+      }
+
+      return () => {
+        observer.disconnect();
+      };
+    },
+    [finishNodeReveal, scrollToNode]
+  );
+
+  const handleScroll = useCallback((): void => {
+    if (pendingNodeIdRef.current !== null) return;
     const el = scrollRef.current;
     if (el === null) return;
-    // Near-bottom heuristic: within 120px of the end.
-    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
-    lastBottomRef.current = atBottom;
-  });
-  useEffect(() => {
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < NEAR_BOTTOM_PX;
+    lastBottomRef.current = nearBottom;
+    setAtBottom(nearBottom);
+  }, []);
+
+  const handleScrollEnd = useCallback((): void => {
+    const pendingNodeId = pendingNodeIdRef.current;
+    if (pendingNodeId !== null) finishNodeReveal(pendingNodeId);
+  }, [finishNodeReveal]);
+
+  const scrollToBottom = useCallback((): void => {
     const el = scrollRef.current;
-    if (el === null || !lastBottomRef.current) return;
+    if (el === null) return;
+    pendingNodeIdRef.current = null;
+    lastBottomRef.current = true;
+    setAtBottom(true);
     el.scrollTop = el.scrollHeight;
-  }, [messages?.length, detail?.events.length]);
+  }, []);
 
   // Keymap bindings: hoisted above early returns so the hook order is stable
   // across all render paths (loading, error, ready).
@@ -310,7 +392,7 @@ export function RunDetailPage(): ReactElement {
   );
   useKeymap({ bindings });
 
-  if (projectId === undefined || runId === undefined) {
+  if (runId === undefined) {
     return (
       <div className="flex h-full items-center justify-center text-sm text-text-tertiary">
         Invalid run URL.
@@ -335,16 +417,9 @@ export function RunDetailPage(): ReactElement {
     );
   }
 
-  const { run, events } = detail;
+  const { run, events, nodes } = detail;
   const messageList = messages ?? [];
-  const inlineToolCount = messageList.reduce((acc, m) => acc + m.toolCalls.length, 0);
-  // Mirror RunStream's source-of-truth rule: when no inline tool calls exist
-  // on messages, the workflow tool_called events become the canonical count.
-  const workflowToolCount =
-    inlineToolCount === 0
-      ? events.filter(e => e.kind === 'tool_call' && e.result === null).length
-      : 0;
-  const toolCallCount = inlineToolCount + workflowToolCount;
+  const toolCallCount = runToolCalls(messageList, providerEvents).count;
 
   const toolbar = (
     <StreamToolbar
@@ -378,50 +453,74 @@ export function RunDetailPage(): ReactElement {
   return (
     <StreamContextProvider value={{ runStartedAt: run.startedAt }}>
       <section className="flex h-full flex-col">
-        <RunDetailHeader run={run} projectId={projectId} projectName={project?.name ?? projectId} />
+        <RunDetailHeader
+          run={run}
+          projectId={projectId}
+          projectName={project?.name ?? detail.run.projectName ?? 'All runs'}
+        />
 
         <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
           {view === 'log' ? (
-            <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto">
-              <div className="w-full px-6">
-                <div className="sticky top-0 z-10 -mx-6 bg-surface px-6">{toolbar}</div>
+            <div className="relative min-h-0 flex-1">
+              <div
+                ref={scrollRef}
+                onScroll={handleScroll}
+                onScrollEnd={handleScrollEnd}
+                className="h-full overflow-y-auto"
+              >
+                <div ref={contentRef} className="w-full px-6">
+                  <div className="sticky top-0 z-10 -mx-6 bg-surface px-6">{toolbar}</div>
 
-                <div className="py-4">
-                  <RunStartedLine run={run} />
+                  <div className="py-4">
+                    <RunStartedLine run={run} />
 
-                  <div className="mt-2">
-                    <RunStream
-                      messages={messageList}
-                      events={events}
-                      showToolCalls={showToolCalls}
-                      showSystem={showSystem}
-                      selectedNodeId={selectedNodeId}
-                    />
-                  </div>
-
-                  <RunFinishedLine run={run} />
-
-                  {run.status === 'paused' &&
-                  run.approval !== null &&
-                  run.approval !== undefined ? (
-                    <div className="mt-6 rounded border border-warning/30 bg-warning/[0.04] p-4">
-                      <div className="mb-2 flex items-center gap-2">
-                        <span
-                          aria-hidden
-                          className="h-2 w-2 animate-pulse rounded-full bg-warning"
-                        />
-                        <span className="text-[11px] font-semibold uppercase tracking-[0.14em] text-warning">
-                          Waiting for approval
-                        </span>
-                      </div>
-                      <ApprovalContext run={run} />
-                      <div className="mt-2">
-                        <ApprovalPanel run={run} />
-                      </div>
+                    <div className="mt-2">
+                      <RunStream
+                        messages={messageList}
+                        events={events}
+                        nodes={nodes}
+                        providerEvents={providerEvents}
+                        showToolCalls={showToolCalls}
+                        showSystem={showSystem}
+                        selectedNodeId={selectedNodeId}
+                      />
                     </div>
-                  ) : null}
+
+                    <RunFinishedLine run={run} />
+
+                    {run.status === 'paused' &&
+                    run.approval !== null &&
+                    run.approval !== undefined ? (
+                      <div className="mt-6 rounded border border-warning/30 bg-warning/[0.04] p-4">
+                        <div className="mb-2 flex items-center gap-2">
+                          <span
+                            aria-hidden
+                            className="h-2 w-2 animate-pulse rounded-full bg-warning"
+                          />
+                          <span className="text-[11px] font-semibold uppercase tracking-[0.14em] text-warning">
+                            Waiting for approval
+                          </span>
+                        </div>
+                        <ApprovalContext run={run} />
+                        <div className="mt-2">
+                          <ApprovalPanel run={run} />
+                        </div>
+                      </div>
+                    ) : null}
+                  </div>
                 </div>
               </div>
+              {!atBottom ? (
+                <button
+                  type="button"
+                  onClick={scrollToBottom}
+                  aria-label="Jump to bottom"
+                  className="absolute bottom-3 left-1/2 flex -translate-x-1/2 items-center gap-1 rounded-full border border-border bg-surface-elevated px-3 py-1 text-[11px] text-text-secondary shadow-md transition-colors hover:text-text-primary"
+                >
+                  <span aria-hidden>↓</span>
+                  Jump to bottom
+                </button>
+              ) : null}
             </div>
           ) : view === 'graph' ? (
             <>
@@ -430,18 +529,21 @@ export function RunDetailPage(): ReactElement {
                 <RunGraphPanel
                   workflowName={run.workflow}
                   projectCwd={project.path}
-                  events={events}
+                  nodes={nodes}
                   onNodeSelect={(nodeId): void => {
+                    pendingNodeIdRef.current = nodeId;
                     setView('log');
                     writeView('log');
-                    // Defer scroll until the log view has mounted.
-                    requestAnimationFrame(() => {
-                      scrollToNode(nodeId);
-                    });
                   }}
                 />
               ) : (
-                <div className="p-6 text-[12px] text-text-tertiary">Loading project…</div>
+                <div className="p-6 text-[12px] text-text-tertiary">
+                  {projectId === undefined
+                    ? 'This run has no project. Its logs and artifacts are available in the other views.'
+                    : projectError
+                      ? `Could not load project: ${projectError.message}`
+                      : 'Loading project…'}
+                </div>
               )}
             </>
           ) : (

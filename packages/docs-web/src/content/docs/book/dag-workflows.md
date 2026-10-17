@@ -168,15 +168,18 @@ This time `plan` runs; `investigate` is skipped. The same workflow, two paths.
 `when:` evaluates a condition before running a node. If the condition is false, the node is skipped:
 
 ```yaml
-when: "$nodeId.output == 'VALUE'"
+when: "$nodeId.output == 'VALUE'"         # whole output — bash:/script: producers only
 when: "$nodeId.output != 'VALUE'"
 when: "$nodeId.output.field == 'VALUE'"   # JSON field access
+when: "$INPUTS.name == 'VALUE'"           # a declared input supplied by the caller
 ```
 
 Two failure modes, by design:
 
-- An **invalid/unparseable expression** (bad syntax) is fail-closed — the node is **skipped**.
-- A `$node.output.field` **reference that can't resolve** — a field not declared in the producer's `output_format` schema, or a schemaless node whose output isn't JSON or lacks that key — **fails the node** (it is not silently treated as empty). The one exception: a field the producer declared **optional** but left absent resolves to `''`. Whole-text `$node.output` never fails.
+- An **invalid or unsupported expression**, including grouping parentheses, is rejected when the workflow loads and by `archon validate workflows`.
+- A `$node.output.field` **reference that can't resolve** — a field not declared in the producer's `output_format` schema, or a schemaless node whose output isn't JSON or lacks that key — **fails the node** (it is not silently treated as empty). The one exception: a field the producer declared **optional** but left absent resolves to `''`. Whole-text `$node.output` never fails. A `$INPUTS.<name>` the run does not carry likewise **fails the node**.
+
+Comparing the **whole output** of an AI producer (`prompt:`, `command:`, `loop:`, `loop_group:` with no `output_format`) to a literal is rejected when the workflow loads — a model's free-form reply is never byte-identical to `BUG`, so the comparison would silently skip the node. Declare `output_format` and compare a field. See [`when:` Condition Syntax](/guides/authoring-workflows/#when-condition-syntax).
 
 ### Accessing Node Output
 
@@ -225,16 +228,22 @@ When a node has multiple dependencies and some might be skipped, `trigger_rule` 
 |-------|----------|
 | `all_success` | Run only if all upstream deps completed successfully (default) |
 | `one_success` | Run if at least one upstream dep completed successfully |
-| `none_failed_min_one_success` | Run if no deps failed AND at least one succeeded (skipped deps are OK) |
+| `none_failed_min_one_success` | Run if at least one dependency succeeded and none failed or skipped because of an upstream failure (`upstream_failed`) |
 | `all_done` | Run when all deps are in a terminal state (completed, failed, or skipped) |
 
-The classify-and-route example uses `none_failed_min_one_success` on `implement` because exactly one of `investigate` or `plan` will be skipped. The default `all_success` would fail because a skipped node doesn't count as a success.
+The classify-and-route example uses `none_failed_min_one_success` on `implement` because exactly one of `investigate` or `plan` will be skipped. The default `all_success` would skip `implement` because a skipped node doesn't count as a success.
+
+A skip caused by an upstream failure is different: `none_failed_min_one_success`
+blocks it by default, even when another dependency succeeded. This applies across
+chains and includes, and the skip cause retains the original failed node. Condition
+skips and optional timeout skips (`on_timeout: skip`) remain admissible with a successful
+dependency. `if_skipped` affects output bindings, not trigger eligibility.
 
 ---
 
 ## Node Types
 
-Archon supports eight node types. Exactly one mode field is required per node:
+These are the common node types. Exactly one mode field is required per node:
 
 | Type | Syntax | When to use |
 |------|--------|-------------|
@@ -244,7 +253,7 @@ Archon supports eight node types. Exactly one mode field is required per node:
 | **Script** | `script: "..."` + `runtime: bun \| uv` | Run TypeScript/JavaScript (bun) or Python (uv) without AI. Inline code or a package-local/shared named reference. Stdout captured as `$nodeId.output`. See [Script Nodes](/guides/script-nodes/). |
 | **Loop** | `loop: { prompt: "...", until: SIGNAL }` | Repeat an AI prompt until a completion signal appears in the output. See [Loop Nodes](/guides/loop-nodes/). |
 | **Loop Group** | `loop_group: { until: SIGNAL, nodes: [...] }` | Repeat a multi-node sub-DAG body until a completion condition is met (cross-node iteration). See [Loop Nodes](/guides/loop-nodes/). |
-| **Approval** | `approval: { message: "..." }` | Pause the workflow for a human approve/reject decision. See [Approval Nodes](/guides/approval-nodes/). |
+| **Wait** | `wait: { attention: "...", form: approval }` | Pause until the question is answered (or a time or event arrives). The answer becomes the node's output. See [Attention waits](/guides/authoring-workflows/#attention-waits). The older `approval:` node is deprecated. |
 | **Cancel** | `cancel: "reason string"` | Terminate the workflow run (status: cancelled, not failed). Usually gated with `when:`. |
 
 **Command** is the most common. Use it for anything you'll reuse across workflows.
@@ -293,21 +302,25 @@ Archon supports eight node types. Exactly one mode field is required per node:
     fresh_context: true
 ```
 
-**Approval** pauses the workflow for human review. The downstream nodes don't run until the user approves in chat, CLI, or web UI:
+**Wait** with an `attention:` question pauses the run until someone answers in chat, the CLI, or the console. The `approval` form records `{decision, text}`. Rejecting is an answer, not a cancel, so branch on the decision:
 
 ```yaml
-interactive: true                 # required at workflow level for web UI delivery
-
 nodes:
   - id: plan
     command: plan-feature
-  - id: review-gate
-    approval:
-      message: "Review the plan above."
+  - id: review
+    wait:
+      attention: "Review the plan above."
+      form: approval
     depends_on: [plan]
+  - id: stop
+    cancel: "Plan rejected."
+    when: "$review.output.decision == 'reject'"
+    depends_on: [review]
   - id: implement
     command: implement
-    depends_on: [review-gate]
+    when: "$review.output.decision == 'approve'"
+    depends_on: [review]
 ```
 
 **Cancel** terminates the workflow with a reason string. Pair with `when:` for guarded exits — the run shows as `cancelled` rather than `failed`:

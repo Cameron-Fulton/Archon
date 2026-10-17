@@ -4,17 +4,18 @@
  * (CLI) workflow runs stream to the console with near-zero latency on Postgres.
  *
  * The notification carries no payload to emit; it only triggers `poller.drainNow()`.
- * That keeps the cursor + row→SSE mapping + dedup in ONE place (the poller), so a
+ * That keeps the cursor + row→SSE mapping in ONE place (the poller), so a
  * dropped or coalesced notification can never desync state — the cursor drain is
  * authoritative, and the poller's interval backstop reconciles anything missed
  * across a `LISTEN` reconnect.
  */
 import { createLogger } from '@archon/paths';
 import type { DbNotificationListener } from '@archon/core/db/adapters/types';
+import { WORKFLOW_EVENT_NOTIFY_CHANNEL } from '@archon/core/db/adapters/types';
 import type { DashboardEventPoller } from './dashboard-event-poller';
 
 const log = createLogger('adapter.web.pg-notify');
-const CHANNEL = 'archon_dashboard_event';
+const CHANNEL = WORKFLOW_EVENT_NOTIFY_CHANNEL;
 const MAX_BACKOFF_MS = 30_000;
 
 export class PgNotifyListener {

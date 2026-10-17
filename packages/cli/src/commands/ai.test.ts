@@ -114,10 +114,11 @@ mock.module('@archon/core/db/users', () => ({
 mock.module('./auth', () => ({ resolveCliUserId: () => 'cli-alice' }));
 mock.module('@archon/paths', () => ({ createLogger: noopLogger }));
 
-// @archon/providers is NOT mocked — register builtins so isRegisteredProvider()
-// (used by the tier/default commands) resolves claude/codex/etc.
-import { registerBuiltinProviders } from '@archon/providers';
+// @archon/providers is NOT mocked — register the providers exercised by the
+// tier/default commands so isRegisteredProvider() resolves them.
+import { registerBuiltinProviders, registerOpencodeProvider } from '@archon/providers/in-process';
 registerBuiltinProviders();
+registerOpencodeProvider();
 
 import {
   aiKeySetCommand,
@@ -345,8 +346,16 @@ describe('aiTierSetCommand', () => {
   });
 
   it('invalid effort for the provider → 1, no write', async () => {
-    expect(await aiTierSetCommand('large', 'claude', 'opus', 'ultra')).toBe(1);
+    expect(await aiTierSetCommand('large', 'claude', 'opus', 'extreme')).toBe(1);
     expect(out()).toContain('Invalid effort');
+    expect(mockUpdateGlobalConfig).not.toHaveBeenCalled();
+  });
+
+  it('effort for a provider without reasoning control → 1, no write', async () => {
+    expect(await aiTierSetCommand('large', 'opencode', 'anthropic/claude-sonnet-4-6', 'high')).toBe(
+      1
+    );
+    expect(out()).toContain("Provider 'opencode' does not support effort");
     expect(mockUpdateGlobalConfig).not.toHaveBeenCalled();
   });
 
@@ -361,6 +370,17 @@ describe('aiTierUnsetCommand', () => {
     expect(await aiTierUnsetCommand('medium')).toBe(0);
     const arg = mockUpdateGlobalConfig.mock.calls[0]?.[0] as { tiers: Record<string, unknown> };
     expect(arg.tiers.medium).toBeNull();
+    // claude ships a built-in for every tier — the message may name the fallback.
+    expect(out()).toContain('built-in default');
+  });
+
+  it('no built-in for the default provider → success without claiming a fallback', async () => {
+    loadConfigResult = { assistant: 'pi', tiers: {} };
+    expect(await aiTierUnsetCommand('medium')).toBe(0);
+    const text = out();
+    expect(text).toContain("Unset tier 'medium'");
+    expect(text).not.toContain('falls back to the built-in default');
+    expect(text).toContain('archon ai tier set medium');
   });
 
   it('invalid tier → 1, no write', async () => {
@@ -405,6 +425,13 @@ describe('aiDefaultCommand', () => {
       defaultAssistant: 'codex',
       assistants: { codex: { model: 'gpt-5.5' } },
     });
+  });
+
+  it('a deprecated provider prints its notice; a supported one does not', async () => {
+    expect(await aiDefaultCommand('opencode', undefined)).toBe(0);
+    expect(out()).toContain('OpenCode is deprecated');
+    expect(await aiDefaultCommand('codex', undefined)).toBe(0);
+    expect(out().match(/is deprecated/g)).toHaveLength(1);
   });
 
   it('unknown provider → 1, no write', async () => {

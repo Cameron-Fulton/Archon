@@ -1,3 +1,8 @@
+// @archon-test-isolated
+import { clearRegistry, getRegisteredProviders, registerProvider } from '@archon/providers';
+import { platformStreamingSchema } from './config-types';
+import { clearPlatformPolicies, setPlatformPolicies } from '../platforms/registry';
+import type { PlatformPolicy } from '../platforms/types';
 import { describe, test, expect, beforeEach, afterEach, mock } from 'bun:test';
 import { homedir } from 'os';
 import { join } from 'path';
@@ -9,23 +14,26 @@ mock.module('@archon/paths', () => ({
   createLogger: mock(() => mockLogger),
   getArchonHome: mock(() => archonHome),
   getArchonConfigPath: mock(() => join(archonHome, 'config.yaml')),
-  getArchonWorkspacesPath: mock(() => join(archonHome, 'workspaces')),
-  getArchonWorktreesPath: mock(() => join(archonHome, 'worktrees')),
-  getDefaultCommandsPath: mock(() => '/app/.archon/commands/defaults'),
-  getDefaultWorkflowsPath: mock(() => '/app/.archon/workflows/defaults'),
+  getBundledWorkflowsPath: mock(() => '/app/.archon/workflows'),
 }));
 
 // Mock fs/promises so that readConfigFile/writeConfigFile (which call fsReadFile/writeFile
 // internally) are intercepted regardless of Bun version mock.module semantics.
-const mockFsReadFile = mock(() => Promise.resolve(''));
-const mockFsWriteFile = mock(() => Promise.resolve());
-const mockFsMkdir = mock(() => Promise.resolve(undefined));
+const mockFsReadFile = mock<(path: string) => Promise<string>>(() => Promise.resolve(''));
+const mockFsWriteFile = mock<(path: string, content: string) => Promise<void>>(() =>
+  Promise.resolve()
+);
+const mockFsMkdir = mock<(path: string) => Promise<void>>(() => Promise.resolve());
 
 mock.module('fs/promises', () => ({
   readFile: mockFsReadFile,
   writeFile: mockFsWriteFile,
   mkdir: mockFsMkdir,
 }));
+
+import { registerBuiltinProviders, registerCommunityProviders } from '@archon/providers/in-process';
+registerBuiltinProviders();
+registerCommunityProviders();
 
 import {
   loadGlobalConfig,
@@ -34,22 +42,34 @@ import {
   clearConfigCache,
   toSafeConfig,
   updateGlobalConfig,
+  InvalidConfigError,
 } from './config-loader';
 
 describe('config-loader', () => {
   const originalEnv: Record<string, string | undefined> = {};
   const envVars = [
     'DEFAULT_AI_ASSISTANT',
-    'TELEGRAM_STREAMING_MODE',
-    'DISCORD_STREAMING_MODE',
-    'SLACK_STREAMING_MODE',
+    'STREAMTEST_STREAMING_MODE',
+    'MATRIX_STREAMING_MODE',
     'MAX_CONCURRENT_CONVERSATIONS',
     'WORKSPACE_PATH',
     'WORKTREE_BASE',
     'ARCHON_HOME',
   ];
 
+  const streamtestPolicy: PlatformPolicy = {
+    id: 'streamtest',
+    workspaceRetention: 'age-based',
+    streaming: { defaultMode: 'stream', envVar: 'STREAMTEST_STREAMING_MODE' },
+  };
+  const matrixPolicy: PlatformPolicy = {
+    id: 'matrix-chat',
+    workspaceRetention: 'age-based',
+    streaming: { defaultMode: 'stream', envVar: 'MATRIX_STREAMING_MODE' },
+  };
+
   beforeEach(() => {
+    setPlatformPolicies([streamtestPolicy]);
     clearConfigCache();
     mockFsReadFile.mockReset();
     mockFsWriteFile.mockReset();
@@ -74,6 +94,113 @@ describe('config-loader', () => {
     // Clear mock state between tests
     mockFsReadFile.mockClear();
     mockFsWriteFile.mockClear();
+  });
+
+  test('new and unregistered streaming keys survive load, merge, update and safe projection', async () => {
+    setPlatformPolicies([streamtestPolicy, matrixPolicy]);
+    mockFsReadFile.mockResolvedValue('streaming:\n  matrix-chat: batch\n  other-chat: stream\n');
+    expect((await loadGlobalConfig()).streaming).toEqual({
+      'matrix-chat': 'batch',
+      'other-chat': 'stream',
+    });
+    const config = await loadConfig();
+    expect(toSafeConfig(config).streaming).toEqual({
+      streamtest: 'stream',
+      'matrix-chat': 'batch',
+      'other-chat': 'stream',
+    });
+    await updateGlobalConfig({ streaming: { 'matrix-chat': 'stream' } });
+    const written = Bun.YAML.parse(mockFsWriteFile.mock.calls[0]?.[1] as string) as {
+      streaming: unknown;
+    };
+    expect(platformStreamingSchema.parse(written.streaming)).toEqual({
+      'matrix-chat': 'stream',
+      'other-chat': 'stream',
+    });
+  });
+
+  test('invalid streaming keys or modes refuse to load and never reach the file', async () => {
+    mockFsReadFile.mockResolvedValue('streaming:\n  Not A Platform: stream\n  streamtest: fast\n');
+    await expect(loadGlobalConfig()).rejects.toThrow('Invalid streaming config');
+    await expect(updateGlobalConfig({ streaming: { 'matrix-chat': 'stream' } })).rejects.toThrow(
+      'Invalid streaming config'
+    );
+    expect(mockFsWriteFile).not.toHaveBeenCalled();
+  });
+
+  test('attention notice routes load from global config only', async () => {
+    const routes = 'attentionNotices:\n  - platform: matrix-chat\n    destination: ops\n';
+    mockFsReadFile.mockImplementation(async (path: string) =>
+      path.replace(/\\/g, '/').includes('/repo/.archon/')
+        ? 'attentionNotices:\n  - platform: repo-chat\n    destination: repo\n'
+        : routes
+    );
+    expect((await loadConfig('/repo')).attentionNotices).toEqual([
+      { platform: 'matrix-chat', destination: 'ops' },
+    ]);
+    expect(toSafeConfig(await loadConfig())).not.toHaveProperty('attentionNotices');
+  });
+
+  test.each([
+    'attentionNotices:\n  - platform: matrix-chat\n    destination: ops\n  - platform: matrix-chat\n    destination: ops\n',
+    'attentionNotices:\n  - platform: matrix-chat\n    destination: ""\n',
+    'attentionNotices:\n  - platform: Matrix Chat\n    destination: ops\n',
+  ])('an invalid attention notice route refuses to load: %s', async yaml => {
+    mockFsReadFile.mockResolvedValue(yaml);
+    await expect(loadConfig()).rejects.toThrow('Invalid attentionNotices config');
+  });
+
+  test.each(['concurrency:', 'concurrency: null', 'concurrency: ~'])(
+    '%s preserves unrelated global settings and the default conversation limit',
+    async concurrency => {
+      mockFsReadFile.mockResolvedValue(`botName: MyBot\n${concurrency}\n`);
+      const config = await loadConfig();
+      expect(config.botName).toBe('MyBot');
+      expect(config.concurrency.maxConversations).toBe(10);
+    }
+  );
+
+  test.each(['concurrency:', 'concurrency: null', 'concurrency: ~'])(
+    '%s allows unrelated global settings updates',
+    async concurrency => {
+      mockFsReadFile.mockResolvedValue(`botName: MyBot\n${concurrency}\n`);
+      await updateGlobalConfig({ botName: 'UpdatedBot' });
+      expect(Bun.YAML.parse(mockFsWriteFile.mock.calls[0]?.[1] as string)).toEqual({
+        botName: 'UpdatedBot',
+        concurrency: null,
+      });
+    }
+  );
+
+  test('invalid conversation limits refuse to load and cannot be persisted', async () => {
+    mockFsReadFile.mockResolvedValue('concurrency:\n  maxConversations: -1\n');
+    await expect(loadConfig()).rejects.toThrow(/Invalid concurrency config.*maxConversations/);
+    await expect(updateGlobalConfig({ defaultAssistant: 'claude' })).rejects.toThrow(
+      /Invalid concurrency config.*maxConversations/
+    );
+    expect(mockFsWriteFile).not.toHaveBeenCalled();
+    await updateGlobalConfig({ concurrency: { maxConversations: 3 } });
+    expect(Bun.YAML.parse(mockFsWriteFile.mock.calls[0]?.[1] as string)).toEqual({
+      concurrency: { maxConversations: 3 },
+    });
+  });
+
+  test('registered streaming default and validated environment override apply', async () => {
+    setPlatformPolicies([streamtestPolicy, matrixPolicy]);
+    mockFsReadFile.mockResolvedValue('');
+    expect((await loadConfig()).streaming['matrix-chat']).toBe('stream');
+    process.env.MATRIX_STREAMING_MODE = 'batch';
+    clearConfigCache();
+    expect((await loadConfig()).streaming['matrix-chat']).toBe('batch');
+    process.env.MATRIX_STREAMING_MODE = 'invalid';
+    clearConfigCache();
+    expect((await loadConfig()).streaming['matrix-chat']).toBe('stream');
+  });
+
+  test('loading config fails until the host configures platform policies', async () => {
+    clearPlatformPolicies();
+    mockFsReadFile.mockResolvedValue('');
+    await expect(loadConfig()).rejects.toThrow('Platform policies are not configured');
   });
 
   describe('loadGlobalConfig', () => {
@@ -101,6 +228,95 @@ concurrency:
       expect(config.concurrency?.maxConversations).toBe(5);
     });
 
+    test.each([
+      ['tiers', 'medium'],
+      ['aliases', "'@deep'"],
+    ] as const)(
+      'rejects retired thinking in global %s config and names effort',
+      async (field, entry) => {
+        mockFsReadFile.mockResolvedValue(`
+${field}:
+  ${entry}: { provider: claude, model: opus, thinking: adaptive }
+`);
+
+        const error = (await loadGlobalConfig().catch(err => err)) as Error;
+
+        expect(error.message).toContain(join(archonHome, 'config.yaml'));
+        expect(error.message).toMatch(new RegExp(`${field}\\..*thinking.*effort:`));
+      }
+    );
+
+    test.each([0, 60000])('accepts tool attention policy %s at config ingress', async threshold => {
+      mockFsReadFile.mockResolvedValue(`workflows:\n  toolCallAttentionMs: ${threshold}\n`);
+      expect((await loadGlobalConfig()).workflows?.toolCallAttentionMs).toBe(threshold);
+    });
+
+    test.each([-1, 1.5])(
+      'rejects invalid tool attention policy %s at config ingress',
+      async threshold => {
+        mockFsReadFile.mockResolvedValue(`workflows:\n  toolCallAttentionMs: ${threshold}\n`);
+        await expect(loadGlobalConfig()).rejects.toThrow('Invalid workflows config');
+      }
+    );
+
+    test('rejects malformed quota continuation policy at config ingress', async () => {
+      mockFsReadFile.mockResolvedValue(`
+workflows:
+  autoResumeOnQuotaReset: yes
+  quotaMaxAttempts: 1.5
+  quotaDeadlineMs: -1
+`);
+
+      await expect(loadGlobalConfig()).rejects.toThrow('Invalid workflows config');
+    });
+
+    test('rejects quota continuation delays beyond the persisted timestamp range', async () => {
+      mockFsReadFile.mockResolvedValue(`
+workflows:
+  quotaFallbackDelayMs: 31536000000001
+  quotaDeadlineMs: 31536000000001
+`);
+
+      await expect(loadGlobalConfig()).rejects.toThrow('Invalid workflows config');
+    });
+
+    test('parses deprecated quota settings at the persisted timestamp bound, with a warning', async () => {
+      mockFsReadFile.mockResolvedValue(`
+workflows:
+  quotaFallbackDelayMs: 31536000000000
+  quotaDeadlineMs: 31536000000000
+`);
+
+      const config = await loadGlobalConfig();
+
+      expect(config.workflows).toEqual({
+        quotaFallbackDelayMs: 31_536_000_000_000,
+        quotaDeadlineMs: 31_536_000_000_000,
+      });
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          warning: expect.stringContaining(
+            'workflows.quotaFallbackDelayMs, workflows.quotaDeadlineMs are deprecated and have no effect'
+          ),
+        }),
+        'config.workflows_quota_keys_deprecated'
+      );
+    });
+
+    test('keeps ordinary config forward-compatible with unknown workflow settings', async () => {
+      mockFsReadFile.mockResolvedValue(`
+defaultAssistant: codex
+workflows:
+  autoResumeOnQuotaReset: true
+  futurePolicy: enabled
+`);
+
+      const config = await loadGlobalConfig();
+
+      expect(config.defaultAssistant).toBe('codex');
+      expect(config.workflows).toEqual({ autoResumeOnQuotaReset: true });
+    });
+
     test('caches config on subsequent calls', async () => {
       mockFsReadFile.mockResolvedValue('defaultAssistant: claude');
 
@@ -120,46 +336,60 @@ concurrency:
       expect(mockFsReadFile).toHaveBeenCalledTimes(2);
     });
 
-    test('logs error for invalid YAML syntax', async () => {
-      mockLogger.error.mockClear();
+    test('invalid YAML fails the load and names the file', async () => {
+      mockFsReadFile.mockResolvedValue('worktree: [');
 
-      // Simulate YAML parse error (SyntaxError has no .code property)
-      const syntaxError = new SyntaxError('YAML Parse error: Multiline implicit key');
-      mockFsReadFile.mockRejectedValue(syntaxError);
+      const error = (await loadGlobalConfig().catch(err => err)) as Error;
 
-      const config = await loadGlobalConfig();
-
-      // Should fall back to empty config
-      expect(config).toEqual({});
-
-      // Should log error via structured logger
-      expect(mockLogger.error).toHaveBeenCalledWith(
-        expect.objectContaining({ err: syntaxError }),
-        'config_invalid_yaml'
-      );
+      expect(error.message).toContain(join(archonHome, 'config.yaml'));
+      expect(error.message).toContain('not valid YAML');
     });
 
-    test('logs error for permission denied', async () => {
-      mockLogger.error.mockClear();
-
-      const permError = new Error('Permission denied') as NodeJS.ErrnoException;
-      permError.code = 'EACCES';
+    test('an unreadable config fails the load', async () => {
+      const permError = Object.assign(new Error('Permission denied'), { code: 'EACCES' });
       mockFsReadFile.mockRejectedValue(permError);
 
-      const config = await loadGlobalConfig();
-
-      // Should fall back to empty config
-      expect(config).toEqual({});
-
-      // Should log error via structured logger
-      expect(mockLogger.error).toHaveBeenCalledWith(
-        expect.objectContaining({ err: permError, code: 'EACCES' }),
-        'config_permission_denied'
-      );
+      await expect(loadGlobalConfig()).rejects.toBe(permError);
     });
+
+    test.each(['false', '[]'])(
+      'a top level that is not a mapping fails the load: %s',
+      async content => {
+        mockFsReadFile.mockResolvedValue(content);
+
+        const error = (await loadGlobalConfig().catch(err => err)) as Error;
+
+        expect(error.message).toContain(join(archonHome, 'config.yaml'));
+        expect(error.message).toContain('not a map of settings');
+      }
+    );
   });
 
   describe('loadRepoConfig', () => {
+    test('loads post-create commands and per-command timeout', async () => {
+      mockFsReadFile.mockResolvedValue(
+        'worktree:\n  postCreate: ["  bun install  ", "./setup.sh"]\n  postCreateTimeout: 75000'
+      );
+      expect((await loadRepoConfig('/repo')).worktree).toEqual({
+        postCreate: ['  bun install  ', './setup.sh'],
+        postCreateTimeout: 75000,
+      });
+    });
+
+    test.each([
+      'postCreate: false',
+      'postCreate: [42]',
+      'postCreate: [" "]',
+      'postCreateTimeout: 0',
+      'postCreateTimeout: -1',
+      'postCreateTimeout: 1.5',
+      'postCreateTimeout: "300000"',
+      'postCreateTimeout: .inf',
+    ])('rejects invalid provisioning setting: %s', async setting => {
+      mockFsReadFile.mockResolvedValue(`worktree:\n  ${setting}`);
+      await expect(loadRepoConfig('/repo')).rejects.toThrow('worktree.postCreate');
+    });
+
     test('loads from .archon/config.yaml', async () => {
       mockFsReadFile.mockResolvedValue('assistant: codex');
 
@@ -176,59 +406,60 @@ concurrency:
       expect(config).toEqual({});
     });
 
-    test('logs error for invalid YAML syntax', async () => {
-      mockLogger.error.mockClear();
+    test.each([
+      ['tiers', 'medium'],
+      ['aliases', "'@deep'"],
+    ] as const)(
+      'rejects retired thinking in repository %s config and names effort',
+      async (field, entry) => {
+        mockFsReadFile.mockResolvedValue(`
+assistant: codex
+${field}:
+  ${entry}: { provider: claude, model: opus, thinking: adaptive }
+`);
 
-      // Simulate YAML parse error (SyntaxError has no .code property)
-      const syntaxError = new SyntaxError('YAML Parse error: Multiline implicit key');
-      mockFsReadFile.mockRejectedValue(syntaxError);
+        const error = (await loadRepoConfig('/test/repo').catch(err => err)) as Error;
 
-      const config = await loadRepoConfig('/test/repo');
+        expect(error.message).toContain(join('/test/repo', '.archon', 'config.yaml'));
+        expect(error.message).toMatch(new RegExp(`${field}\\..*thinking.*effort:`));
+      }
+    );
 
-      // Should fall back to empty config
-      expect(config).toEqual({});
+    test('invalid YAML fails the load and names the file', async () => {
+      mockFsReadFile.mockResolvedValue('worktree: [');
 
-      // Should log error via structured logger
-      expect(mockLogger.error).toHaveBeenCalledWith(
-        expect.objectContaining({ err: syntaxError }),
-        'config_invalid_yaml'
-      );
+      const error = (await loadRepoConfig('/test/repo').catch(err => err)) as Error;
+
+      expect(error.message).toContain(join('/test/repo', '.archon', 'config.yaml'));
+      expect(error.message).toContain('not valid YAML');
     });
 
-    test('logs error for permission denied', async () => {
-      mockLogger.error.mockClear();
-
-      const permError = new Error('Permission denied') as NodeJS.ErrnoException;
-      permError.code = 'EACCES';
+    test('an unreadable config fails the load', async () => {
+      const permError = Object.assign(new Error('Permission denied'), { code: 'EACCES' });
       mockFsReadFile.mockRejectedValue(permError);
 
-      const config = await loadRepoConfig('/test/repo');
-
-      // Should fall back to empty config
-      expect(config).toEqual({});
-
-      // Should log error via structured logger
-      expect(mockLogger.error).toHaveBeenCalledWith(
-        expect.objectContaining({ err: permError, code: 'EACCES' }),
-        'config_permission_denied'
-      );
+      await expect(loadRepoConfig('/test/repo')).rejects.toBe(permError);
     });
+
+    test.each(['false', '[]'])(
+      'a top level that is not a mapping fails the load: %s',
+      async content => {
+        mockFsReadFile.mockResolvedValue(content);
+        await expect(loadRepoConfig('/repo')).rejects.toThrow(/not a map of settings/);
+      }
+    );
 
     test('parses recommendedWorkflows as an ordered string array', async () => {
       mockFsReadFile.mockResolvedValue(`
 recommendedWorkflows:
-  - archon-fix-github-issue
-  - archon-idea-to-pr
+  - archon-ship
+  - archon-deliver
   - archon-plan
 `);
 
       const config = await loadRepoConfig('/test/repo');
 
-      expect(config.recommendedWorkflows).toEqual([
-        'archon-fix-github-issue',
-        'archon-idea-to-pr',
-        'archon-plan',
-      ]);
+      expect(config.recommendedWorkflows).toEqual(['archon-ship', 'archon-deliver', 'archon-plan']);
     });
 
     test('omits recommendedWorkflows when key is absent', async () => {
@@ -245,12 +476,12 @@ recommendedWorkflows:
   - "  archon-plan  "
   - ""
   - 42
-  - archon-fix-github-issue
+  - archon-ship
 `);
 
       const config = await loadRepoConfig('/test/repo');
 
-      expect(config.recommendedWorkflows).toEqual(['archon-plan', 'archon-fix-github-issue']);
+      expect(config.recommendedWorkflows).toEqual(['archon-plan', 'archon-ship']);
     });
 
     test('coerces non-array recommendedWorkflows to undefined without throwing', async () => {
@@ -265,6 +496,28 @@ recommendedWorkflows: "archon-plan"
   });
 
   describe('loadConfig', () => {
+    test('tolerates retired YAML keys without merging or exposing them', async () => {
+      mockFsReadFile
+        .mockResolvedValueOnce(`
+paths:
+  workspaces: /unused/workspaces
+  worktrees: /unused/worktrees
+concurrency:
+  maxConversations: 7
+`)
+        .mockResolvedValueOnce(`
+defaults:
+  copyDefaults: false
+  loadDefaultCommands: false
+`);
+      const config = await loadConfig('/test/repo');
+      expect(config.concurrency.maxConversations).toBe(7);
+      expect(config.defaults.loadDefaultCommands).toBe(false);
+      expect(config).not.toHaveProperty('paths');
+      expect(config.defaults).not.toHaveProperty('copyDefaults');
+      expect(toSafeConfig(config).defaults).not.toHaveProperty('copyDefaults');
+    });
+
     test('returns defaults when no configs exist', async () => {
       const error = new Error('ENOENT') as NodeJS.ErrnoException;
       error.code = 'ENOENT';
@@ -272,37 +525,88 @@ recommendedWorkflows: "archon-plan"
 
       const config = await loadConfig();
 
-      expect(config.assistant).toBe('claude');
+      expect(config.assistant).toBeUndefined();
       // Built-ins always present; community providers (like `pi`) are
       // seeded dynamically from the registry — check the built-ins
       // explicitly rather than asserting an exhaustive shape.
       expect(config.assistants.claude).toEqual({});
       expect(config.assistants.codex).toEqual({});
-      expect(config.streaming.telegram).toBe('stream');
+      expect(config.streaming.streamtest).toBe('stream');
       expect(config.concurrency.maxConversations).toBe(10);
+      expect(config.workflows).toEqual({
+        toolCallAttentionMs: 1800000,
+        autoResumeOnQuotaReset: true,
+      });
+    });
+
+    test('merges global and repo workflow policy per field, without deprecated quota keys', async () => {
+      mockFsReadFile
+        .mockResolvedValueOnce(`
+workflows:
+  toolCallAttentionMs: 60000
+  autoResumeOnQuotaReset: true
+  quotaFallbackDelayMs: 3600000
+  quotaMaxAttempts: 2
+`)
+        .mockResolvedValueOnce(`
+workflows:
+  toolCallAttentionMs: 0
+  quotaMaxAttempts: 3
+  quotaDeadlineMs: 43200000
+`);
+
+      const config = await loadConfig('/test/repo');
+
+      expect(config.workflows).toEqual({
+        toolCallAttentionMs: 0,
+        autoResumeOnQuotaReset: true,
+      });
+    });
+
+    test('only one installed provider is the default; zero or multiple leave it unset', async () => {
+      const providers = getRegisteredProviders();
+      try {
+        clearRegistry();
+        clearConfigCache();
+        expect((await loadConfig()).assistant).toBeUndefined();
+        const codex = providers.find(provider => provider.id === 'codex');
+        if (!codex) throw new Error('missing fixture');
+        registerProvider(codex);
+        clearConfigCache();
+        expect((await loadConfig()).assistant).toBe('codex');
+        const pi = providers.find(provider => provider.id === 'pi');
+        if (!pi) throw new Error('missing fixture');
+        registerProvider(pi);
+        clearConfigCache();
+        expect((await loadConfig()).assistant).toBeUndefined();
+      } finally {
+        clearRegistry();
+        for (const provider of providers) registerProvider(provider);
+        clearConfigCache();
+      }
     });
 
     test('env var DEFAULT_AI_ASSISTANT is a fallback — config file assistant wins', async () => {
       mockFsReadFile.mockResolvedValue(`
 defaultAssistant: claude
 streaming:
-  telegram: stream
+  streamtest: stream
 `);
 
       process.env.DEFAULT_AI_ASSISTANT = 'codex';
-      process.env.TELEGRAM_STREAMING_MODE = 'batch';
+      process.env.STREAMTEST_STREAMING_MODE = 'batch';
 
       const config = await loadConfig();
 
       // Config file explicitly set 'claude' — env var must NOT override it
       expect(config.assistant).toBe('claude');
       // Streaming env var still overrides (no config-file guard needed there)
-      expect(config.streaming.telegram).toBe('batch');
+      expect(config.streaming.streamtest).toBe('batch');
     });
 
     test('env var DEFAULT_AI_ASSISTANT applies when no config file sets the assistant', async () => {
       // Global config exists but does not set defaultAssistant
-      mockFsReadFile.mockResolvedValue('streaming:\n  telegram: stream\n');
+      mockFsReadFile.mockResolvedValue('streaming:\n  streamtest: stream\n');
       process.env.DEFAULT_AI_ASSISTANT = 'codex';
 
       const config = await loadConfig();
@@ -338,7 +642,7 @@ streaming:
       mockFsReadFile.mockResolvedValue('');
       process.env.DEFAULT_AI_ASSISTANT = 'nonexistent-provider';
 
-      await expect(loadConfig()).rejects.toThrow(/not a registered provider/);
+      await expect(loadConfig()).rejects.toThrow(/Unknown provider:/);
     });
 
     test('invalid DEFAULT_AI_ASSISTANT env var is silently ignored when config file sets assistant', async () => {
@@ -353,7 +657,7 @@ streaming:
     test('throws on unknown defaultAssistant in global config', async () => {
       mockFsReadFile.mockResolvedValue('defaultAssistant: nonexistent-provider');
 
-      await expect(loadConfig()).rejects.toThrow(/not a registered provider/);
+      await expect(loadConfig()).rejects.toThrow(/Unknown provider:/);
     });
 
     test('throws on unknown assistant in repo config', async () => {
@@ -365,7 +669,7 @@ streaming:
         return '';
       });
 
-      await expect(loadConfig('/tmp/test-repo')).rejects.toThrow(/not a registered provider/);
+      await expect(loadConfig('/tmp/test-repo')).rejects.toThrow(/Unknown provider:/);
     });
 
     test('repo config overrides global config', async () => {
@@ -705,17 +1009,6 @@ env:
       const config = await loadConfig('/test/repo');
       expect(config.envVars).toBeUndefined();
     });
-
-    test('paths use archon defaults', async () => {
-      const error = new Error('ENOENT') as NodeJS.ErrnoException;
-      error.code = 'ENOENT';
-      mockFsReadFile.mockRejectedValue(error);
-
-      const config = await loadConfig();
-
-      expect(config.paths.workspaces).toBe(join(homedir(), '.archon', 'workspaces'));
-      expect(config.paths.worktrees).toBe(join(homedir(), '.archon', 'worktrees'));
-    });
   });
 
   describe('settingSources config', () => {
@@ -775,6 +1068,140 @@ assistants:
     });
   });
 
+  describe('assistants validation', () => {
+    test('global config refuses to load an effort the provider would drop', async () => {
+      mockFsReadFile.mockResolvedValue(`
+assistants:
+  codex:
+    modelReasoningEffort: extreme
+`);
+
+      await expect(loadGlobalConfig()).rejects.toThrow(
+        /assistants\.codex\.modelReasoningEffort.*minimal, low, medium, high, xhigh, max/
+      );
+      await expect(loadGlobalConfig()).rejects.toThrow(join(archonHome, 'config.yaml'));
+    });
+
+    test('repo config refuses to load an unknown provider setting', async () => {
+      mockFsReadFile.mockResolvedValue(`
+assistants:
+  claude:
+    modle: sonnet
+`);
+
+      await expect(loadRepoConfig('/test/repo')).rejects.toThrow(
+        /assistants\.claude\.modle.*unknown provider setting/
+      );
+    });
+
+    test('repo config refuses a settingSources entry Claude does not honour', async () => {
+      mockFsReadFile.mockResolvedValue(`
+assistants:
+  claude:
+    settingSources:
+      - projekt
+`);
+
+      await expect(loadRepoConfig('/test/repo')).rejects.toThrow(
+        /assistants\.claude\.settingSources\.0.*'project' or 'user'/
+      );
+    });
+
+    test('keeps process-scoped Pi defaults loadable from config.yaml', async () => {
+      mockFsReadFile.mockResolvedValue(`
+assistants:
+  pi:
+    env:
+      PLANNOTATOR_REMOTE: '1'
+    maxConcurrent: 4
+`);
+
+      const config = await loadGlobalConfig();
+      expect(config.assistants?.pi).toEqual({
+        env: { PLANNOTATOR_REMOTE: '1' },
+        maxConcurrent: 4,
+      });
+    });
+
+    // Archon owns the embedded OpenCode runtime, so a server URL has no consumer.
+    test('rejects an OpenCode server URL as an unknown setting', async () => {
+      mockFsReadFile.mockResolvedValue(`
+assistants:
+  opencode:
+    model: anthropic/claude-3-5-sonnet
+    baseUrl: http://localhost:4096
+`);
+
+      await expect(loadGlobalConfig()).rejects.toThrow(
+        /assistants\.opencode\.baseUrl.*unknown provider setting/
+      );
+    });
+
+    test.each([
+      ['an empty assistants block', 'assistants:\n'],
+      ['an empty provider block', 'assistants:\n  codex:\n'],
+    ])('loads a config with %s', async (_label, yaml) => {
+      mockFsReadFile.mockResolvedValue(yaml);
+
+      await expect(loadGlobalConfig()).resolves.toBeDefined();
+    });
+
+    test('keeps an unregistered provider entry passing through unvalidated', async () => {
+      mockFsReadFile.mockResolvedValue(`
+assistants:
+  nonesuch:
+    modelReasoningEffort: extreme
+`);
+
+      const config = await loadGlobalConfig();
+      expect(config.assistants?.nonesuch).toEqual({ modelReasoningEffort: 'extreme' });
+    });
+
+    // The settings API validates its body as `record(string, unknown)`, so any
+    // key and value can reach updateGlobalConfig at runtime even though the
+    // typed provider defaults would reject a misspelled effort value.
+    test('refuses to persist assistant defaults the loaders would then reject', async () => {
+      mockFsReadFile.mockResolvedValue('');
+
+      const misspelled: Record<string, unknown> = { modelReasoningEfort: 'high' };
+      await expect(updateGlobalConfig({ assistants: { codex: misspelled } })).rejects.toThrow(
+        /assistants\.codex\.modelReasoningEfort.*unknown provider setting/
+      );
+      expect(mockFsWriteFile).not.toHaveBeenCalled();
+    });
+
+    // Settings API and `archon ai tier/alias set` all write through
+    // updateGlobalConfig, so validating the file on read would lock the
+    // operator out of repairing it through Archon.
+    test('repairs an invalid assistant default already in the file', async () => {
+      mockFsReadFile.mockResolvedValue(`
+assistants:
+  codex:
+    modelReasoningEffort: extreme
+`);
+
+      await updateGlobalConfig({ assistants: { codex: { modelReasoningEffort: 'high' } } });
+
+      expect(mockFsWriteFile).toHaveBeenCalledTimes(1);
+      const writtenContent = mockFsWriteFile.mock.calls[0]?.[1] as string;
+      expect(writtenContent).toContain('high');
+      expect(writtenContent).not.toContain('extreme');
+    });
+
+    test('refuses an unrelated edit that leaves an invalid assistant default in place', async () => {
+      mockFsReadFile.mockResolvedValue(`
+assistants:
+  codex:
+    modelReasoningEffort: extreme
+`);
+
+      await expect(
+        updateGlobalConfig({ tiers: { large: { provider: 'claude', model: 'opus' } } })
+      ).rejects.toThrow(/assistants\.codex\.modelReasoningEffort/);
+      expect(mockFsWriteFile).not.toHaveBeenCalled();
+    });
+  });
+
   describe('updateGlobalConfig', () => {
     test('merges assistant config into existing file', async () => {
       mockFsReadFile.mockResolvedValue(`
@@ -811,6 +1238,28 @@ assistants:
       const writtenContent = mockFsWriteFile.mock.calls[0]?.[1] as string;
       expect(writtenContent).toContain('claude');
       expect(writtenContent).toContain('MyBot');
+    });
+
+    test('merges workflow continuation policy into the persisted config', async () => {
+      mockFsReadFile.mockResolvedValue(`
+workflows:
+  autoResumeOnQuotaReset: false
+  quotaMaxAttempts: 2
+`);
+
+      await updateGlobalConfig({
+        workflows: { autoResumeOnQuotaReset: true, quotaFallbackDelayMs: 60_000 },
+      });
+
+      const writtenContent = mockFsWriteFile.mock.calls[0]?.[1] as string;
+      const written = Bun.YAML.parse(writtenContent) as {
+        workflows?: Record<string, unknown>;
+      };
+      expect(written.workflows).toEqual({
+        autoResumeOnQuotaReset: true,
+        quotaMaxAttempts: 2,
+        quotaFallbackDelayMs: 60_000,
+      });
     });
 
     test('creates config when file does not exist', async () => {
@@ -900,6 +1349,147 @@ assistants:
       const written = mockFsWriteFile.mock.calls[0]?.[1] as string;
       expect(written).toContain('opus'); // tiers preserved via the {...current} spread
       expect(written).toContain('haiku');
+    });
+  });
+
+  // The loaders refuse a file with an invalid `tiers`/`aliases`/`workflows`
+  // block; a settings write must merge into what is actually on disk so it can
+  // repair the block without replacing the rest of the file.
+  describe('updateGlobalConfig over an invalid file', () => {
+    const fileWithBadTier = `
+botName: MyBot
+defaultAssistant: codex
+streaming:
+  telegram: batch
+tiers:
+  large:
+    provider: claude
+aliases:
+  fast:
+    provider: claude
+    model: haiku
+`;
+
+    test('refuses an unrelated edit that leaves an invalid tier in place', async () => {
+      mockFsReadFile.mockResolvedValue(fileWithBadTier);
+
+      await expect(
+        updateGlobalConfig({ aliases: { deep: { provider: 'claude', model: 'opus' } } })
+      ).rejects.toThrow(/Invalid model binding config.*tiers\.large\.model/);
+      expect(mockFsWriteFile).not.toHaveBeenCalled();
+    });
+
+    test('a patch that repairs the invalid tier keeps every unrelated key', async () => {
+      mockFsReadFile.mockResolvedValue(fileWithBadTier);
+
+      await updateGlobalConfig({ tiers: { large: { provider: 'claude', model: 'opus' } } });
+
+      const written = Bun.YAML.parse(mockFsWriteFile.mock.calls[0]?.[1] as string);
+      expect(written).toEqual({
+        botName: 'MyBot',
+        defaultAssistant: 'codex',
+        streaming: { telegram: 'batch' },
+        tiers: { large: { provider: 'claude', model: 'opus' } },
+        aliases: { fast: { provider: 'claude', model: 'haiku' } },
+      });
+    });
+
+    // The tier merge must not rebuild the block from the known tier names only,
+    // which would silently drop an entry it cannot represent.
+    test('a tier edit does not silently drop an unknown tier name', async () => {
+      mockFsReadFile.mockResolvedValue(`
+tiers:
+  huge:
+    provider: claude
+    model: opus
+`);
+
+      await expect(
+        updateGlobalConfig({ tiers: { small: { provider: 'claude', model: 'haiku' } } })
+      ).rejects.toThrow(/Invalid model binding config.*tiers\.huge/);
+      expect(mockFsWriteFile).not.toHaveBeenCalled();
+    });
+
+    test('refuses an unrelated edit that leaves an invalid workflows block in place', async () => {
+      mockFsReadFile.mockResolvedValue(`
+botName: MyBot
+workflows:
+  quotaMaxAttempts: many
+`);
+
+      await expect(updateGlobalConfig({ defaultAssistant: 'claude' })).rejects.toThrow(
+        /Invalid workflows config.*quotaMaxAttempts/
+      );
+      expect(mockFsWriteFile).not.toHaveBeenCalled();
+    });
+
+    test('a patch that repairs the invalid workflows block keeps every unrelated key', async () => {
+      mockFsReadFile.mockResolvedValue(`
+botName: MyBot
+workflows:
+  quotaMaxAttempts: many
+`);
+
+      await updateGlobalConfig({ workflows: { quotaMaxAttempts: 3 } });
+
+      const written = Bun.YAML.parse(mockFsWriteFile.mock.calls[0]?.[1] as string);
+      expect(written).toEqual({ botName: 'MyBot', workflows: { quotaMaxAttempts: 3 } });
+    });
+
+    test('an edit to one provider does not overwrite a malformed entry for another', async () => {
+      mockFsReadFile.mockResolvedValue(`
+assistants:
+  codex: high
+`);
+
+      await expect(
+        updateGlobalConfig({ assistants: { claude: { model: 'opus' } } })
+      ).rejects.toThrow(/assistants\.codex' must be an object/);
+      expect(mockFsWriteFile).not.toHaveBeenCalled();
+    });
+
+    // The settings API returns 400 for this class and 500 for anything else, and
+    // shows `summary` to the web client, so it must not carry the server's path.
+    test('a refused edit is an InvalidConfigError whose summary names the key, not the path', async () => {
+      mockFsReadFile.mockResolvedValue(fileWithBadTier);
+
+      const error = await updateGlobalConfig({ defaultAssistant: 'claude' }).catch(
+        (e: unknown) => e
+      );
+
+      expect(error).toBeInstanceOf(InvalidConfigError);
+      const { summary } = error as InvalidConfigError;
+      expect(summary).toMatch(/^Invalid model binding config: tiers\.large\.model/);
+      expect(summary).not.toContain('config.yaml');
+    });
+
+    test('never overwrites a file that is not valid YAML', async () => {
+      mockFsReadFile.mockResolvedValue('botName: MyBot\ntiers: [unclosed\n');
+
+      await expect(updateGlobalConfig({ defaultAssistant: 'claude' })).rejects.toThrow(
+        /config\.yaml/
+      );
+      expect(mockFsWriteFile).not.toHaveBeenCalled();
+    });
+
+    test('never overwrites a file whose top level is not a map', async () => {
+      mockFsReadFile.mockResolvedValue('- botName: MyBot\n');
+
+      await expect(updateGlobalConfig({ defaultAssistant: 'claude' })).rejects.toThrow(
+        /not a map of settings/
+      );
+      expect(mockFsWriteFile).not.toHaveBeenCalled();
+    });
+
+    test('never overwrites a file that cannot be read', async () => {
+      const permError = new Error('Permission denied') as NodeJS.ErrnoException;
+      permError.code = 'EACCES';
+      mockFsReadFile.mockRejectedValue(permError);
+
+      await expect(updateGlobalConfig({ defaultAssistant: 'claude' })).rejects.toThrow(
+        'Permission denied'
+      );
+      expect(mockFsWriteFile).not.toHaveBeenCalled();
     });
   });
 

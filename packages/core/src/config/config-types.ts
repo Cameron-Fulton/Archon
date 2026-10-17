@@ -1,3 +1,6 @@
+import type { WorktreeCreateConfig } from '@archon/isolation';
+import type { WorkflowStoreKind } from '@archon/workflows/store';
+import type { ResolvedWorkflowPolicy } from '@archon/workflows/schemas/run-config';
 /**
  * Configuration types for Archon YAML config files
  *
@@ -5,14 +8,42 @@
  * - Global: ~/.archon/config.yaml (user preferences)
  * - Repository: .archon/config.yaml (project settings)
  */
+import { z } from '@hono/zod-openapi';
+import { identityPlatformSchema } from '../schemas/user';
+
+export const streamingModeSchema = z.enum(['stream', 'batch']);
+export const platformStreamingSchema = z.record(identityPlatformSchema, streamingModeSchema);
+export type PlatformStreaming = z.infer<typeof platformStreamingSchema>;
+
+/** An install-level chat route for attention notices. `destination` is opaque to Archon. */
+export const attentionNoticeRouteSchema = z.object({
+  platform: identityPlatformSchema,
+  destination: z.string().min(1),
+});
+export type AttentionNoticeRoute = z.infer<typeof attentionNoticeRouteSchema>;
+/** The id a route's ledger rows and health entry carry; a platform cannot contain ':'. */
+export function attentionNoticeRouteId(route: AttentionNoticeRoute): string {
+  return `${route.platform}:${route.destination}`;
+}
+export const attentionNoticeRoutesSchema = z
+  .array(attentionNoticeRouteSchema)
+  .superRefine((routes, ctx) => {
+    const seen = new Set<string>();
+    for (const [index, route] of routes.entries()) {
+      const id = attentionNoticeRouteId(route);
+      if (seen.has(id))
+        ctx.addIssue({ code: 'custom', path: [index], message: `duplicate route '${id}'` });
+      seen.add(id);
+    }
+  });
 
 /**
  * Global configuration (non-secret user preferences)
  * Located at ~/.archon/config.yaml
  */
 
-// Provider config defaults — canonical definitions live in @archon/providers/types.
-// Imported and re-exported here so existing consumers don't break.
+// Provider config defaults — each type is derived from its provider's config
+// schema and re-exported through @archon/providers/types.
 import type {
   ClaudeProviderDefaults,
   CodexProviderDefaults,
@@ -21,6 +52,10 @@ import type {
   ProviderDefaultsMap,
 } from '@archon/providers/types';
 import type { RawAliasesConfig, RawTiersConfig } from '@archon/workflows/model-validation';
+import {
+  workflowRunContinuationConfigSchema,
+  type WorkflowRunConfigLayer,
+} from '@archon/workflows/schemas/run-config';
 
 export type {
   ClaudeProviderDefaults,
@@ -55,8 +90,8 @@ export type AssistantDefaultsConfig = ProviderDefaultsMap & {
  * `getDefaults()` seeds every registered provider (built-in + community)
  * with `{}`, so community providers appear in the map too — just typed as
  * `ProviderDefaults` via the generic index rather than a specific shape.
- * `registerBuiltinProviders()` is called before `loadConfig()` at every
- * process entrypoint, so claude/codex are guaranteed present.
+ * `getDefaults()` also seeds claude and codex, so their slots exist even when
+ * a release binary has not installed those providers.
  */
 export type AssistantDefaults = ProviderDefaultsMap & {
   claude: ClaudeProviderDefaults;
@@ -106,6 +141,7 @@ export interface ContainerConfig {
 }
 
 export interface GlobalConfig {
+  store?: WorkflowStoreKind;
   /**
    * Bot display name (shown in messages)
    * @default 'Archon'
@@ -137,30 +173,15 @@ export interface GlobalConfig {
   tiers?: RawTiersConfig;
 
   /**
-   * Platform streaming preferences (can be overridden per conversation)
+   * Platform streaming preferences
    */
-  streaming?: {
-    telegram?: 'stream' | 'batch';
-    discord?: 'stream' | 'batch';
-    slack?: 'stream' | 'batch';
-  };
+  streaming?: PlatformStreaming;
 
   /**
-   * Directory preferences (usually not needed - defaults work well)
+   * Chat routes that receive a notice when a run needs attention, and a follow-up
+   * when it ends. Global only: repository config never carries routes.
    */
-  paths?: {
-    /**
-     * Override workspaces directory
-     * @default '~/.archon/workspaces'
-     */
-    workspaces?: string;
-
-    /**
-     * Override worktrees directory
-     * @default '~/.archon/worktrees'
-     */
-    worktrees?: string;
-  };
+  attentionNotices?: AttentionNoticeRoute[];
 
   /**
    * Concurrency limits
@@ -171,6 +192,12 @@ export interface GlobalConfig {
      * @default 10
      */
     maxConversations?: number;
+    /**
+     * Opt-in install-wide cap on simultaneous provider attempts, keyed by provider
+     * registration ID (e.g. `claude: 4`). Pi also honors `assistants.pi.maxConcurrent`.
+     * Read fresh and strictly at every attempt by `loadProviderConcurrencyCaps`.
+     */
+    providers?: Record<string, number>;
   };
 
   /**
@@ -178,7 +205,15 @@ export interface GlobalConfig {
    * overrides these per-field.
    */
   container?: ContainerConfig;
+
+  /** Operator policy for live tool attention and quota continuation. */
+  workflows?: WorkflowContinuationConfig;
 }
+
+// Ordinary global/repo config remains forward-compatible: unlike the explicitly
+// selected run layer, it strips extension keys it does not understand yet.
+export const workflowContinuationConfigSchema = workflowRunContinuationConfigSchema.strip();
+export type WorkflowContinuationConfig = NonNullable<WorkflowRunConfigLayer['workflows']>;
 
 /**
  * Repository configuration (project-specific settings)
@@ -202,6 +237,9 @@ export interface RepoConfig {
   /** Repo-level model tier presets — override global tiers with same name. */
   tiers?: RawTiersConfig;
 
+  /** Project override for live tool attention and quota continuation. */
+  workflows?: WorkflowContinuationConfig;
+
   /**
    * Commands configuration
    */
@@ -222,69 +260,7 @@ export interface RepoConfig {
   /**
    * Worktree settings for this repository
    */
-  worktree?: {
-    /**
-     * Base branch for worktrees (e.g., 'main', 'develop')
-     * @default auto-detected from repo
-     */
-    baseBranch?: string;
-
-    /**
-     * Git-ignored files/directories to copy from main repo to new worktrees.
-     * Tracked files are already in worktrees — only use this for git-ignored files.
-     * @example [".env", ".archon", "data/fixtures/"]
-     */
-    copyFiles?: string[];
-
-    /**
-     * Initialize git submodules in new worktrees.
-     * Runs `git submodule update --init --recursive` after worktree creation
-     * when the repo contains a `.gitmodules` file. Repos without submodules
-     * pay zero cost (the check short-circuits).
-     *
-     * Set to `false` to skip submodule init (e.g., when submodules are not
-     * needed by any workflow or when fetch cost is prohibitive).
-     * @default true
-     */
-    initSubmodules?: boolean;
-
-    /**
-     * Per-project worktree directory (relative to repo root). When set,
-     * worktrees are created at `<repoRoot>/<path>/<branch>` instead of under
-     * `~/.archon/worktrees/` or the workspaces layout.
-     *
-     * Opt-in — co-locates worktrees with the repo so they appear in the IDE
-     * file tree. The user is responsible for adding the directory to their
-     * `.gitignore` (no automatic file mutation).
-     *
-     * Path resolution precedence (highest to lowest):
-     *   1. this `worktree.path` (repo-local)
-     *   2. global `paths.worktrees` (absolute override in `~/.archon/config.yaml`)
-     *   3. auto-detected project-scoped (`~/.archon/workspaces/owner/repo/...`)
-     *   4. default global (`~/.archon/worktrees/`)
-     *
-     * Must be a safe relative path: no leading `/`, no `..` segments. Absolute
-     * or escaping values fail loudly at worktree creation (Fail Fast — no silent
-     * fallback).
-     *
-     * @example '.worktrees'
-     */
-    path?: string;
-
-    /**
-     * Git remote name for fetch/push operations.
-     *
-     * When set, all git operations (fetch, push, branch tracking) use this
-     * remote instead of 'origin'. Useful for repos with multiple remotes or
-     * non-standard naming conventions.
-     *
-     * When omitted, auto-detected: 'origin' if it exists, otherwise the sole
-     * remote if only one is configured.
-     *
-     * @example 'upstream'
-     */
-    remote?: string;
-  };
+  worktree?: WorktreeCreateConfig;
 
   /**
    * Documentation directory settings
@@ -312,8 +288,8 @@ export interface RepoConfig {
 
   /**
    * Repo-owner-curated list of recommended workflow names, in display order.
-   * Pinned on top of both the Workflows page and the sidebar run dropdown
-   * under a "Recommended for this project" header. Names not matching any
+   * The console new-run picker shows these under "Recommended for this project"
+   * and remaining choices under "Other workflows". Names not matching any
    * discovered workflow are silently ignored (advisory).
    */
   recommendedWorkflows?: string[];
@@ -322,14 +298,6 @@ export interface RepoConfig {
    * Default commands/workflows configuration
    */
   defaults?: {
-    /**
-     * Copy bundled default commands and workflows on clone
-     * Set to false to skip copying defaults
-     * @default true
-     * @deprecated Use loadDefaultCommands/loadDefaultWorkflows instead
-     */
-    copyDefaults?: boolean;
-
     /**
      * Load app's bundled default commands at runtime
      * Set to false to only use repo-specific commands
@@ -352,7 +320,7 @@ export interface RepoConfig {
  */
 export interface MergedConfig {
   botName: string;
-  assistant: string;
+  assistant: string | undefined;
   assistants: AssistantDefaults;
   /**
    * Merged aliases (repo > global). Used by buildAiProfile at execution time.
@@ -364,18 +332,12 @@ export interface MergedConfig {
    * Undefined when no tiers are configured anywhere.
    */
   tiers?: RawTiersConfig;
-  streaming: {
-    telegram: 'stream' | 'batch';
-    discord: 'stream' | 'batch';
-    slack: 'stream' | 'batch';
-  };
-  paths: {
-    workspaces: string;
-    worktrees: string;
-  };
+  streaming: PlatformStreaming;
+  attentionNotices: AttentionNoticeRoute[];
   concurrency: {
     maxConversations: number;
   };
+  workflows: ResolvedWorkflowPolicy;
   commands: {
     /**
      * Additional command folder to search (relative to repo root)
@@ -385,7 +347,6 @@ export interface MergedConfig {
     autoLoad: boolean;
   };
   defaults: {
-    copyDefaults: boolean;
     loadDefaultCommands: boolean;
     loadDefaultWorkflows: boolean;
   };
@@ -427,21 +388,13 @@ export interface MergedConfig {
  */
 export interface SafeConfig {
   botName: string;
-  assistant: string;
+  assistant: string | undefined;
   assistants: ProviderDefaultsMap;
-  streaming: {
-    telegram: 'stream' | 'batch';
-    discord: 'stream' | 'batch';
-    slack: 'stream' | 'batch';
-  };
+  streaming: PlatformStreaming;
   concurrency: {
     maxConversations: number;
   };
-  defaults: {
-    copyDefaults: boolean;
-    loadDefaultCommands: boolean;
-    loadDefaultWorkflows: boolean;
-  };
+  defaults: MergedConfig['defaults'];
   /** Configured small/medium/large tier presets (merged repo > global). */
   tiers?: RawTiersConfig;
   /**

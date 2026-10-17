@@ -1,3 +1,4 @@
+// @archon-test-isolated
 import { describe, test, expect, afterEach } from 'bun:test';
 import { createHash } from 'node:crypto';
 import {
@@ -6,6 +7,7 @@ import {
   exchangeOpenAiAuthorizationCode,
   refreshOpenAiOAuthCredentials,
   mintOpenAiOAuthApiKey,
+  OpenAiTokenError,
 } from './openai-oauth';
 
 /** Build an unsigned JWT-shaped token with the given payload. */
@@ -23,14 +25,22 @@ const ACCESS_WITHOUT_ACCOUNT = fakeJwt({ sub: 'nobody' });
 // fetch stub — restored after each test (no mock.module; global only).
 const realFetch = globalThis.fetch;
 let lastRequest: { url: string; body: URLSearchParams } | undefined;
+function installFetch(
+  implementation: (
+    ...args: Parameters<typeof globalThis.fetch>
+  ) => ReturnType<typeof globalThis.fetch>
+): void {
+  globalThis.fetch = Object.assign(implementation, { preconnect: realFetch.preconnect });
+}
+
 function stubTokenEndpoint(status: number, json: unknown): void {
-  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+  installFetch(async (input, init) => {
     lastRequest = {
       url: String(input),
       body: new URLSearchParams(String(init?.body)),
     };
     return new Response(JSON.stringify(json), { status });
-  }) as typeof fetch;
+  });
 }
 
 afterEach(() => {
@@ -157,8 +167,7 @@ describe('exchangeOpenAiAuthorizationCode', () => {
   });
 
   test('HTTP 200 with a non-JSON body → labeled error, not a raw SyntaxError (I2)', async () => {
-    globalThis.fetch = (async () =>
-      new Response('<html>maintenance</html>', { status: 200 })) as typeof fetch;
+    installFetch(async () => new Response('<html>maintenance</html>', { status: 200 }));
     await expect(exchangeOpenAiAuthorizationCode('C', 'V')).rejects.toThrow(
       /non-JSON response \(HTTP 200\)/
     );
@@ -212,19 +221,46 @@ describe('refreshOpenAiOAuthCredentials', () => {
       /refresh failed \(401\): invalid_grant/
     );
   });
+
+  test('a token endpoint answer carries its HTTP status; a network failure carries none', async () => {
+    stubTokenEndpoint(401, { error: 'invalid_grant' });
+    const rejected = await refreshOpenAiOAuthCredentials(stored).catch((e: unknown) => e);
+    expect(rejected).toBeInstanceOf(OpenAiTokenError);
+    expect((rejected as OpenAiTokenError).status).toBe(401);
+
+    installFetch(async () => {
+      throw new TypeError('fetch failed');
+    });
+    const unreachable = await refreshOpenAiOAuthCredentials(stored).catch((e: unknown) => e);
+    expect(unreachable).toBeInstanceOf(OpenAiTokenError);
+    expect((unreachable as OpenAiTokenError).status).toBeUndefined();
+  });
 });
 
 describe('mintOpenAiOAuthApiKey', () => {
+  test('an expired blob whose refresh is rejected keeps the HTTP status on the error', async () => {
+    stubTokenEndpoint(401, { error: 'invalid_grant' });
+    const rejected = await mintOpenAiOAuthApiKey({
+      access: 'old-access',
+      refresh: 'old-refresh',
+      expires: 1,
+      accountId: 'acct-42',
+      id_token: 'old-idt',
+    }).catch((e: unknown) => e);
+    expect(rejected).toBeInstanceOf(OpenAiTokenError);
+    expect((rejected as OpenAiTokenError).status).toBe(401);
+  });
+
   test('unexpired blob → returned as-is, no network call', async () => {
     let fetched = 0;
-    globalThis.fetch = (async () => {
+    installFetch(async () => {
       fetched++;
       return new Response('{}');
-    }) as typeof fetch;
+    });
     const creds = {
       access: 'a1',
       refresh: 'r1',
-      expires: Date.now() + 60_000,
+      expires: Date.now() + 60 * 60_000,
       accountId: 'acct-42',
       id_token: 'i1',
     };
@@ -236,7 +272,7 @@ describe('mintOpenAiOAuthApiKey', () => {
   test('legacy/corrupt row with no usable access token → null, no throw (S1)', async () => {
     // The narrow parameter type is a write-time promise; decrypted rows can
     // still be junk — simulate one via the same assertion the store performs.
-    const corrupt = { expires: Date.now() + 60_000 } as unknown as Parameters<
+    const corrupt = { expires: Date.now() + 60 * 60_000 } as unknown as Parameters<
       typeof mintOpenAiOAuthApiKey
     >[0];
     expect(await mintOpenAiOAuthApiKey(corrupt)).toBeNull();
@@ -258,5 +294,22 @@ describe('mintOpenAiOAuthApiKey', () => {
     expect(out!.apiKey).toBe(ACCESS_WITH_ACCOUNT);
     expect(out!.newCredentials.id_token).toBe('keep-me');
     expect(out!.newCredentials.refresh).toBe('r2');
+  });
+
+  test('a blob that expires within five minutes refreshes before delivery', async () => {
+    // Codex gets only the access token, and Archon cannot refresh it mid-turn.
+    stubTokenEndpoint(200, {
+      access_token: ACCESS_WITH_ACCOUNT,
+      refresh_token: 'r2',
+      expires_in: 3600,
+    });
+    const out = await mintOpenAiOAuthApiKey({
+      access: 'a1',
+      refresh: 'r1',
+      expires: Date.now() + 60_000,
+      accountId: 'acct-42',
+      id_token: 'i1',
+    });
+    expect(out!.apiKey).toBe(ACCESS_WITH_ACCOUNT);
   });
 });

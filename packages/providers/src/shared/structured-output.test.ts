@@ -1,12 +1,9 @@
 import { describe, expect, test } from 'bun:test';
-
 import {
   augmentPromptForJsonSchema,
-  formatSchemaErrors,
-  hasOpenAdditionalProperties,
-  normalizeJsonSchemaForOpenAiStrict,
   tryParseStructuredOutput,
-  validateStructuredOutput,
+  normalizeJsonSchemaForOpenAiStrict,
+  hasOpenAdditionalProperties,
 } from './structured-output';
 
 describe('augmentPromptForJsonSchema', () => {
@@ -121,72 +118,6 @@ After careful evaluation, here is the JSON:
     expect(
       tryParseStructuredOutput('Here is the JSON:\n{"ok":true}\nHope this helps!')
     ).toBeUndefined();
-  });
-});
-
-describe('validateStructuredOutput', () => {
-  const schema = {
-    type: 'object',
-    properties: { summary: { type: 'string' }, count: { type: 'number' } },
-    required: ['summary'],
-  };
-
-  test('valid value passes', () => {
-    const r = validateStructuredOutput({ summary: 'hi', count: 2 }, schema);
-    expect(r.valid).toBe(true);
-  });
-
-  test('missing required field fails with a root-level error', () => {
-    const r = validateStructuredOutput({ count: 2 }, schema);
-    expect(r.valid).toBe(false);
-    if (r.valid) return;
-    expect(r.errors.length).toBeGreaterThan(0);
-    expect(r.errors.some(e => e.includes('summary'))).toBe(true);
-  });
-
-  test('wrong type fails with a path-scoped error', () => {
-    const r = validateStructuredOutput({ summary: 'hi', count: 'two' }, schema);
-    expect(r.valid).toBe(false);
-    if (r.valid) return;
-    expect(r.errors.some(e => e.startsWith('/count'))).toBe(true);
-  });
-
-  test('enum violation fails', () => {
-    const enumSchema = { type: 'object', properties: { kind: { enum: ['A', 'B'] } } };
-    expect(validateStructuredOutput({ kind: 'C' }, enumSchema).valid).toBe(false);
-    expect(validateStructuredOutput({ kind: 'A' }, enumSchema).valid).toBe(true);
-  });
-
-  test('optional field absent is still valid (additionalProperties not required)', () => {
-    expect(validateStructuredOutput({ summary: 'hi' }, schema).valid).toBe(true);
-  });
-
-  test('uncompilable schema fails SAFE (valid:true) and reports via onCompileError', () => {
-    let compileError: string | undefined;
-    // `$ref` to a non-existent definition makes ajv.compile throw.
-    const broken = { type: 'object', properties: { a: { $ref: '#/$defs/missing' } } };
-    const r = validateStructuredOutput({ a: 1 }, broken, msg => {
-      compileError = msg;
-    });
-    expect(r.valid).toBe(true);
-    expect(compileError).toBeDefined();
-  });
-});
-
-describe('formatSchemaErrors', () => {
-  test('renders root-level missing-property failures with the property name', () => {
-    const r = validateStructuredOutput(
-      {},
-      { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] }
-    );
-    expect(r.valid).toBe(false);
-    if (r.valid) return;
-    expect(r.errors.some(line => line.startsWith('(root):') && line.includes('name'))).toBe(true);
-  });
-
-  test('returns a generic line for null/empty error input', () => {
-    expect(formatSchemaErrors(null)).toEqual(['value does not match the declared schema']);
-    expect(formatSchemaErrors([])).toEqual(['value does not match the declared schema']);
   });
 });
 

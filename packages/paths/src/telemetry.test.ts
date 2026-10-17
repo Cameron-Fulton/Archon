@@ -1,5 +1,6 @@
-import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test';
+import { describe, test, expect, beforeEach, afterEach, spyOn, jest } from 'bun:test';
 import { tmpdir } from 'os';
+import { setImmediate } from 'node:timers/promises';
 import { join } from 'path';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 
@@ -11,7 +12,8 @@ import {
   captureChatTurn,
   captureApprovalResolved,
   captureCodebaseRegistered,
-  captureWorkflowCompleted,
+  captureWorkflowTerminal,
+  runRefForTelemetry,
   classifyWorkflowForTelemetry,
   sanitizeModelForTelemetry,
   shutdownTelemetry,
@@ -19,6 +21,9 @@ import {
   getOrCreateTelemetryId,
   getTelemetryStatus,
   resetTelemetryId,
+  resolveInstallChannel,
+  NOTICE_STAMP_FILENAME,
+  TELEMETRY_SCHEMA_VERSION,
 } from './telemetry';
 
 const ENV_VARS = [
@@ -258,7 +263,7 @@ describe('first-run notice (via captureWorkflowInvoked)', () => {
   let saved: Record<string, string | undefined>;
   let tmpHome: string;
   let originalIsTTY: boolean | undefined;
-  const stampPath = (): string => join(tmpHome, 'telemetry-notice-shown-v4');
+  const stampPath = (): string => join(tmpHome, NOTICE_STAMP_FILENAME);
 
   beforeEach(() => {
     saved = saveEnv();
@@ -287,7 +292,7 @@ describe('first-run notice (via captureWorkflowInvoked)', () => {
   test('does not write the notice when stderr is not a TTY', () => {
     setTTY(false);
     const writeSpy = spyOn(process.stderr, 'write').mockImplementation(() => true);
-    captureWorkflowInvoked({ workflowName: 'w' });
+    captureWorkflowInvoked({ runId: 'run-1', isChild: false, workflowName: 'w' });
     expect(writeSpy).not.toHaveBeenCalled();
     expect(existsSync(stampPath())).toBe(false);
     writeSpy.mockRestore();
@@ -296,7 +301,7 @@ describe('first-run notice (via captureWorkflowInvoked)', () => {
   test('writes the notice once on first invocation (TTY, no stamp) and stamps it', () => {
     setTTY(true);
     const writeSpy = spyOn(process.stderr, 'write').mockImplementation(() => true);
-    captureWorkflowInvoked({ workflowName: 'w' });
+    captureWorkflowInvoked({ runId: 'run-1', isChild: false, workflowName: 'w' });
     expect(writeSpy).toHaveBeenCalledTimes(1);
     expect(String(writeSpy.mock.calls[0]?.[0])).toContain('anonymous usage telemetry');
     expect(existsSync(stampPath())).toBe(true);
@@ -306,8 +311,8 @@ describe('first-run notice (via captureWorkflowInvoked)', () => {
   test('does not write again in the same process (noticeChecked guard)', () => {
     setTTY(true);
     const writeSpy = spyOn(process.stderr, 'write').mockImplementation(() => true);
-    captureWorkflowInvoked({ workflowName: 'w' });
-    captureWorkflowInvoked({ workflowName: 'w2' });
+    captureWorkflowInvoked({ runId: 'run-1', isChild: false, workflowName: 'w' });
+    captureWorkflowInvoked({ runId: 'run-1', isChild: false, workflowName: 'w2' });
     expect(writeSpy).toHaveBeenCalledTimes(1);
     writeSpy.mockRestore();
   });
@@ -317,7 +322,7 @@ describe('first-run notice (via captureWorkflowInvoked)', () => {
     writeFileSync(stampPath(), '2026-01-01T00:00:00.000Z', 'utf8');
     setTTY(true);
     const writeSpy = spyOn(process.stderr, 'write').mockImplementation(() => true);
-    captureWorkflowInvoked({ workflowName: 'w' });
+    captureWorkflowInvoked({ runId: 'run-1', isChild: false, workflowName: 'w' });
     expect(writeSpy).not.toHaveBeenCalled();
     writeSpy.mockRestore();
   });
@@ -327,7 +332,7 @@ describe('first-run notice (via captureWorkflowInvoked)', () => {
     process.env.DO_NOT_TRACK = '1';
     resetTelemetryForTests();
     const writeSpy = spyOn(process.stderr, 'write').mockImplementation(() => true);
-    captureWorkflowInvoked({ workflowName: 'w' });
+    captureWorkflowInvoked({ runId: 'run-1', isChild: false, workflowName: 'w' });
     expect(writeSpy).not.toHaveBeenCalled();
     expect(existsSync(stampPath())).toBe(false);
     writeSpy.mockRestore();
@@ -351,6 +356,8 @@ describe('captureWorkflowInvoked when disabled', () => {
   test('does not throw when telemetry is disabled', () => {
     expect(() => {
       captureWorkflowInvoked({
+        runId: 'run-1',
+        isChild: false,
         workflowName: 'test-workflow',
         platform: 'cli',
       });
@@ -382,7 +389,7 @@ describe('telemetry ID persistence', () => {
   });
 
   test('calling capture while disabled does not create a telemetry-id file', () => {
-    captureWorkflowInvoked({ workflowName: 'w' });
+    captureWorkflowInvoked({ runId: 'run-1', isChild: false, workflowName: 'w' });
     expect(existsSync(join(tmpHome, 'telemetry-id'))).toBe(false);
   });
 
@@ -404,9 +411,8 @@ describe('telemetry ID persistence', () => {
 });
 
 describe('classifyWorkflowForTelemetry', () => {
-  test('bundled workflows report their real name and is_builtin true', () => {
+  test('bundled workflows report their real name', () => {
     expect(classifyWorkflowForTelemetry('implement', 'bundled')).toEqual({
-      is_builtin: true,
       workflow_name: 'implement',
       workflow_source: 'bundled',
     });
@@ -414,7 +420,6 @@ describe('classifyWorkflowForTelemetry', () => {
 
   test('project workflows are redacted to "custom" and report their source', () => {
     expect(classifyWorkflowForTelemetry('deploy-acme-prod', 'project')).toEqual({
-      is_builtin: false,
       workflow_name: 'custom',
       workflow_source: 'project',
     });
@@ -422,7 +427,6 @@ describe('classifyWorkflowForTelemetry', () => {
 
   test('global workflows are also redacted to "custom"', () => {
     expect(classifyWorkflowForTelemetry('my-global', 'global')).toEqual({
-      is_builtin: false,
       workflow_name: 'custom',
       workflow_source: 'global',
     });
@@ -430,12 +434,72 @@ describe('classifyWorkflowForTelemetry', () => {
 
   test('undefined source defaults to the privacy-safe custom/project treatment', () => {
     expect(classifyWorkflowForTelemetry('anything', undefined)).toEqual({
-      is_builtin: false,
       workflow_name: 'custom',
       workflow_source: 'project',
     });
   });
 });
+
+interface WireEvent {
+  event: string;
+  properties: Record<string, unknown>;
+}
+
+const TEST_FLUSH_TIMEOUT_MS = 10000;
+
+async function captureTelemetry(capture: () => void): Promise<WireEvent[]> {
+  delete process.env.ARCHON_TELEMETRY_DISABLED;
+  delete process.env.DO_NOT_TRACK;
+  delete process.env.CI;
+  delete process.env.POSTHOG_API_KEY;
+  const bodies: (string | Blob)[] = [];
+  const fetchImpl = Object.assign(
+    (url: Parameters<typeof fetch>[0], options?: Parameters<typeof fetch>[1]) => {
+      options?.signal?.throwIfAborted();
+      const body = options?.body;
+      if (String(url).endsWith('/batch/') && (typeof body === 'string' || body instanceof Blob)) {
+        bodies.push(body);
+      }
+      return Promise.resolve(new Response('{"status":"ok"}', { status: 200 }));
+    },
+    { preconnect: (): void => undefined }
+  );
+  const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation(fetchImpl);
+  try {
+    try {
+      capture();
+    } finally {
+      // Wire assertions need delivery even when CPU contention exceeds the exit budget.
+      await shutdownTelemetry(TEST_FLUSH_TIMEOUT_MS);
+    }
+    const events: WireEvent[] = [];
+    for (const body of bodies) {
+      const text =
+        typeof body === 'string'
+          ? body
+          : new TextDecoder().decode(Bun.gunzipSync(new Uint8Array(await body.arrayBuffer())));
+      events.push(...(JSON.parse(text) as { batch: WireEvent[] }).batch);
+    }
+    return events;
+  } finally {
+    fetchSpy.mockRestore();
+  }
+}
+
+function eventProperties(
+  events: WireEvent[],
+  name: string,
+  workflowName?: string
+): Record<string, unknown> {
+  const event = events.find(
+    event =>
+      event.event === name &&
+      (workflowName === undefined || event.properties.workflow_name === workflowName)
+  );
+  if (!event)
+    throw new Error(`Missing telemetry event: ${name} (${workflowName ?? 'any workflow'})`);
+  return event.properties;
+}
 
 describe('new capture functions are fire-and-forget no-throw', () => {
   let saved: Record<string, string | undefined>;
@@ -460,20 +524,42 @@ describe('new capture functions are fire-and-forget no-throw', () => {
   });
 
   test('captureArchonStarted does not throw (enabled)', async () => {
-    delete process.env.ARCHON_TELEMETRY_DISABLED;
-    delete process.env.DO_NOT_TRACK;
-    delete process.env.CI;
-    delete process.env.POSTHOG_API_KEY;
-    // Stub the transport so the enabled path never touches the network, then
-    // flush deterministically before restoring (no flaky timers / real ingest).
-    const fetchSpy = spyOn(globalThis, 'fetch').mockResolvedValue(
-      new Response('{"status":"ok"}', { status: 200 })
-    );
-    try {
+    await captureTelemetry(() => {
       expect(() => captureArchonStarted({ surface: 'server' })).not.toThrow();
-      await shutdownTelemetry();
+    });
+  });
+
+  test('wire capture survives compression completing after the production exit deadline', async () => {
+    const compressed = Promise.withResolvers<void>();
+    const releaseCompression = Promise.withResolvers<void>();
+    const originalBlob = Response.prototype.blob;
+    const blobSpy = spyOn(Response.prototype, 'blob').mockImplementation(async function (
+      this: Response
+    ) {
+      const body = await originalBlob.call(this);
+      compressed.resolve();
+      await releaseCompression.promise;
+      return body;
+    });
+    jest.useFakeTimers();
+    try {
+      const captured = captureTelemetry(() => captureArchonStarted({ surface: 'cli' }));
+      await compressed.promise;
+      // Hold the real gzip result past 75 ms, then drain deadline reactions before delivery.
+      jest.advanceTimersByTime(76);
+      await setImmediate();
+      releaseCompression.resolve();
+      const events = await captured;
+      expect(eventProperties(events, 'archon_started')).toMatchObject({
+        schema_version: TELEMETRY_SCHEMA_VERSION,
+        surface: 'cli',
+        $ip: '',
+        $process_person_profile: false,
+      });
     } finally {
-      fetchSpy.mockRestore();
+      releaseCompression.resolve();
+      jest.useRealTimers();
+      blobSpy.mockRestore();
     }
   });
 
@@ -483,19 +569,9 @@ describe('new capture functions are fire-and-forget no-throw', () => {
   });
 
   test('captureArchonActive does not throw (enabled)', async () => {
-    delete process.env.ARCHON_TELEMETRY_DISABLED;
-    delete process.env.DO_NOT_TRACK;
-    delete process.env.CI;
-    delete process.env.POSTHOG_API_KEY;
-    const fetchSpy = spyOn(globalThis, 'fetch').mockResolvedValue(
-      new Response('{"status":"ok"}', { status: 200 })
-    );
-    try {
+    await captureTelemetry(() => {
       expect(() => captureArchonActive({ surface: 'server' })).not.toThrow();
-      await shutdownTelemetry();
-    } finally {
-      fetchSpy.mockRestore();
-    }
+    });
   });
 
   test('captureChatTurn does not throw (disabled)', () => {
@@ -507,21 +583,11 @@ describe('new capture functions are fire-and-forget no-throw', () => {
   });
 
   test('captureChatTurn does not throw (enabled)', async () => {
-    delete process.env.ARCHON_TELEMETRY_DISABLED;
-    delete process.env.DO_NOT_TRACK;
-    delete process.env.CI;
-    delete process.env.POSTHOG_API_KEY;
-    const fetchSpy = spyOn(globalThis, 'fetch').mockResolvedValue(
-      new Response('{"status":"ok"}', { status: 200 })
-    );
-    try {
+    await captureTelemetry(() => {
       expect(() =>
         captureChatTurn({ platform: 'web', provider: 'codex', outcome: 'completed' })
       ).not.toThrow();
-      await shutdownTelemetry();
-    } finally {
-      fetchSpy.mockRestore();
-    }
+    });
   });
 
   test('captureApprovalResolved does not throw (disabled)', () => {
@@ -531,19 +597,9 @@ describe('new capture functions are fire-and-forget no-throw', () => {
   });
 
   test('captureApprovalResolved does not throw (enabled)', async () => {
-    delete process.env.ARCHON_TELEMETRY_DISABLED;
-    delete process.env.DO_NOT_TRACK;
-    delete process.env.CI;
-    delete process.env.POSTHOG_API_KEY;
-    const fetchSpy = spyOn(globalThis, 'fetch').mockResolvedValue(
-      new Response('{"status":"ok"}', { status: 200 })
-    );
-    try {
+    await captureTelemetry(() => {
       expect(() => captureApprovalResolved({ resolution: 'approved' })).not.toThrow();
-      await shutdownTelemetry();
-    } finally {
-      fetchSpy.mockRestore();
-    }
+    });
   });
 
   test('captureChatTurn accepts v4 usage fields without throwing (disabled)', () => {
@@ -562,10 +618,10 @@ describe('new capture functions are fire-and-forget no-throw', () => {
     ).not.toThrow();
   });
 
-  test('captureWorkflowCompleted accepts v4 usage fields without throwing (disabled)', () => {
+  test('captureWorkflowCompleted accepts v5 cache usage fields without throwing (disabled)', () => {
     process.env.ARCHON_TELEMETRY_DISABLED = '1';
     expect(() =>
-      captureWorkflowCompleted({
+      captureWorkflowTerminal({
         outcome: 'completed',
         workflowName: 'implement',
         workflowSource: 'bundled',
@@ -575,6 +631,8 @@ describe('new capture functions are fire-and-forget no-throw', () => {
         costUsd: 1.5,
         tokensIn: 50000,
         tokensOut: 12000,
+        cacheReadTokens: 40000,
+        cacheWriteTokens: 0,
         loopIterations: 4,
       })
     ).not.toThrow();
@@ -586,19 +644,9 @@ describe('new capture functions are fire-and-forget no-throw', () => {
   });
 
   test('captureCodebaseRegistered does not throw (enabled)', async () => {
-    delete process.env.ARCHON_TELEMETRY_DISABLED;
-    delete process.env.DO_NOT_TRACK;
-    delete process.env.CI;
-    delete process.env.POSTHOG_API_KEY;
-    const fetchSpy = spyOn(globalThis, 'fetch').mockResolvedValue(
-      new Response('{"status":"ok"}', { status: 200 })
-    );
-    try {
+    await captureTelemetry(() => {
       expect(() => captureCodebaseRegistered()).not.toThrow();
-      await shutdownTelemetry();
-    } finally {
-      fetchSpy.mockRestore();
-    }
+    });
   });
 
   test('captureArchonStarted accepts deployment-shape props without throwing (disabled)', () => {
@@ -620,17 +668,7 @@ describe('new capture functions are fire-and-forget no-throw', () => {
   });
 
   test('captureArchonStarted serializes deployment shape to wire properties (enabled)', async () => {
-    delete process.env.ARCHON_TELEMETRY_DISABLED;
-    delete process.env.DO_NOT_TRACK;
-    delete process.env.CI;
-    delete process.env.POSTHOG_API_KEY;
-    const bodies: (string | Blob)[] = [];
-    const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation((_url, options) => {
-      const body = (options as { body?: unknown } | undefined)?.body;
-      if (typeof body === 'string' || body instanceof Blob) bodies.push(body);
-      return Promise.resolve(new Response('{"status":"ok"}', { status: 200 }));
-    });
-    try {
+    const events = await captureTelemetry(() => {
       captureArchonStarted({
         surface: 'server',
         dbKind: 'postgresql',
@@ -640,28 +678,8 @@ describe('new capture functions are fire-and-forget no-throw', () => {
         // multiUser and the remaining adapter booleans intentionally omitted —
         // absent fields must be omitted from the wire, not sent as undefined.
       });
-      await shutdownTelemetry();
-    } finally {
-      fetchSpy.mockRestore();
-    }
-
-    interface WireEvent {
-      event: string;
-      properties: Record<string, unknown>;
-    }
-    // posthog-node gzips the /batch/ body into a Blob; decompress to inspect.
-    const events: WireEvent[] = [];
-    for (const body of bodies) {
-      const text =
-        typeof body === 'string'
-          ? body
-          : new TextDecoder().decode(Bun.gunzipSync(new Uint8Array(await body.arrayBuffer())));
-      const payload = JSON.parse(text) as { batch?: WireEvent[] };
-      events.push(...(payload.batch ?? []));
-    }
-    const started = events.find(e => e.event === 'archon_started');
-    expect(started).toBeDefined();
-    const props = started!.properties;
+    });
+    const props = eventProperties(events, 'archon_started');
     expect(props.surface).toBe('server');
     expect(props.db_kind).toBe('postgresql');
     expect(props.web_auth_enabled).toBe(true);
@@ -677,17 +695,7 @@ describe('new capture functions are fire-and-forget no-throw', () => {
   });
 
   test('captureChatTurn serializes v4 usage fields to snake_case wire keys (enabled)', async () => {
-    delete process.env.ARCHON_TELEMETRY_DISABLED;
-    delete process.env.DO_NOT_TRACK;
-    delete process.env.CI;
-    delete process.env.POSTHOG_API_KEY;
-    const bodies: (string | Blob)[] = [];
-    const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation((_url, options) => {
-      const body = (options as { body?: unknown } | undefined)?.body;
-      if (typeof body === 'string' || body instanceof Blob) bodies.push(body);
-      return Promise.resolve(new Response('{"status":"ok"}', { status: 200 }));
-    });
-    try {
+    const events = await captureTelemetry(() => {
       captureChatTurn({
         platform: 'web',
         provider: 'claude',
@@ -698,27 +706,8 @@ describe('new capture functions are fire-and-forget no-throw', () => {
         tokensIn: 900,
         tokensOut: 210,
       });
-      await shutdownTelemetry();
-    } finally {
-      fetchSpy.mockRestore();
-    }
-
-    interface WireEvent {
-      event: string;
-      properties: Record<string, unknown>;
-    }
-    const events: WireEvent[] = [];
-    for (const body of bodies) {
-      const text =
-        typeof body === 'string'
-          ? body
-          : new TextDecoder().decode(Bun.gunzipSync(new Uint8Array(await body.arrayBuffer())));
-      const payload = JSON.parse(text) as { batch?: WireEvent[] };
-      events.push(...(payload.batch ?? []));
-    }
-    const turn = events.find(e => e.event === 'chat_turn_handled');
-    expect(turn).toBeDefined();
-    const props = turn!.properties;
+    });
+    const props = eventProperties(events, 'chat_turn_handled');
     expect(props.model).toBe('sonnet');
     expect(props.duration_ms).toBe(5120);
     expect(props.cost_usd).toBe(0.03);
@@ -731,7 +720,7 @@ describe('new capture functions are fire-and-forget no-throw', () => {
   test('captureWorkflowCompleted does not throw for completed/failed (disabled)', () => {
     process.env.ARCHON_TELEMETRY_DISABLED = '1';
     expect(() =>
-      captureWorkflowCompleted({
+      captureWorkflowTerminal({
         outcome: 'completed',
         workflowName: 'implement',
         workflowSource: 'bundled',
@@ -741,7 +730,7 @@ describe('new capture functions are fire-and-forget no-throw', () => {
       })
     ).not.toThrow();
     expect(() =>
-      captureWorkflowCompleted({
+      captureWorkflowTerminal({
         outcome: 'failed',
         workflowName: 'x',
         exitReason: 'node_error',
@@ -750,26 +739,131 @@ describe('new capture functions are fire-and-forget no-throw', () => {
   });
 
   test('captureWorkflowCompleted does not throw (enabled)', async () => {
-    delete process.env.ARCHON_TELEMETRY_DISABLED;
-    delete process.env.DO_NOT_TRACK;
-    delete process.env.CI;
-    delete process.env.POSTHOG_API_KEY;
-    const fetchSpy = spyOn(globalThis, 'fetch').mockResolvedValue(
-      new Response('{"status":"ok"}', { status: 200 })
-    );
-    try {
+    await captureTelemetry(() => {
       expect(() =>
-        captureWorkflowCompleted({
+        captureWorkflowTerminal({
           outcome: 'failed',
           workflowName: 'implement',
           workflowSource: 'bundled',
           exitReason: 'unhandled_error',
         })
       ).not.toThrow();
-      await shutdownTelemetry();
-    } finally {
-      fetchSpy.mockRestore();
-    }
+    });
+  });
+
+  test('captureWorkflowTerminal serializes run identity, outcome events, cache totals and machine context', async () => {
+    const events = await captureTelemetry(() => {
+      captureWorkflowTerminal({
+        outcome: 'completed',
+        runId: 'run-db-id-1',
+        isChild: false,
+        workflowName: 'implement',
+        workflowSource: 'bundled',
+        tokensIn: 100,
+        tokensOut: 10,
+        cacheReadTokens: 70,
+        cacheWriteTokens: 0,
+      });
+      captureWorkflowTerminal({
+        outcome: 'completed',
+        workflowName: 'plan',
+        workflowSource: 'bundled',
+        tokensIn: 100,
+        tokensOut: 10,
+        cacheReadTokens: 70,
+        cacheWriteTokens: 0,
+        cachePartialTokens: true,
+      });
+      captureWorkflowTerminal({
+        outcome: 'cancelled',
+        runId: 'run-db-id-2',
+        workflowName: 'deploy-acme-prod',
+        workflowSource: 'project',
+        cancelReason: 'operator',
+      });
+    });
+    const exact = eventProperties(events, 'workflow_completed', 'implement');
+    expect(exact).toMatchObject({
+      schema_version: TELEMETRY_SCHEMA_VERSION,
+      run_ref: runRefForTelemetry('run-db-id-1'),
+      is_child: false,
+      // Super-properties: this test runs from a source checkout.
+      install_channel: 'source',
+      git_commit: expect.stringMatching(/^[0-9a-f]{7}$/),
+      tokens_in: 100,
+      tokens_out: 10,
+      cache_read_tokens: 70,
+      cache_write_tokens: 0,
+    });
+    // A complete total carries no flag, so absence keeps its meaning.
+    expect(exact).not.toHaveProperty('cache_partial');
+
+    // Identical totals, but only a floor. Without the flag these two would pool together
+    // and bias aggregate cache figures low across installs (#2662).
+    const floor = eventProperties(events, 'workflow_completed', 'plan');
+    expect(floor).toMatchObject({
+      schema_version: TELEMETRY_SCHEMA_VERSION,
+      cache_read_tokens: 70,
+      cache_write_tokens: 0,
+      cache_partial: true,
+    });
+    // The event name carries the outcome, so neither it nor is_builtin is repeated.
+    expect(exact).not.toHaveProperty('outcome');
+    expect(exact).not.toHaveProperty('is_builtin');
+    const cancelled = eventProperties(events, 'workflow_cancelled');
+    expect(cancelled).toMatchObject({ workflow_name: 'custom', cancel_reason: 'operator' });
+    // Only the hashed reference leaves the machine, never the run's database id.
+    expect(JSON.stringify(events)).not.toContain('run-db-id');
+  });
+  test('captureWorkflowInvoked serializes workflow shape and bundled ancestry', async () => {
+    const events = await captureTelemetry(() => {
+      captureWorkflowInvoked({
+        runId: 'run-shape',
+        isChild: false,
+        workflowName: 'acme-intake',
+        workflowSource: 'project',
+        shape: {
+          nodeCounts: { prompt: 3, bash: 1, loop: 0 },
+          graphDepth: 4,
+          maxFanOut: 2,
+          commandRefs: 1,
+          promptCharsBucket: '1k_5k',
+        },
+        ancestry: { derivedFrom: 'archon-implement', derivedSimilarity: 'modified' },
+      });
+    });
+    const invoked = eventProperties(events, 'workflow_invoked');
+    expect(invoked).toMatchObject({
+      schema_version: TELEMETRY_SCHEMA_VERSION,
+      workflow_name: 'custom',
+      nodes_prompt: 3,
+      nodes_bash: 1,
+      graph_depth: 4,
+      max_fan_out: 2,
+      command_refs: 1,
+      prompt_chars_bucket: '1k_5k',
+      derived_from: 'archon-implement',
+      derived_similarity: 'modified',
+    });
+    // A node type with no nodes is left out rather than sent as zero.
+    expect(invoked).not.toHaveProperty('nodes_loop');
+    expect(JSON.stringify(events)).not.toContain('acme-intake');
+  });
+});
+
+describe('runRefForTelemetry', () => {
+  test('is a stable 16-hex reference per run that differs between runs', () => {
+    const ref = runRefForTelemetry('run-a');
+    expect(ref).toMatch(/^[0-9a-f]{16}$/);
+    expect(runRefForTelemetry('run-a')).toBe(ref);
+    expect(runRefForTelemetry('run-b')).not.toBe(ref);
+  });
+});
+
+describe('resolveInstallChannel', () => {
+  test('a source build is docker only when running in the Archon image', () => {
+    expect(resolveInstallChannel({})).toBe('source');
+    expect(resolveInstallChannel({ ARCHON_DOCKER: 'true' })).toBe('docker');
   });
 });
 
@@ -782,6 +876,8 @@ describe('sanitizeModelForTelemetry', () => {
       'gpt-5.6-sol',
       'anthropic/claude-haiku-4-5',
       'openrouter/qwen/qwen3-coder',
+      'opus[1m]',
+      'claude-opus-4-7[1m]',
     ]) {
       expect(sanitizeModelForTelemetry(model)).toBe(model);
     }
@@ -792,6 +888,9 @@ describe('sanitizeModelForTelemetry', () => {
     expect(sanitizeModelForTelemetry('john.doe@example.com is testing')).toBeUndefined();
     expect(sanitizeModelForTelemetry('x'.repeat(100))).toBeUndefined();
     expect(sanitizeModelForTelemetry('')).toBeUndefined();
+    expect(sanitizeModelForTelemetry('opus[1 m]')).toBeUndefined();
+    expect(sanitizeModelForTelemetry('opus[<script>]')).toBeUndefined();
+    expect(sanitizeModelForTelemetry('opus[1m][2m]')).toBeUndefined();
   });
 
   test('passes through undefined', () => {

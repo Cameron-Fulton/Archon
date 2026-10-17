@@ -1,9 +1,27 @@
+// @archon-test-isolated
 import { describe, test, expect } from 'bun:test';
-import { isPerUserGitHubEnabled, loadDeviceFlowConfig, assertEncryptionKeyAtBoot } from './config';
+import {
+  isPerUserGitHubEnabled,
+  loadDeviceFlowConfig,
+  assertEncryptionKeyAtBoot,
+  resolveGitHubTokenFromEnv,
+} from './config';
 
 const VALID_KEY = 'a'.repeat(64);
 
 describe('github-auth/config', () => {
+  test.each([
+    [{ GITHUB_TOKEN: 'github-token', GH_TOKEN: 'gh-token' }, 'gh-token'],
+    [{ GH_TOKEN: 'gh-token' }, 'gh-token'],
+    [{ GITHUB_TOKEN: 'github-token' }, 'github-token'],
+    [{}, undefined],
+    [{ GH_TOKEN: '', GITHUB_TOKEN: 'github-token' }, 'github-token'],
+    [{ GH_TOKEN: 'gh-token', GITHUB_TOKEN: '' }, 'gh-token'],
+    [{ GH_TOKEN: '', GITHUB_TOKEN: '' }, undefined],
+  ])('resolves GH_TOKEN before GITHUB_TOKEN: %j', (env, expected) => {
+    expect(resolveGitHubTokenFromEnv(env)).toBe(expected);
+  });
+
   describe('isPerUserGitHubEnabled', () => {
     test('true only when both GITHUB_APP_ID and TOKEN_ENCRYPTION_KEY are set', () => {
       expect(isPerUserGitHubEnabled({ GITHUB_APP_ID: '1', TOKEN_ENCRYPTION_KEY: VALID_KEY })).toBe(
