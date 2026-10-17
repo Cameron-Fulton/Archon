@@ -40,3 +40,51 @@ Appended by `_system/scripts/collab_metrics.py`. Derived from git and GitHub aft
 
 **Time from opening to merge: median 54.8 h, longest 89.6 h, across 4 merged pull requests.** *The long tail is where friction hides; a merge that waited on a human is counted the same as one that fought the code.*
 
+## 2026-09-28 05:01 (last 7 days)
+
+**Abandoned pull requests (closed, never merged): 10.**
+  - #3535 feat(chat): add subscription-aware task routing with Laya
+  - #3496 Backport durable node failure classes to Factory lineage
+  - #3493 chore(workflows): consolidate Athena test and visual QA gates
+  - #3474 fix(sdlc): the plan step must list the accepted contract and may not scope its i
+  - #3464 feat(server): drain mode so a deploy can land on a busy box
+  - #3423 fix(server): set Cache-Control on the served web UI
+  - #3421 feat(forge): publish and merge PRs through installed plugins
+  - #3363 [PARKED — do not review] feat(workflows): IWorkflowEngine.subscribe() — the even
+  - #3351 [BLOCKED — do not merge] fix(cli): an interrupted foreground run records cancell
+  - #3350 fix(core): getRunAncestry throws instead of returning a truncated chain
+  - *Says nothing about why. A superseded duplicate and a failed change look the same.*
+
+**Leftovers: 0 worktree records to prune, 4 branches with no merged pull request (2 older than 7 days).**
+  - chore/drop-fork-customizations (38 days)
+  - feat/upstream-v0.9.0 (38 days)
+  - *Expect this to look alarming and mostly not be. Squash-merge rewrites commits, so a branch whose work IS merged still reads as unmerged; these are matched against merged pull request branches by name only. Review candidates, not findings.*
+
+**File collisions: 34 pair(s) of the 16 open pull requests touch the same file.**
+  - #3147 and #3378 share 2 file(s): packages/server/package.json, packages/server/src/routes/api.ts
+  - #3147 and #3379 share 2 file(s): packages/server/src/routes/api.ts, packages/web/src/lib/api.generated.d.ts
+  - #3147 and #3495 share 2 file(s): packages/cli/src/cli.ts, packages/docs-web/src/content/docs/reference/cli.md
+  - #3147 and #3528 share 2 file(s): packages/docs-web/src/content/docs/reference/configuration.md, packages/web/src/lib/api.generated.d.ts
+  - #3147 and #3529 share 1 file(s): packages/cli/src/cli.test.ts
+  - #3147 and #3542 share 3 file(s): packages/cli/src/cli.ts, packages/core/src/db/workflow-events.ts, packages/docs-web/src/content/docs/reference/cli.md
+  - #3147 and #3543 share 4 file(s): packages/cli/src/args.ts, packages/cli/src/cli.test.ts, packages/cli/src/cli.ts, packages/docs-web/src/content/docs/reference/cli.md
+  - #3378 and #3379 share 2 file(s): packages/server/src/routes/api.ts, packages/server/src/routes/api.workflows.test.ts
+  - #3378 and #3528 share 1 file(s): bun.lock
+  - #3379 and #3528 share 1 file(s): packages/web/src/lib/api.generated.d.ts
+  - *Only counts pull requests open right now, so two agents who collided and already merged are invisible to it.*
+
+**Rework: 27 of the 28 merged pull requests carrying a GitHub review got more commits after the first one.**
+  - #3446: 11 commit(s) after review
+  - #3511: 8 commit(s) after review
+  - #3486: 6 commit(s) after review
+  - #3476: 6 commit(s) after review
+  - #3461: 6 commit(s) after review
+  - #3485: 5 commit(s) after review
+  - #3453: 5 commit(s) after review
+  - #3506: 4 commit(s) after review
+  - #3491: 4 commit(s) after review
+  - #3483: 4 commit(s) after review
+  - *More commits after a review can mean the review worked, not that the process failed.*
+
+**Time from opening to merge: median 3.3 h, longest 22.6 h, across 40 merged pull requests.** *The long tail is where friction hides; a merge that waited on a human is counted the same as one that fought the code.*
+
