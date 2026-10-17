@@ -218,27 +218,7 @@ The rules `--help` will not tell you:
 
 ### Directory Structure
 
-**Monorepo Layout (Bun Workspaces):**
-
-```
-packages/
-├── paths/        # @archon/paths      - path resolution + Pino logger factory
-├── git/          # @archon/git        - worktrees, branches, repos, exec wrappers
-├── providers/    # @archon/providers  - AI agent providers (owns the SDK deps)
-├── isolation/    # @archon/isolation  - worktree + container isolation
-├── workflows/    # @archon/workflows  - workflow engine (loader, router, DAG executor)
-├── core/         # @archon/core       - business logic, database, orchestration
-├── adapters/     # @archon/adapters   - Slack, Telegram, GitHub, Discord
-├── server/       # @archon/server     - OpenAPIHono HTTP server + Web adapter (SSE)
-├── cli/          # @archon/cli        - command-line interface
-├── web/          # @archon/web        - React frontend
-└── docs-web/     # the docs site (astro)
-```
-
-Listed in dependency order — each package may depend only on those above it. *Package Split*
-under **Architecture Layers** below states each one's exact allowed dependencies; that list is
-the rule, and it is what a change must respect. Inside a package, `ls` and the file docblocks
-are more current than any tree drawn here.
+Moved to `docs/agents/architecture.md`, section "Directory Structure". Read it before changing this area. The rules below stay here.
 
 **Import Patterns:**
 
@@ -248,109 +228,15 @@ are more current than any tree drawn here.
 
 ### Database Schema
 
-**19 Tables (all prefixed with `remote_agent_`):**
-1. **`codebases`** - Repository/project metadata and commands (JSONB); `kind` (`'repo'`/`'folder'`, default `'repo'`) discriminates git repos from **folder projects** (non-git workspaces — multi-repo roots or plain ops folders — that run in place with named `_folder/<slug>/` storage; `repository_url`/`default_branch` are null)
-2. **`conversations`** - Track platform conversations with titles and soft-delete support; nullable `user_id` records first creator (provenance + execution-identity **fallback** only — chat turns execute as the message sender, #1982)
-3. **`sessions`** - Track AI SDK sessions with resume capability
-4. **`isolation_environments`** - Isolation tracking (git worktrees AND folder-project containers — `provider` is `'worktree'`/`'container'`; container rows use a `''` `branch_name` sentinel and store `{containerId, volume, image, overlayMode, …}` in `metadata`); nullable `created_by_user_id` preserves first creator
-5. **`workflow_runs`** - Workflow execution tracking and state; nullable `user_id` for per-run attribution; nullable `parent_run_id` (self-referential FK, `ON DELETE SET NULL`) links a `workflow:` sub-run to the parent run that spawned it (#2121 Phase 2); nullable `output_root` records the resolved `~/.archon/workspaces/<project>/` this run's artifacts, logs, and state live under, written ONCE at run start (never on resume) so historical artifacts stay addressable across a codebase rename (#2200/#1192) — readers prefer it and re-derive identity only when it is NULL
-6. **`workflow_events`** - Step-level workflow event log (step transitions, artifacts, errors)
-7. **`messages`** - Conversation message history with tool call metadata (JSONB); nullable `user_id` (NULL for assistant rows). Split write-path: the **web** adapter persists its own turns via `MessagePersistence`; the **orchestrator** persists non-web turns (Slack/Telegram/GitHub/Discord/CLI) fire-and-forget, guarded by `isWebAdapter` to avoid double-writing web turns — only AI-bound turns get a user row (deterministic-command and approval-only turns return earlier), so a `user` row always pairs with an `assistant` row
-8. **`codebase_env_vars`** - Per-project env vars injected into project-scoped execution surfaces (Claude, Codex, bash/script nodes, and direct chat when codebase-scoped), managed via Web UI or `env:` in config
-9. **`users`** - Archon-internal identity (one row per human/bot); created lazily on first sight by any adapter; `role` (`'admin'`(default)`/'member'`) is the identity seam for future per-resource scoping (visibility stays open today)
-10. **`user_identities`** - Per-platform mapping (Slack U-id, Telegram chat id, Discord snowflake, GitHub login, Better Auth web user id) → `users.id`; `UNIQUE(platform, platform_user_id)`
-11. **`workflow_node_sessions`** - Per-node provider session IDs persisted across workflow re-runs (opt-in via `persist_session`); keyed by `(workflow_name, node_id, scope_key, provider)`; `scope_key` is typically the conversation UUID
-12. **`user_github_tokens`** - Per-user GitHub device-flow tokens encrypted at rest (AES-256-GCM); one row per Archon user (`UNIQUE(user_id)`), cascades on user deletion; numeric `github_user_id` anchors the commit no-reply email
-13. **`user_provider_keys`** - Per-user AI-provider credentials encrypted at rest (AES-256-GCM); one row per `(user_id, provider)` (`UNIQUE(user_id, provider)`), cascades on user deletion; `kind` is `api_key` or `oauth`; resolved + injected into the **acting user's** (run starter / message sender) runs/chat env at execution time. Always available — the encryption key is auto-provisioned at `~/.archon/credential-key` when `TOKEN_ENCRYPTION_KEY` is not set. Since #1955 the `provider` column holds **vendor-canonical credential ids** (`anthropic`, `openai`, `github-copilot`, plus the Pi backend vendors) — NOT agent ids; legacy `claude`/`codex`/`copilot` rows are renamed by an idempotent startup data fix (vendor row wins on conflict), and the connectable catalog is derived from provider registrations (`acceptedCredentials` via `credentials:` on `ProviderRegistration`), never hand-listed
-14. **`user_ai_prefs`** - Per-user AI preferences (Phase 3): personal model `tiers`/`aliases` (JSON-as-TEXT) + `default_provider` + `default_model` (#1998 — per-user default CHAT model, written atomically with `default_provider`; replaces the `large`-tier lookup for direct chat only when the effective provider matches — workflows still resolve `large`). NON-encrypted (model names aren't secrets — mirrors `codebase_env_vars`, not the provider-key store); one row per user (`UNIQUE(user_id)`), cascades on user deletion. Folded into `buildAiProfile` as the highest-precedence layer at the userId-aware seams (workflow executor: run starter; chat orchestrator: message **sender**-first, conversation creator only as fallback — #1982); needs a web/CLI identity but NO `TOKEN_ENCRYPTION_KEY`
-15–18. **`remote_agent_auth_user` / `remote_agent_auth_session` / `remote_agent_auth_account` / `remote_agent_auth_verification`** - Better Auth tables for opt-in web login (**PostgreSQL only**; always created on Postgres via the idempotent schema apply, but populated only when web auth is enabled — `DATABASE_URL` + `BETTER_AUTH_SECRET`). Owned and shaped by Better Auth (text ids, camelCase columns); Archon never queries them directly — a session maps to the canonical `users` row via `user_identities('web', <betterAuthUserId>)`
-19. **`remote_agent_schema_version`** - Diagnostic schema vintage (#2316): single row (`id = 1`) recording `created_app_version` (the Archon build that created this database — NULL, never guessed, for databases predating the table) and `app_version`/`applied_at` (the build that last applied schema). Written from `APP_VERSION` by both adapters' existing idempotent apply-on-connect path, and only when the value changes. Surfaced by `archon doctor` and `GET /api/health`; **nothing gates on it**
-
-**Key Patterns:**
-- Conversation ID format: Platform-specific (`thread_ts`, `chat_id`, `user/repo#123`)
-- One active session per conversation
-- Codebase commands stored in filesystem, paths in `codebases.commands` JSONB
-
-**Session Transitions:**
-- Sessions are immutable - transitions create new linked sessions
-- Each transition has explicit `TransitionTrigger` reason (first-message, plan-to-execute, reset-requested, etc.)
-- Audit trail: `parent_session_id` links to previous session, `transition_reason` records why
-- Only plan→execute creates new session immediately; other triggers deactivate current session
+Moved to `docs/agents/architecture.md`, section "Database Schema". Read it before changing this area.
 
 ### Architecture Layers
 
-**Package Split:**
-- **@archon/paths**: Path resolution utilities, Pino logger factory, web dist cache path (`getWebDistDir`), CWD env stripper (`stripCwdEnv`, `strip-cwd-env-boot`) (no @archon/* deps; `pino` and `dotenv` are allowed external deps)
-- **@archon/git**: Git operations - worktrees, branches, repos, exec wrappers (depends only on @archon/paths)
-- **@archon/providers**: AI agent providers (Claude, Codex, Pi community) — owns SDK deps, `IAgentProvider` interface, `sendQuery()` contract, and provider-specific option translation. `@archon/providers/types` is the contract subpath (zero SDK deps, zero runtime side effects) that `@archon/workflows` imports from. Providers receive raw `nodeConfig` + `assistantConfig` and translate to SDK-specific options internally. Core providers live under `claude/` and `codex/`; community providers live under `community/` (currently `community/pi/`, registered with `builtIn: false`). `@archon/providers/oauth` is the SDK-boundary subpath wrapping Pi's `@earendil-works/pi-ai/oauth` (subscription login: Claude Pro/Max, Copilot) — `@archon/core` drives Pi-based subscription OAuth through it so the Pi SDK dep stays in `@archon/providers`. The ChatGPT/Codex subscription login is NOT Pi-driven: it's Archon-owned PKCE in `@archon/core` `credentials/openai-oauth.ts` (Pi drops the `id_token` the Codex CLI requires, #1924).
-- **@archon/isolation**: Worktree isolation types, providers, resolver, error classifiers, and the folder-project backend seam — `IIsolationBackend`/`resolveFolderBackend` + the `ExecutionContext` it produces (depends only on @archon/git + @archon/paths + @archon/providers/types — the types-only import that carries the shared `ExecutionContext` + write-back result contracts). The container backend's full lifecycle: `prepare` (per-run upper volume + labeled container) → in-container exec → `suspend` (`docker stop` on pause) / `resumeEnv` (rediscover by `diy.archon.env-id` label + restart, or recreate over the surviving volume; fails loud if the volume is gone) → `finalize` (overlay diff walk) → approval-gated `applyChanges` (the ONE live-root write) / `discardChanges` → `destroy`. The engine drives suspend + the write-back gate through a structural write-back port (`ContainerWriteBackBackend`, injected via `ExecuteWorkflowOptions.container`) so @archon/workflows never imports @archon/isolation. The write-back gate reuses the pause/approve machinery with a `type: 'writeback'` ApprovalContext (synthetic `__writeback__` node); the resume path branches on the persisted `metadata.pending_writeback` marker (idempotent via `writeback_resolved`). Container pauses are CLI-resumable only (chat/web resume fails fast with a CLI pointer, run stays resumable). `isolation list/cleanup` cover container envs; a paused run's container is never auto-pruned.
-- **@archon/workflows**: Workflow engine - loader, router, executor, DAG, logger, bundled defaults (depends only on @archon/git + @archon/paths + @archon/providers/types + @hono/zod-openapi + zod; DB/AI/config injected via `WorkflowDeps`)
-- **@archon/cli**: Command-line interface for running workflows and starting the web UI server (depends on @archon/server + @archon/adapters for the serve command)
-- **@archon/core**: Business logic, database, orchestration (depends on @archon/providers for AI and @hono/zod-openapi for core Zod schemas; provides `createWorkflowStore()` adapter bridging core DB → `IWorkflowStore`)
-- **@archon/adapters**: Platform adapters for Slack, Telegram, GitHub, Discord (depends on @archon/core)
-- **@archon/server**: OpenAPIHono HTTP server (Zod + OpenAPI spec generation via `@hono/zod-openapi`), Web adapter (SSE), API routes, Web UI static serving (depends on @archon/adapters)
-- **@archon/web**: React frontend (Vite + Tailwind v4 + shadcn/ui + Zustand), SSE streaming to server. `WorkflowRunStatus`, `WorkflowDefinition`, and `DagNode` are all derived from `src/lib/api.generated.d.ts` (generated from the OpenAPI spec via `bun generate:types`; never import from `@archon/workflows`)
-
-**1. Platform Adapters**
-- Implement `IPlatformAdapter` interface
-- Handle platform-specific message formats
-- **Web** (`packages/server/src/adapters/web/`): Server-Sent Events (SSE) streaming, conversation ID = user-provided string
-- **Slack** (`packages/adapters/src/chat/slack/`): SDK with polling (not webhooks), conversation ID = `thread_ts`
-- **Telegram** (`packages/adapters/src/chat/telegram/`): Bot API with polling, conversation ID = `chat_id`
-- **GitHub** (`packages/adapters/src/forge/github/`): Webhooks + GitHub CLI, conversation ID = `owner/repo#number`
-- **Discord** (`packages/adapters/src/community/chat/discord/`): discord.js WebSocket, conversation ID = channel ID
-
-**Adapter Authorization Pattern:**
-- Auth checks happen INSIDE adapters (encapsulation, consistency)
-- Auth utilities co-located with each adapter (e.g., `packages/adapters/src/chat/slack/auth.ts`)
-- Parse whitelist from env var in constructor (e.g., `TELEGRAM_ALLOWED_USER_IDS`)
-- Check authorization in message handler (before calling `onMessage` callback)
-- Silent rejection for unauthorized users (no error response)
-- Log unauthorized attempts with masked user IDs for privacy
-- Adapters expose `onMessage(handler)` callback; errors handled by caller
-
-**2. Command Handler** (`packages/core/src/handlers/`)
-- Process slash commands (deterministic, no AI)
-- The orchestrator treats only these top-level commands as deterministic: `/help`, `/status`, `/reset`, `/workflow`, `/register-project`, `/update-project`, `/remove-project`, `/setproject` (binds by DB conversation id, clears cwd/worktree override, deactivates the session with `project-changed`), `/commands`, `/init` (falls back to the selected project root when `conversation.cwd` is null), `/worktree`
-- `/workflow` handles subcommands like `list`, `run`, `status`, `cancel`, `resume`, `abandon`, `approve`, `reject`, `reset-sessions`
-- Update database, perform operations, return responses
-
-**3. Orchestrator** (`packages/core/src/orchestrator/`)
-- Manage AI conversations
-- Load conversation + codebase context from database
-- Variable substitution: `$ARGUMENTS`/`$USER_MESSAGE` (the whole trigger message; positional `$1`/`$2`/`$3` are not supported)
-- Session management: Create new or resume existing
-- Stream AI responses to platform
-- System prompt gets a "Managing Workflow Runs" section (`buildRunManagementSection` in `prompt-builder.ts`) teaching the chat agent to drive run management (`archon workflow runs/get/status/run --detach/approve/reject/abandon`) directly via bash. It is appended **only for project-scoped chats on providers without the native `manage_run` tool** (Codex/OpenCode/Copilot) — gated in `orchestrator-agent.ts` on `!scopedCaps.nativeTools`. Claude and Pi instead receive the in-process `manage_run` native tool (the prompt section would be redundant for them). This is the CLI-bash delivery path for providers that have neither native tools nor `skills:` (direct chat doesn't consume the `skills:` option — it is workflow-node-only).
-
-**4. AI Agent Providers** (`packages/providers/src/`)
-- Implement `IAgentProvider` interface
-- **ClaudeProvider**: `@anthropic-ai/claude-agent-sdk`
-- **CodexProvider**: `@openai/codex-sdk`
-- **PiProvider** (community, `builtIn: false`): `@earendil-works/pi-coding-agent` — one harness for ~20 LLM backends via `<provider>/<model>` refs (e.g. `anthropic/claude-haiku-4-5`, `openrouter/qwen/qwen3-coder`); supports extensions, skills, tool restrictions, thinking level, best-effort structured output. See `packages/docs-web/src/content/docs/getting-started/ai-assistants.md` for setup, capability matrix, and extension config.
-- Streaming: `for await (const event of events) { await platform.send(event) }`
+Moved to `docs/agents/architecture.md`, section "Architecture Layers". Read it before changing this area.
 
 ### Configuration
 
-**Environment Variables:**
-
-see .env.example
-see .archon/config.yaml setup as needed
-
-**Assistant Defaults:**
-
-Per-assistant model and option defaults live in `.archon/config.yaml` under `assistants.<provider>`, alongside `tiers:` and `aliases:`. The docs site's configuration reference (`packages/docs-web/src/content/docs/reference/configuration.md`) carries the full key set and value ranges; the schema in `@archon/core/config` is the authority. Two keys are worth knowing before you look: `claudeBinaryPath`/`codexBinaryPath` are required in compiled binaries when the matching `*_BIN_PATH` env var is unset, and `settingSources` controls which `CLAUDE.md`, skills, commands and agents the Claude SDK loads — use exactly `['project']` to restrict a run to project-only sources.
-
-**Configuration Priority:**
-1. Workflow-level options (in YAML `model`, `modelReasoningEffort`, etc.)
-2. Config file defaults (`.archon/config.yaml` `assistants.*`)
-3. SDK defaults
-
-**Model Validation:**
-- Workflows are validated at load time for provider _identity_ only — `provider:` (workflow-level and per-node) must be a registered provider id, otherwise the YAML is rejected with `Unknown provider '<id>'. Registered: claude, codex, pi`.
-- Model strings are classified by `resolveModelSpec()` in `packages/workflows/src/model-validation.ts`: tier keywords (`small`/`medium`/`large`) resolve via built-in defaults plus `tiers:` overrides; `@<name>` refs resolve via the merged alias map from config; anything else remains a literal SDK model string.
-- Tier and alias refs can resolve provider, model, and provider-specific options. Literal model strings keep the normal provider chain (`node.provider ?? workflow.provider ?? config.assistant`).
-- `tiers:` and `aliases:` are valid on global and repo config (repo overrides global). Reserved names `small`, `medium`, `large` cannot be used as custom alias names. Custom alias keys must start with `@` (e.g. `@fast`).
+Moved to `docs/agents/architecture.md`, section "Configuration". Read it before changing this area.
 
 ### Running the App in Worktrees
 
@@ -369,30 +255,9 @@ Agents working in worktrees can run the app for self-testing (make changes → r
 
 ### Archon Directory Structure
 
-**User-level (`~/.archon/`):** per-project workspaces under `workspaces/owner/repo/` (`source/`, `worktrees/`, `artifacts/`, `logs/`), with folder projects at `workspaces/_folder/<slug>/` (no `source/` or `worktrees/` — they run in place), plus `archon.db` and the global `config.yaml`. The docs site's directory reference (`packages/docs-web/src/content/docs/reference/archon-directories.md`) has the full layout.
+Moved to `docs/agents/architecture.md`, section "Archon Directory Structure". Read it before changing this area. The rules below stay here.
 
 What matters here: **artifacts and logs live outside the repo and must never be committed** — `$ARTIFACTS_DIR` points at `artifacts/runs/{id}/`, and typed node sidecars land in its `nodes/` subdirectory. `ARCHON_HOME` overrides the base directory; Docker sets it to `/.archon/`.
-
-**Repo-level (`.archon/` in any repository):**
-
-```text
-.archon/
-├── commands/       # Custom commands
-├── workflows/      # Workflow definitions (YAML files)
-├── scripts/        # Named scripts for script: nodes (.ts/.js for bun, .py for uv)
-└── config.yaml     # Repo-specific configuration
-```
-
-The repo directory holds SOURCE only — every byte a run produces lives under
-`~/.archon/workspaces/<project>/`. `.archon/state/` is the LEGACY location for cross-run
-state: it had no engine support (prompts did `mkdir -p .archon/state` relative to cwd), so
-inside an isolated run it wrote to the worktree and died at cleanup, and in a user's repo it
-was stageable. Use `$STATE_DIR` instead. Archon detects a legacy directory, WARNs once with
-the `mv`, and never moves it; `scripts/migrate-state-dir.ts` is the operator's one-shot
-(dry run by default; pass `--apply` to move).
-
-- `ARCHON_HOME` - Override the base directory (default: `~/.archon`)
-- Docker: Paths automatically set to `/.archon/`
 
 ## Development Guidelines
 
@@ -462,59 +327,9 @@ Structured logging uses Pino via `createLogger('<module>')` from `@archon/paths`
 
 ### Command System
 
-**Variable Substitution:**
-- `$ARGUMENTS`, `$USER_MESSAGE` - The user's full trigger message as a single string. Positional `$1`/`$2`/`$3` args are NOT supported — command/workflow prompts receive the whole message only.
-- `$ARTIFACTS_DIR` - External artifacts directory for the current workflow run (pre-created by executor)
-- `$STATE_DIR` - External cross-run state directory (`~/.archon/workspaces/<project>/state/`), pre-created by the executor. Scoped per PROJECT — shared by every workflow, conversation, and invocation surface; namespace inside it (`$STATE_DIR/<name>/`) for isolation. Survives worktree teardown and never appears in `git status`. Throws when referenced but unresolved, mirroring `$BASE_BRANCH`. No engine locking — see the authoring guide for the concurrent read-modify-write hazard.
-- `$WORKFLOW_ID` - The workflow run ID
-- `$BASE_BRANCH` - Base branch; auto-detected from git when `worktree.baseBranch` is not set; fails only if referenced in a prompt and auto-detection also fails
-- `$DOCS_DIR` - Documentation directory path; configured via `docs.path` in `.archon/config.yaml`. Defaults to `docs/`. Never throws.
-- `$LOOP_USER_INPUT` - User feedback provided via `/workflow approve <id> <text>` at an interactive loop gate. Only populated on the first iteration of a resumed interactive loop; empty string on all other iterations. Note: on a gate whose iteration emitted the completion signal, approving with NO text finalizes the node from the already-computed output (no new iteration, so `$LOOP_USER_INPUT` is never read) — providing text runs another iteration with it (#2074).
-- `$REJECTION_REASON` - Reviewer feedback provided via `/workflow reject <id> <reason>` at an approval gate. Only populated in `on_reject` prompts; empty string elsewhere.
-- `$LOOP_PREV_OUTPUT` - Cleaned output of the previous loop iteration (loop nodes only). Empty string on the first iteration (no prior output exists). Useful for `fresh_context: true` loops that need to reference what the previous pass produced or why it failed without carrying full session history.
+Moved to `docs/agents/command-system.md`, section "Command System". Read it before changing this area. The rules below stay here.
 
-**Command Types:**
-
-1. **Codebase Commands** (per-repo):
-   - Stored in `.archon/commands/` (plain text/markdown)
-   - Discovered from the repository `.archon/commands/` directory
-   - Surfaced via `GET /api/commands` for the workflow builder and invoked by workflow `command:` nodes
-
-2. **Workflows** (YAML-based):
-   - Stored in `.archon/workflows/`; recommended copyable layout is `.archon/workflows/<pack>/<workflow>/` with one YAML plus optional `commands/` and `scripts/`. Both directory names are author-chosen. Flat and one-level grouped YAML remain supported.
-   - Multi-step AI execution chains, discovered at runtime
-   - **`nodes:` (DAG format)**: Nodes with explicit `depends_on` edges; independent nodes in the same topological layer run concurrently. Node types: `command:` (named command file), `prompt:` (inline prompt), `bash:` (shell script, stdout captured as `$nodeId.output`, no AI, receives managed per-project env vars in its subprocess environment when configured), `loop:` (iterative AI prompt until completion signal), `loop_group:` (multi-node sub-DAG body repeated per iteration until `until` signal / `until_bash` exit 0 / `max_iterations`; body is sealed for `depends_on` but may read outer outputs via `$nodeId.output` and the previous iteration via `$LOOP_PREV.<nodeId>.output`; a failed body node fails the group immediately; group-level `model`/`provider` become body defaults), `approval:` (human gate; pauses until user approves or rejects; `capture_response: true` stores the user's comment as `$<node-id>.output` for downstream nodes, default false), `script:` (inline TypeScript/Python or named script from `.archon/scripts/`, runs via `bun` or `uv`, stdout captured as `$nodeId.output`, no AI, receives managed per-project env vars in its subprocess environment when configured, supports `deps:` for dependency installation and `timeout:` in ms, requires `runtime: bun` or `runtime: uv`), `include:` (load-time inlining of another workflow's nodes as a flattened, namespaced sub-DAG — each included node becomes `<includeId>__<nodeId>`; the include node's `depends_on`/`when`/`trigger_rule` attach to the block's entry nodes, and `$includeId.output` resolves to the block's terminal (primary) sink; expansion happens at discovery so the executor sees ordinary nodes; `with:` passes an identifier-keyed string map the block reads as `$INPUTS.<name>`, substituted VERBATIM at load time (never expressions) across every inline text surface including inside code fences — an unsupplied name is a load error, and `$INPUTS` in a `command:`/`loop.command` file is rejected because a command body is read after expansion and can never be parameterized (best-effort: command files are scanned recursively through nested `loop_group` bodies; unresolvable files warn and are skipped) — see the "Reusing a Shared Sub-DAG" guide), `workflow:` (runtime sub-run — starts another workflow by static name as a separate governed CHILD run with its own `workflow_runs` row (`parent_run_id`), artifacts, gates, cost, and audit trail; `input:` forwards a data string (substituted like prompt bodies) as the child's `$ARGUMENTS`; the child's terminal output threads back as `$nodeId.output`; a child gate pauses the whole tree (approve the CHILD by run id — the parent auto-resumes on child completion); `isolation:` chooses the child's checkout — `inherit` (default; shares the parent's) or `worktree` (its own git worktree + branch, opt-in only, never inferred; requires an injected child-isolation resolver, so it fails fast on folder projects and surfaces that don't wire one), `with:` passes an identifier-keyed string map (mutually exclusive with `input:`) resolved at run time and persisted to the child as `$INPUTS.<name>` or `INPUTS_<UPPER_SNAKE>` for bash/script nodes; the resolved child input contract is enforced before any worktree or run row exists; `retry:` rejected, disallowed inside a `loop_group` body; abandon cascade-cancels descendants; `fan_out:` runs ONE CHILD PER ITEM of a runtime list — `items` (a `$node.output` ref or literal JSON array), `max_parallel` (default 5, bounds concurrency not total count or spend), `join` (default `all_done`: every terminal outcome aggregates with failures as `{error,status}`; `all_success` for the genuinely dependent case), `as` names the per-item value as `$INPUTS.<as>` inside each child (rejected only when it collides with a `with:` key; without `as`, the item still travels as `$ARGUMENTS`). Children are INDEPENDENT: every index spawns, each runs to its own terminal state, and none cancels another — the sole exception is a child that pauses at a gate, which is cancelled because a parent has one approval slot (gate before/after the fan-out, never inside a child). Racing (`join: first_success`) is rejected outright, not deferred. Concurrent children on a SHARED checkout collide on the path lock, so a spawn-time preflight refuses that expansion unless the child declares `mutates_checkout: false`, the node sets `isolation: worktree`, or `max_parallel: 1`) . Supports `when:` conditions, `trigger_rule` join semantics, `$nodeId.output` substitution, `output_format` for structured JSON output (SDK-enforced on Claude/Codex/OpenCode; best-effort prompt-augmentation + repair on Pi/Copilot — the parsed output is **validated against the declared schema for every provider**, best-effort providers (Pi/Copilot) re-ask up to 3× on a validation miss, and a node that declares `output_format` but returns no schema-valid output **fails** rather than degrading silently; `$nodeId.output.field` access is strict — a field not in the producer's schema, or a schemaless node whose output isn't JSON / lacks the key, fails the consuming node, while an author-declared-optional field resolves to `''`), `allowed_tools`/`denied_tools` for per-node tool restrictions (all providers except Codex), `hooks` for per-node SDK hook callbacks (Claude only), `mcp` for per-node MCP server config files (all providers except Pi, env vars expanded at execution time), and `skills` for per-node skill preloading via AgentDefinition wrapping (per-node injection on Claude/Pi/OpenCode/Copilot; Codex instead auto-discovers skills from `.agents/skills/` on the filesystem — the `skills:` list is informational for Codex nodes), `agents` for inline sub-agent definitions invokable via the Task tool (Claude only), and `effort`/`thinking` for reasoning depth (Claude/Pi/Copilot) plus the Claude-only SDK advanced options `maxBudgetUsd`/`systemPrompt`/`fallbackModel`/`betas`/`sandbox` (also settable at workflow level), and `persist_session` for cross-run provider session continuity (node-level opt-in; workflow-level default via `persist_sessions: true`; requires a provider with the `sessionResume` capability), and `output_type` (any node type) for engine-written typed output sidecars — when set, the executor writes `$ARTIFACTS_DIR/nodes/<id>.md` + `<id>.meta.json` after the node completes (best-effort) so downstream nodes and later runs can locate output by type instead of guessing filenames
-   - Workflow-level `requires: [github]` hard-blocks invocation (before any worktree/clone/AI cost) when the originating user hasn't connected their GitHub identity — enforced only when per-user GitHub is enabled (GitHub App + `TOKEN_ENCRYPTION_KEY`); a no-op for solo PAT installs
-   - Workflow-level **signature** (`inputs:` / `returns:`) declares the contract a workflow exposes to callers. `inputs:` maps names to `{ required?, default?, description? }`; callers provide values through `with:` (`include:` validates at load time, `workflow:` validates before runtime child spawn). Defaults are applied, missing required and undeclared inputs are rejected, and workflows without `inputs:` preserve passthrough behavior. `returns:` names the node whose output becomes `$<callerNodeId>.output`, replacing positional first-sink selection without changing dependency completion.
-   - Provider inherited from `.archon/config.yaml` unless explicitly set; per-node `provider` and `model` overrides supported
-   - Model and options can be set per workflow or inherited from config defaults
-   - `interactive: true` at the workflow level forces foreground execution on web (required for approval-gate workflows in the web UI)
-   - Model validation ensures provider/model compatibility at load time
-   - Commands: `/workflow list`, `/workflow reload`, `/workflow status`, `/workflow cancel`, `/workflow resume <id>` (re-runs a failed or paused workflow, skipping completed nodes), `/workflow abandon <id>`, `/workflow cleanup [days]` (CLI only — deletes old run records), `/workflow reset-sessions <name> [<node-id>]` (clears persisted `persist_session` memory; chat auto-scopes to the current conversation, CLI adds `--scope`/`--yes` for cross-scope control)
-   - Resilient loading: One broken YAML doesn't abort discovery; errors shown in `/workflow list`
-   - `resolveWorkflowName()` (in `router.ts`) resolves workflow names via a 4-tier fallback — exact, case-insensitive, suffix (`-name`), substring — with ambiguity detection; used by both the CLI and all chat platforms
-   - Router fallback: if no `/invoke-workflow` is produced, falls back to `archon-assist` (with "Routing unclear" notice); raw AI response returned only when `archon-assist` is unavailable
-   - Claude routing calls use `tools: []` to prevent tool use at the API level; Codex tool bypass is detected and triggers the same fallback
-
-**Defaults:**
-- Bundled in `.archon/commands/defaults/` and `.archon/workflows/defaults/`
-- Packaged bundled workflows may use any `.archon/workflows/<pack>/<workflow>/` path; `defaults` has no special packaged-workflow semantics. The generator embeds the YAML, local commands, local scripts, and internal ownership metadata.
-- Binary builds: Embedded at compile time (no filesystem access needed) via `packages/workflows/src/defaults/bundled-defaults.generated.ts`
-- Source builds: Loaded from filesystem at runtime
-- Merged with repo-specific commands/workflows (repo overrides defaults by name)
-- Opt-out: Set `defaults.loadDefaultCommands: false` or `defaults.loadDefaultWorkflows: false` in `.archon/config.yaml`
 - **After adding, removing, or editing a default file, run `bun run generate:bundled`** to refresh the embedded bundle. A new default file must be staged in git first (`git add`); `bun run generate:bundled` (and `check:bundled`) refuse to embed untracked files in `defaults/`. After editing `migrations/000_combined.sql`, run `bun run generate:bundled-schema` to keep the embedded schema in sync, AND mirror any new table into `createSchema()` in `packages/core/src/db/adapters/sqlite.ts` — the SQLite schema is hand-maintained separately and is NOT generated from the migration; the only intentional Postgres-only exception is the `remote_agent_auth_*` Better Auth tables, and the schema-parity test in `sqlite.test.ts` fails CI on any other drift. After a `@earendil-works/pi-ai` upgrade, run `bun run generate:pi-vendor-map` to regenerate the Pi backend → env-var map + credential specs from the installed SDK (a new upstream backend must be classified in `scripts/generate-pi-vendor-map.ts`). After changing any provider's `capabilities.ts` (or adding a provider/capability axis), run `bun run generate:capability-matrix` to refresh the canonical provider capability matrix at `packages/docs-web/src/content/docs/reference/provider-capabilities.md` — it is generated from the registry's capability constants (the same objects the dag-executor reads for ignored-capability warnings), so the docs can never drift from runtime behavior; a new `ProviderCapabilities` field fails the generator until it gets a matrix axis in `scripts/generate-capability-matrix.ts`. `bun run validate` (and CI) run `check:bundled`, `check:bundled-skill`, `check:bundled-schema`, `check:pi-vendor-map`, and `check:capability-matrix` and will fail loudly if any generated file is stale.
-
-**Home-scoped ("global") workflows, commands, and scripts** (user-level, applies to every project):
-- Workflows: `~/.archon/workflows/` (or `$ARCHON_HOME/workflows/`)
-- Commands: `~/.archon/commands/` (or `$ARCHON_HOME/commands/`)
-- Scripts: `~/.archon/scripts/` (or `$ARCHON_HOME/scripts/`)
-- Source label: `source: 'global'` on workflows and commands (scripts don't have a source label)
-- Load priority: bundled < global < project (repo overrides global by filename or script name)
-- Layouts: flat YAML and one-level grouped YAML remain supported. Packaged workflows use exactly `~/.archon/workflows/<pack>/<workflow>/`; YAML must be directly inside the workflow folder. Deeper YAML is not loaded, and a workflow folder without exactly one direct YAML reports a validation error.
-- Discovery is automatic — `discoverWorkflowsWithConfig(cwd, loadConfig)` and `discoverScriptsForCwd(cwd)` both read home-scoped paths unconditionally; no caller option needed
-- **Migration from pre-0.x `~/.archon/.archon/workflows/`**: if Archon detects files at the old location it emits a one-time WARN with the exact `mv` command and does NOT load from there. Move with: `mv ~/.archon/.archon/workflows ~/.archon/workflows && rmdir ~/.archon/.archon`
-- See the docs site at `packages/docs-web/` for details
 
 ### Error Handling
 
@@ -524,100 +339,10 @@ Structured logging uses Pino via `createLogger('<module>')` from `@archon/paths`
 
 ### API Endpoints
 
-**Web UI REST API** (`packages/server/src/routes/api.ts`):
-
-**Workflow Management:**
-- `GET /api/workflows` - List available workflows; optional `?cwd=`; returns `{ workflows: [...], recommended: [...], errors?: [...] }`. Each entry is `{ workflow, source, parseWarnings? }` — `parseWarnings` (#2213) holds warning messages naming the keys the engine silently dropped from that YAML and is **omitted** when the workflow is clean, so presence alone is the signal
-- `POST /api/workflows/validate` - Validate a workflow definition in-memory (no save); body: `{ definition: object }`; returns `{ valid: boolean, errors?: string[] }`
-- `GET /api/workflows/:name` - Fetch a single workflow by name; optional `?cwd=` query param; returns `{ workflow, filename, source: 'project' | 'bundled' }`
-- `PUT /api/workflows/:name` - Save (create or update) a workflow YAML; body: `{ definition: object }`; validates before writing; requires `?cwd=` or registered codebase
-- `DELETE /api/workflows/:name` - Delete a user-defined workflow; bundled defaults cannot be deleted
-- `DELETE /api/workflows/:name/node-sessions` - Reset persisted per-node provider sessions; optional `?scope=` and `?node=` narrow the deletion; omitting `?scope=` is a cross-scope wipe and requires `?confirm=all-scopes`; returns `{ success, deleted }`
-
-**Workflow Run Lifecycle:**
-- `POST /api/workflows/runs/{runId}/resume` - Resume a failed or paused run from where it left off (skips already-completed DAG nodes; AI session context is not restored).
-- `POST /api/workflows/runs/{runId}/abandon` - Abandon a non-terminal run (marks as cancelled); cascade-cancels non-terminal `workflow:` sub-run descendants (#2121 Phase 2) and reports `cascadeFailures`/`blockedParentRunId`
-- `DELETE /api/workflows/runs/{runId}` - Delete a terminal workflow run and its events
-
-**Codebases:**
-- `GET /api/codebases` / `GET /api/codebases/:id` - List / fetch codebases
-- `POST /api/codebases` - Register a codebase (clone or local path). A non-git local `path` now auto-registers as a folder project (`kind: 'folder'`, runs in place) instead of erroring
-- `DELETE /api/codebases/:id` - Delete a codebase and clean up resources
-- `GET /api/codebases/:id/env` - List env var keys for a codebase (never returns values)
-- `PUT /api/codebases/:id/env` / `DELETE /api/codebases/:id/env/:key` - Upsert / delete a single codebase env var
-- `GET /api/codebases/:id/environments` - List tracked isolation environments for a codebase
-
-**Artifact Files:**
-- `GET /api/runs/:runId/artifacts` - List artifact files for a run; walks the on-disk artifact directory (dotfiles skipped) and returns `{ files: [{ path, size, modifiedAt }] }`; 400 on invalid run id or path-escape attempt, 404 if the run does not exist
-- `GET /api/artifacts/:runId/*` - Serve a workflow artifact file by run ID and relative path; returns `text/markdown` for `.md` files, `text/plain` otherwise; 400 on path traversal (`..`), 404 if run or file not found
-
-**Command Listing:**
-- `GET /api/commands` - List available command names (bundled + project-defined); optional `?cwd=`; returns `{ commands: [{ name, source: 'bundled' | 'project' }] }`
-
-**Providers:**
-- `GET /api/providers` - List registered AI providers; returns `{ providers: [{ id, displayName, capabilities, builtIn }] }`. `capabilities.nativeTools` is `true` for providers that accept in-process native tools (Claude, Pi) — Archon's `manage_run` tool is auto-injected into project-scoped chat for those providers only. `capabilities.structuredOutput` is a tiered union `'enforced' | 'best-effort' | false` (not a boolean): `'enforced'` = SDK/backend grammar-constrained (Claude/Codex/OpenCode), `'best-effort'` = prompt-augmentation + validate (Pi/Copilot), `false` = unsupported.
-
-**Web Auth (opt-in Better Auth; Postgres + `BETTER_AUTH_SECRET`):**
-- Better Auth mounts email/password login at `/api/auth/*` (sign-up/sign-in/sign-out/get-session). Mounted only when enabled; the catch-all explicitly falls through (`isArchonOwnedAuthPath` in `auth/config.ts`, guard-tested) for Archon-owned `/api/auth/status` + `/api/auth/github*` + `/api/auth/providers*` + `/api/auth/me/ai-prefs*` paths so they aren't shadowed (a missing exemption 404s the route — see #1918).
-- `GET /api/auth/status` - Web auth availability + signup posture (no auth required); returns `{ enabled: boolean, signup: 'allowlist' | 'open' | 'disabled' }`. Drives the Web UI login gate.
-- The per-request identity seam is `resolveAuthContext(c): { userId, role } | undefined` (in `routes/api.ts`): Better Auth session first, then the `X-Archon-User` header, then undefined. `resolveWebUserId` delegates to it; `requireWebUser` is the session-aware strict variant (401 missing / 503 backend). `role` rides the canonical user row (default `admin`).
-- **Server-side API gate** (`isApiGateEnabled`): when web auth is enabled, every `/api/*` request must resolve to an identity or gets **401** — except `/api/auth/*` (login surface) and `/api/health*` (healthcheck must stay reachable). `/webhooks/*` and `/internal/*` are outside `/api/*` and untouched. On by default; `ARCHON_WEB_AUTH_REQUIRED=false` keeps login-UI-only. This is what lets Better Auth replace the Caddy `forward_auth` sidecar as the real access boundary.
-- **Signup safety** (`getSignupMode`): with web auth on and no `ARCHON_AUTH_ALLOWED_EMAILS`, signup defaults to **disabled** (login only) + a boot WARN — never silently open. `ARCHON_AUTH_OPEN_SIGNUP=true` opts into open public signup.
-- `GET /api/workflows/runs?mine=true` and `GET /api/conversations?mine=true` - Non-enforcing "my" filter (narrows to `ctx.userId` only when an identity resolves; default lists everything). Not a security boundary.
-
-**GitHub Identity (per-user device flow; App mode + `TOKEN_ENCRYPTION_KEY`):**
-- `POST /api/auth/github/device/start` - Begin the device flow for the current web user (from `X-Archon-User`); returns `{ device_code, user_code, verification_uri, interval, expires_in }`; 401 if no web-auth header
-- `POST /api/auth/github/device/poll` - Single non-blocking poll; body `{ device_code }`; returns `{ status: 'pending' | 'connected' | 'expired' | 'denied' | 'error', githubLogin?, detail? }`
-- `GET /api/auth/github` - Connection status for the current web user; returns `{ connected, githubLogin }`
-- `DELETE /api/auth/github` - Disconnect the current web user's GitHub identity
-
-**AI-Provider Keys (per-user; `requireWebUser`):**
-- `GET /api/auth/providers` - List the current web user's connected provider keys; returns `{ enabled, connections: [{ provider, kind, label }], available: string[], subscriptionAvailable: string[], agents: [...] }` (no secret values; `available` = registry-derived connectable **vendor** catalog, `subscriptionAvailable` = subset that supports OAuth login; `enabled` is always `true` — vault is auto-provisioned). `agents` (#1955) is the agent → credential matrix: per registered agent `{ id, displayName, catalog: 'static'|'dynamic', ready, credentials: [{ vendor, displayName, kinds, connected, subscriptionAvailable, installEnv, ambientConfigured? }] }` — `installEnv`/`ambientConfigured` report server-env detection so readiness works on solo installs too; OpenCode is `catalog:'dynamic'` (introspect via the endpoint below). `requireWebUser` (401 without identity)
-- `PUT /api/auth/providers/:provider` - Connect (upsert) an API key by **vendor id** (legacy `claude`/`codex`/`copilot` accepted + normalized); body `{ apiKey, label? }`; returns `{ success, provider: <vendor>, kind: 'api_key', label }` (never echoes the key). 400 on unknown vendor / blank key, 404 when per-user keys disabled, 500 (opaque) on storage failure
-- `DELETE /api/auth/providers/:provider` - Disconnect a credential (idempotent, vendor-normalized); returns `{ success }`. 404 when disabled
-- `POST /api/auth/providers/:provider/oauth/start` - Begin a subscription (OAuth) login (`anthropic`/`openai`/`github-copilot`); returns `{ sessionId, mode: 'manual'|'device', url?, userCode?, verificationUri?, expiresIn }` (no secret). 400 non-subscription vendor, 404 disabled, 503 when a previous login still holds the OAuth callback port (#1963 — retryable). Held server-side by the `oauth-bridge`: Pi's `login()` for anthropic/github-copilot; an Archon-OWNED PKCE flow for openai/ChatGPT (`openai-oauth.ts` — captures the `id_token` Pi drops, manual-paste only with no local callback server, #1924). `SUBSCRIPTION_PROVIDERS` (in `oauth-providers.ts`) is the single source of truth.
-- `POST /api/auth/providers/:provider/oauth/poll` - Poll the login session; body `{ sessionId, code? }` (`code` = pasted manual-code); returns `{ status: 'pending'|'connected'|'error', detail? }`. Session bound to the caller's userId.
-- Credentials (API keys + subscriptions) injected into runs/chat env at execution time (vault always active — `TOKEN_ENCRYPTION_KEY` overrides the auto-key on managed deploys). Subscription tokens refresh-on-read and re-save on rotation. Subscriptions are delivered to native Claude/Codex (env / `CODEX_HOME/auth.json`) AND to Pi — in workflow runs via a per-run `auth.json` (`ARCHON_PI_AUTH_PATH`), and in env-only direct chat (no artifacts dir) an `anthropic` subscription rides `ANTHROPIC_OAUTH_TOKEN` in the env bag, which the Pi env bridge reads ahead of `ANTHROPIC_API_KEY` (#1984).
-
-**Per-User AI Prefs (Phase 3; `requireWebUser` — identity only, NO `TOKEN_ENCRYPTION_KEY`):**
-- `GET /api/auth/me/ai-prefs` - The current user's stored prefs (raw per-user layer, not merged with config); returns `{ tiers?, aliases?, defaultProvider? }`. 401 without identity — the console hides "Just me" on failure.
-- `PATCH /api/auth/me/ai-prefs/tiers` / `…/aliases` - Per-key merge writes (`null` unsets); validate provider via `isRegisteredProvider`, effort via `isEffortValidForProvider`, alias names (`@` prefix, not a reserved tier keyword). All return the updated prefs.
-- `PATCH /api/auth/me/ai-prefs/default` - Set the personal default assistant + default chat model: `{ provider, model? }` written ATOMICALLY (omitted `model` clears any pin; `model` without `provider` → 400; `provider: null` clears both). Chat model precedence (#1998, chat call-site only): user `default_model` (provider must match) → configured `large` tier (user > repo > global) → install `assistants.<p>.model` (beats only the built-in tier default) → built-in tier default.
-- Stored in `remote_agent_user_ai_prefs` (non-encrypted); folded into `buildAiProfile` as the **highest-precedence** layer (global < repo < user) at the userId-aware seams — workflow executor (`deps.getUserAiPrefs`, resolved from the run starter) and chat orchestrator (sender-first: `executionUserId = context.userId ?? conversation.user_id` — the SENDER's prefs and credentials win; the conversation creator is only the fallback when no sender identity resolves, see #1982). The per-user `defaultProvider` rebases tier defaults and the chat assistant. No identity → byte-for-byte config-only behavior (solo unchanged). A chat request for tier `large` that resolves via the fallback chain emits a one-line non-blocking nudge (`orchestrator.tier_fallback_nudge`). Note: on genuinely shared threads (Slack/Telegram), per-sender prefs mean the provider can differ per turn within one thread (session transitions churn accordingly), and a sender's turn carries the shared thread history into a call billed to their credential — accepted semantics.
-
-**Config and provider metadata (System; not `requireWebUser`, but covered by the global API gate):**
-
-- These routes are ungated on solo installs and when `ARCHON_WEB_AUTH_REQUIRED=false`. With web auth's default API gate enabled, they require either a Better Auth session or the trusted reverse-proxy identity header; only `/api/auth/*` and `/api/health*` bypass that gate. The proxy header is safe only when a trusted proxy strips client-supplied copies (or Archon binds to loopback).
-- The config `PATCH` routes do not add a route-specific identity requirement. Consequently, disabling the global API gate leaves them writable whether or not the optional proxy header is present; deployments that opt out must enforce the equivalent boundary at their proxy.
-- `GET /api/config` - Read-only safe config; returns `{ config, database }`. `config` includes `tiers` (configured small/medium/large presets), `tierDefaults` (built-in presets for the default provider, computed via `buildAiProfile` — lets the UI show what an unset tier resolves to), and `aliases` (configured `@custom` aliases, merged repo > global).
-- `PATCH /api/config/assistants` - Update default assistant + per-provider model defaults.
-- `PATCH /api/config/tiers` - Update model-tier presets; body `{ tiers: { small?, medium?, large? } }` where each tier is `{ provider, model, effort? }` or `null` (unset). Per-key merge; validates each `provider` via `isRegisteredProvider`. Writes `~/.archon/config.yaml`. Drives the console "AI Settings → Model Tiers" panel + `archon ai tier` CLI.
-- `PATCH /api/config/aliases` - Update `@custom` model aliases; body `{ aliases: Record<'@name', entry | null> }`. Same per-key merge + validation as `/tiers`, plus alias-name checks (`@` prefix, not reserved). Drives the console "Model Aliases" panel + `archon ai alias` CLI.
-- `GET /api/providers/pi/models` - Pi's model catalog (`{ models: [{ ref, provider, id, name, reasoning, cost, contextWindow }] }`) for the tier picker's cost/reasoning hint. Best-effort: returns `{ models: [] }` on any catalog failure — never blocks tier/alias saves.
-- `GET /api/providers/opencode/credentials` - Introspect OpenCode's backend providers (#1955): proxies the embedded server's `GET /provider` + `/provider/auth`; returns `{ providers: [{ id, name, env, connected, modelCount, authMethods }] }` (metadata only; `connected` is install-wide — OpenCode's auth store is server-global). **Heavyweight**: starts the embedded OpenCode runtime when not already running — call on demand from the settings card, never on passive page load. 503 (never a silent `[]`) when the runtime is unavailable.
-
-**System:**
-- `GET /api/health` - Health check with adapter/system status
-- `GET /api/update-check` - Check for available updates; returns `{ updateAvailable, currentVersion, latestVersion, releaseUrl }`; skips GitHub API call for non-binary builds
-
-**OpenAPI Spec:**
-- `GET /api/openapi.json` - Generated OpenAPI 3.0 spec for all Zod-validated routes
-
-**Webhooks:**
-- `POST /webhooks/github` - GitHub webhook events
-- Signature verification required (HMAC SHA-256)
-- Return 200 immediately, process async
-
-**Internal (App mode only; bind 127.0.0.1):**
-- `POST /internal/git-credential` - Git credential helper endpoint. Returns `{token}` for the installation matching the requested host/path. Used by the `git-credential-archon` script in worktree `.git/config` to refresh installation tokens for long-running workflow `git` operations. Hands out installation tokens — MUST NOT be exposed beyond loopback. Server **refuses to start** (not just WARN) if App mode is active and `hostname != 127.0.0.1/localhost`, unless `ARCHON_ALLOW_INTERNAL_ON_PUBLIC_BIND=1` is set as an opt-in escape hatch for deployments where the reverse proxy already drops `/internal/*`.
+Moved to `docs/agents/api-endpoints.md`, section "API Endpoints". Read it before changing this area. The rules below stay here.
 
 **Security:**
 - Verify webhook signatures (GitHub: `X-Hub-Signature-256`)
 - Use `c.req.text()` for raw webhook body (signature verification)
 - Never log or expose tokens in responses
 - `/internal/*` paths hand out live credentials — the reverse proxy in production MUST drop them, or the server MUST bind to `127.0.0.1` only.
-
-**@Mention Detection:**
-- Parse `@archon` in issue/PR **comments only** (not descriptions)
-- Events: `issue_comment` only
-- Note: Descriptions often contain example commands or documentation - these are NOT command invocations (see #96)
