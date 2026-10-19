@@ -1,29 +1,32 @@
 /**
  * Check the run's decision, perform the writes it declared, and read each one back.
  *
- * The decision is the last agent's that ran: give-up's over answer's, answer's over
- * route's. A route that launched is answered after its round, so its own decision is
+ * The decision is the last agent's that ran: answer's over route's. At the round cap an
+ * answer that asks is the scope question. A route that launched is answered after its round, so its own decision is
  * recorded only when it asked. A push the answer declared is made whatever the run
  * decided, since a round's work belongs on its pull request even when a person is
- * asked about it. In live the push comes first, then the work item, in
- * one conditional write that also releases the claim unless a person is asked; a run
- * that asks keeps its claim until the ruling node records the answer. Eval writes
- * nothing and returns the decision, with the writes live would make, as `evaluation`.
+ * asked about it. The push comes first, then the work item, in one conditional
+ * write that also releases the claim unless a person is asked; a run that asks keeps
+ * its claim until the ruling node records the answer. A continue then starts the item's
+ * next round at once, on the run config this run started with; if that launch fails,
+ * the item waits for the next queue run.
  *
- * Bound inputs: INPUTS_PATH, INPUTS_ITEM and INPUTS_RECORDED from facts; INPUTS_ROUTE,
- * INPUTS_ENDING (archon-ship's report), INPUTS_ANSWER and INPUTS_GIVE_UP, each the
- * whole output of its node, "null" when it was skipped.
+ * Bound inputs: INPUTS_PATH and INPUTS_ITEM from facts; INPUTS_ROUTE,
+ * INPUTS_ENDING (archon-ship's report) and INPUTS_ANSWER, each the whole output of its
+ * node, "null" when it was skipped; INPUTS_AT_CAP from facts.
  */
 
 import type { ApplyDecision, AskedBy, BuildAttention, BuildRound, BuildStatus } from '../../.shared/build.ts';
 import { withBuild } from '../../.shared/build.ts';
 import { forgeSource, parseQualifiedPr, type QualifiedPr } from '../../.shared/forge.ts';
 import { gitOrThrow } from '../../.shared/git.ts';
+import { launchNextRound } from '../../.shared/launch.ts';
 import { artifactsDir, emit, nullableJson, refuse, text, trimmed } from '../../.shared/io.ts';
 import { viewPr } from '../../.shared/pr.ts';
 import { pushHead } from '../../.shared/push.ts';
-import { attentionOptions, checkAttention, type DecisionEntry, renderAttention } from '../../.shared/queue.ts';
-import { parseMode, updateClaimed } from '../../.shared/workitem.ts';
+import { attentionOptions, checkAttention, type DecisionEntry, renderAttention, withOther } from '../../.shared/queue.ts';
+import { idleSummary, stuckItems } from '../../.shared/stuck.ts';
+import { updateClaimed } from '../../.shared/workitem.ts';
 
 interface RouteOutput {
   readonly decision: 'launch' | 'ask';
@@ -36,12 +39,6 @@ interface AnswerOutput {
   readonly decision: 'done' | 'continue' | 'ask';
   readonly brief: string;
   readonly push: QualifiedPr | null;
-  readonly reason: string;
-  readonly attention: BuildAttention | null;
-}
-
-interface GiveUpOutput {
-  readonly decision: 'continue' | 'ask';
   readonly reason: string;
   readonly attention: BuildAttention | null;
 }
@@ -70,28 +67,25 @@ type Decision =
 function asked(by: AskedBy, attention: BuildAttention | null, brief: string, reason: string): Decision {
   if (attention === null) throw new Error(`the ${by} decision asks without an attention item`);
   checkAttention(attention);
-  return { kind: 'asked', by, attention, brief, reason };
+  return { kind: 'asked', by, attention: withOther(attention, 'continue'), brief, reason };
 }
 
 function decide(
   path: string,
   route: RouteOutput | null,
   answer: AnswerOutput | null,
-  giveUp: GiveUpOutput | null
+  atCap: boolean
 ): Decision {
   if (path === 'closed') return { kind: 'parked', reason: 'the issue is closed' };
   if (answer !== null) {
     if (answer.decision === 'done') return { kind: 'ready', reason: answer.reason };
-    if (answer.decision === 'ask') return asked('stop', answer.attention, answer.brief, answer.reason);
+    if (answer.decision === 'ask') return asked(atCap ? 'scope' : 'stop', answer.attention, answer.brief, answer.reason);
     if (answer.brief.trim() === '') throw new Error('a continue decision has no brief to launch from');
-    if (giveUp?.decision === 'ask') {
-      return asked('scope', giveUp.attention, answer.brief, giveUp.reason);
-    }
     return { kind: 'continue', brief: answer.brief, reason: answer.reason };
   }
   if (route === null) throw new Error(`the ${path} path reached apply with no decision`);
   if (route.decision === 'ask') return asked('route', route.attention, route.brief, route.reason);
-  // Live answers every launch; only eval, which never launches, ends on one.
+  // A launch is answered after its round, so a run never ends on one.
   return { kind: 'launch', brief: route.brief, reason: route.reason };
 }
 
@@ -116,18 +110,22 @@ function summaryOf(item: QualifiedPr | null, decision: Decision): string {
   return `${subject}${decision.kind}. ${decision.reason}`;
 }
 
+/** The summary once the writes are done; a continue starts the next round now instead of waiting for the next queue run. */
+function afterWrite(summary: string, pushed: string | null, decision: Decision, item: QualifiedPr, runId: string): string {
+  const written = pushed === null ? summary : `${summary} (${pushed})`;
+  return decision.kind === 'continue' ? `${written}; ${launchNextRound(item, runId)}` : written;
+}
+
 function main(): void {
-  const mode = parseMode(text(process.env.INPUTS_MODE));
   const path = trimmed(process.env.INPUTS_PATH);
   if (path === 'idle') {
     emit({
       decision: 'idle',
-      summary: 'No item waits for the build queue.',
+      summary: idleSummary('No item waits for the build queue.', stuckItems(text(process.env.WORKFLOW_ID))),
       attention: '',
       options: [],
       class: '',
       asked: null,
-      evaluation: null,
     });
     return;
   }
@@ -137,15 +135,13 @@ function main(): void {
   const ending = nullableJson(process.env.INPUTS_ENDING) as ShipReport | null;
   const at = new Date().toISOString();
   const round: BuildRound | null =
-    ending === null
-      ? (nullableJson(process.env.INPUTS_RECORDED) as BuildRound | null)
-      : { run_id: runId, at, ...ending, artifacts: artifactsDir() };
+    ending === null ? null : { run_id: runId, at, ...ending, artifacts: artifactsDir() };
   const answer = nullableJson(process.env.INPUTS_ANSWER) as AnswerOutput | null;
   const decision = decide(
     path,
     nullableJson(process.env.INPUTS_ROUTE) as RouteOutput | null,
     answer,
-    nullableJson(process.env.INPUTS_GIVE_UP) as GiveUpOutput | null
+    text(process.env.INPUTS_AT_CAP) === 'true'
   );
   const push = answer?.push ?? null;
   const asking = decision.kind === 'asked' ? decision : null;
@@ -167,23 +163,7 @@ function main(): void {
       asking === null ? null : { attention: asking.attention, brief: asking.brief, by: asking.by },
   };
 
-  if (mode === 'eval') {
-    emit({
-      ...result,
-      attention: '',
-      options: [],
-      class: '',
-      asked: null,
-      evaluation: {
-        decision,
-        round,
-        attention,
-        push,
-      },
-    });
-    return;
-  }
-  if (decision.kind === 'launch') throw new Error('a live launch reached apply without its round');
+  if (decision.kind === 'launch') throw new Error('a launch reached apply without its round');
 
   const pushed = push === null ? null : pushTo(push);
   const entry: DecisionEntry = {
@@ -204,7 +184,7 @@ function main(): void {
       release: asking === null,
     })
   );
-  emit({ ...result, summary: pushed === null ? result.summary : `${result.summary} (${pushed})`, evaluation: null });
+  emit({ ...result, summary: afterWrite(result.summary, pushed, decision, item, runId) });
 }
 
 try {

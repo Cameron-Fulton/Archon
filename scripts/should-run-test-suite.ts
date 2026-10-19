@@ -5,8 +5,8 @@ const DOCS_DIRECTORY = 'packages/docs-web/';
 const EMPTY_GIT_SHA = '0000000000000000000000000000000000000000';
 
 /**
- * Paths that read as documentation but are build inputs, so changing one must run
- * the auxiliary build and service jobs. Markdown in bundled prompts and skills is
+ * Paths that read as documentation but are build or test inputs, so changing one must run
+ * the test suite and auxiliary build and service jobs. Markdown in bundled prompts and skills is
  * executable content rather than ordinary prose.
  *
  * An entry ending in `/` matches a directory, anything else matches one file. Each is here
@@ -20,9 +20,22 @@ const EMPTY_GIT_SHA = '0000000000000000000000000000000000000000';
  *   - `provider-capabilities.md` is generated from the providers' `capabilities.ts`
  *     (`check:capability-matrix`), and lives under the docs site without being prose.
  *   - The docs manifest is copied by the Docker dependency layer.
+ *   - Directory-qualified tracked Markdown paths named by tests are checked against this gate by
+ *     `markdownTestInputs` in `should-run-test-suite.test.ts`.
  */
 const BUILD_INPUTS = [
   '.claude/skills/',
+  '.archon/architecture.md',
+  '.archon/workflow-language-constitution.md',
+  '.claude/commands/execute.md',
+  'packages/providers/src/codex/protocol/README.md',
+  'packages/docs-web/src/content/docs/reference/database.md',
+  'packages/docs-web/src/content/docs/reference/api.md',
+  'packages/docs-web/src/content/docs/reference/node-execution.md',
+  'packages/docs-web/src/content/docs/deployment/docker.md',
+  'packages/docs-web/src/content/docs/deployment/reverse-proxy.md',
+  'packages/docs-web/src/content/docs/guides/attention-queue.md',
+  'packages/docs-web/src/content/docs/guides/workflow-triggers.md',
   'packages/docs-web/src/content/docs/reference/provider-capabilities.md',
   'packages/docs-web/package.json',
 ];
@@ -66,19 +79,6 @@ export function shouldRunTestSuite(files: Iterable<string>): boolean {
     if (isBuildInput(file)) return true;
     if (isInert(file) || file.endsWith('.md') || file.startsWith(DOCS_DIRECTORY)) continue;
     return true;
-  }
-  return false;
-}
-
-export function shouldRunWorkflowFixtures(files: Iterable<string>): boolean {
-  for (const path of files) {
-    const file = path.replaceAll('\\', '/');
-    if (
-      file.startsWith('.archon/workflows/sdlc/') ||
-      file.startsWith('packages/workflows/src/') ||
-      file === 'packages/cli/src/commands/workflow.ts'
-    )
-      return true;
   }
   return false;
 }
@@ -254,9 +254,9 @@ function requireSha(value: unknown, field: string): string {
  * docs-only push cancel the run a code push had started (the workflow's concurrency group
  * cancels the older run) and then skip the suite, leaving the PR head untested.
  *
- * A push spans `before` to `after`. Its suite decision comes from `proofFromPullRequestRun`, and
- * only the fixture decision still reads the push diff. A push that creates a branch has an
- * all-zero `before`, so there is nothing to compare.
+ * A push spans `before` to `after`. Its decision comes from `proofFromPullRequestRun`, never
+ * from the push diff. A push that creates a branch has an all-zero `before`, so there is nothing
+ * to compare.
  */
 export function diffRange(eventName: string, event: EventPayload): DiffRange {
   if (eventName === 'workflow_dispatch') return null;
@@ -450,7 +450,7 @@ function githubApi(env: NodeJS.ProcessEnv = process.env): GitHubGet {
   };
 }
 
-const MODES = { '--workflow-fixtures': 'fixtures', '--workspace-tests': 'workspace' } as const;
+const MODES = { '--workspace-tests': 'workspace' } as const;
 type Mode = 'suite' | (typeof MODES)[keyof typeof MODES];
 
 function readMode(args: readonly string[]): Mode {
@@ -467,7 +467,6 @@ function readMode(args: readonly string[]): Mode {
 
 const PREDICATES: Record<Mode, (files: Iterable<string>) => boolean> = {
   suite: shouldRunTestSuite,
-  fixtures: shouldRunWorkflowFixtures,
   workspace: files => {
     const changed = [...files];
     return shouldRunWorkspaceTests(changed, workspaceTestInputs(process.cwd(), changed));
@@ -496,11 +495,9 @@ async function main(): Promise<void> {
       return;
     }
     console.error(`No pull request run proves this push: ${proof.reason}.`);
-    // A push is never path-filtered for the tests; only fixtures still follow the push diff.
-    if (mode !== 'fixtures') {
-      console.log(true);
-      return;
-    }
+    // A push is never path-filtered.
+    console.log(true);
+    return;
   }
   console.log(decideFromDiff(range.base, range.head, PREDICATES[mode]));
 }

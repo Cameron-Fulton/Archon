@@ -11,7 +11,9 @@ import type {
 
 const operator: RunActor = { kind: 'operator' };
 
-const { hydrateResumableRun: realHydrateResumableRun } = await import('@archon/workflows/executor');
+const { hydrateResumableRun: realHydrateResumableRun } = await import(
+  '@archon/workflows/run-resume'
+);
 const { createWorkflowDeps: realCreateWorkflowDeps } = await import('../workflows/store-adapter');
 
 const CODEBASE_ID = 'proj-1';
@@ -988,6 +990,7 @@ describe('manage_run — gate continuation', () => {
           getDagResumeSnapshot: async () => ({
             completedNodeOutputs: new Map(),
             fanOutSnapshots: new Map(),
+            failedNodes: new Map(),
             unresolvedNodeStarts: new Set<string>(),
             budget: { workUnits: 0, spendUsd: 0 },
             costUsd: 0,

@@ -47,7 +47,7 @@ import {
   withCapturedSource,
   type CapturedSourceOwner,
   type PreparedWorkflowSource,
-} from '@archon/workflows/executor';
+} from '@archon/workflows/run-source';
 import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
 import { resolveWorkflowName } from '@archon/workflows/router';
 import { loadConfig } from '../config/config-loader';
@@ -383,8 +383,8 @@ async function dispatchBackgroundWorkflowOwned(
       });
       // From here the owner reclaims it unless a run adopts it, whichever way we leave.
       owner.hold(preparedSource);
-      // See the note in orchestrator-agent.ts: an empty capture means the definition came
-      // from a binary's embedded bundled set, which has nothing on disk to re-read.
+      // See `captureFreshSource` in workflow-dispatch.ts: an empty capture means the definition
+      // came from a binary's embedded bundled set, which has nothing on disk to re-read.
       if (preparedSource.manifest.scopes.length > 0) {
         const { workflows: capturedWorkflows } = await discoverWorkflowsWithConfig(
           preflightCwd,
@@ -437,7 +437,7 @@ async function dispatchBackgroundWorkflowOwned(
           : {}),
       }
     );
-    await assertRunCredentials(workflowDeps, preparedAiConfiguration);
+    await assertRunCredentials(workflowDeps, preparedAiConfiguration, { cwd: launchConfigCwd });
 
     return { workflow, preparedSource, preparedAiConfiguration };
   };

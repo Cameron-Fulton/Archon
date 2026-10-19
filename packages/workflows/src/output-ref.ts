@@ -2,7 +2,7 @@
  * Strict resolution for `$nodeId.output.<path>` references (no-silent-drop).
  *
  * Shared by both consumers — prompt/script substitution (`substituteNodeOutputRefs`
- * in dag-executor) and `when:` evaluation (`resolveOutputRef` in condition-evaluator)
+ * in dag/references) and `when:` evaluation (`resolveOutputRef` in condition-evaluator)
  * — so the contract is identical in both.
  *
  * A path is one or more object-field segments; a single field is a depth-1 path.
@@ -320,7 +320,7 @@ export function resolveExecutionCheckoutStart(
 /**
  * Thrown when a `$nodeId.output.field` reference cannot be honored under the
  * no-silent-drop contract. Propagates to fail the consuming node (both call
- * sites run inside the dag-executor's per-node try/catch).
+ * sites run inside runLayers' per-node try/catch).
  */
 export type OutputRefErrorReason =
   | 'not-in-schema'

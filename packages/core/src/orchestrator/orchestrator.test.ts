@@ -1,4 +1,5 @@
 // @archon-test-isolated
+import type * as WorkflowRunSource from '@archon/workflows/run-source';
 import type { RunActor } from '../operations/run-authorization';
 import type { ProviderRegistry } from '@archon/provider-contract';
 mock.module('../workflows/branch-launch-source', () => ({
@@ -439,15 +440,19 @@ mock.module('../utils/error-formatter', () => ({
 mock.module('@archon/workflows/workflow-discovery', () => ({
   discoverWorkflowsWithConfig: mockDiscoverWorkflows,
 }));
-/** Ownership calls the dispatch path makes on its capture, in order. */
 const capturedSourceOwnerCalls: string[] = [];
 
 mock.module('@archon/workflows/executor', () => ({
   executeWorkflow: mockExecuteWorkflow,
+}));
+mock.module('@archon/workflows/run-resume', () => ({
+  hydrateResumableRun: mock(() => Promise.resolve(null)),
+}));
+mock.module('@archon/workflows/run-source', () => ({
   finalizeWorkflowSource: mock(
-    async (_deps: unknown, source: WorkflowExecutor.PreparedWorkflowSource) => source
+    async (_deps: unknown, source: WorkflowRunSource.PreparedWorkflowSource) => source
   ),
-  preparedWorkflowSourceRecord: (source: WorkflowExecutor.PreparedWorkflowSource) => ({
+  preparedWorkflowSourceRecord: (source: WorkflowRunSource.PreparedWorkflowSource) => ({
     version: 1,
     root: source.anchor.root,
     origin: source.origin,
@@ -457,10 +462,7 @@ mock.module('@archon/workflows/executor', () => ({
     file_count: source.manifest.file_count,
     byte_count: source.manifest.byte_count,
   }),
-  hydrateResumableRun: mock(() => Promise.resolve(null)),
-  // Source capture runs before dispatch and does real filesystem work; stub it so these
-  // tests stay about routing. `mock.module` MERGES, so an export omitted here keeps its
-  // REAL implementation — which is exactly how a stub silently starts doing disk I/O.
+  // Bun merges module mocks: stub each capture export to avoid real I/O.
   prepareWorkflowSource: mock(() =>
     Promise.resolve({
       runId: 'prepared-run-id',
@@ -558,7 +560,7 @@ mock.module('../db/workflows', () => ({
 
 // ─── Import module under test (AFTER all mocks) ─────────────────────────────
 
-import { handleMessage, parseOrchestratorCommands } from './orchestrator-agent';
+import { handleMessage } from './orchestrator-agent';
 
 // ─── Test Fixtures ──────────────────────────────────────────────────────────
 
@@ -682,150 +684,6 @@ function clearAllMocks(): void {
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
-
-describe('parseOrchestratorCommands', () => {
-  const codebases: Codebase[] = [mockCodebase];
-  const workflows: WorkflowDefinition[] = testWorkflowDefs;
-
-  test('parses /invoke-workflow with --project', () => {
-    const response = 'I will fix this.\n/invoke-workflow fix-bug --project test-project';
-    const result = parseOrchestratorCommands(response, codebases, workflows);
-
-    expect(result.workflowInvocation).not.toBeNull();
-    expect(result.workflowInvocation?.workflowName).toBe('fix-bug');
-    expect(result.workflowInvocation?.projectName).toBe('test-project');
-    expect(result.workflowInvocation?.remainingMessage).toBe('I will fix this.');
-  });
-
-  test('case-insensitive project name matching', () => {
-    const response = '/invoke-workflow fix-bug --project TEST-PROJECT';
-    const result = parseOrchestratorCommands(response, codebases, workflows);
-
-    expect(result.workflowInvocation).not.toBeNull();
-    expect(result.workflowInvocation?.projectName).toBe('test-project');
-  });
-
-  test('returns null for unknown workflow name', () => {
-    const response = '/invoke-workflow nonexistent --project test-project';
-    const result = parseOrchestratorCommands(response, codebases, workflows);
-
-    expect(result.workflowInvocation).toBeNull();
-  });
-
-  test('returns null for unknown project name', () => {
-    const response = '/invoke-workflow fix-bug --project unknown-project';
-    const result = parseOrchestratorCommands(response, codebases, workflows);
-
-    expect(result.workflowInvocation).toBeNull();
-  });
-
-  test('parses /register-project', () => {
-    const response = 'Sure!\n/register-project my-app /home/user/my-app';
-    const result = parseOrchestratorCommands(response, codebases, workflows);
-
-    expect(result.projectRegistration).not.toBeNull();
-    expect(result.projectRegistration?.projectName).toBe('my-app');
-    expect(result.projectRegistration?.projectPath).toBe('/home/user/my-app');
-  });
-
-  test('returns empty commands when no commands in text', () => {
-    const response = 'Just a conversational response.';
-    const result = parseOrchestratorCommands(response, codebases, workflows);
-
-    expect(result.workflowInvocation).toBeNull();
-    expect(result.projectRegistration).toBeNull();
-  });
-
-  test('extracts remaining message before /invoke-workflow', () => {
-    const response =
-      'Let me analyze this for you.\n\n/invoke-workflow fix-bug --project test-project';
-    const result = parseOrchestratorCommands(response, codebases, workflows);
-
-    expect(result.workflowInvocation?.remainingMessage).toBe('Let me analyze this for you.');
-  });
-
-  test('handles --project= (equals syntax)', () => {
-    const response = '/invoke-workflow fix-bug --project=test-project';
-    const result = parseOrchestratorCommands(response, codebases, workflows);
-
-    expect(result.workflowInvocation).not.toBeNull();
-    expect(result.workflowInvocation?.projectName).toBe('test-project');
-  });
-
-  test('parses --prompt with double quotes', () => {
-    const response =
-      'I will analyze this.\n/invoke-workflow archon-investigate --project test-project --prompt "Analyze the orchestrator module architecture"';
-    const result = parseOrchestratorCommands(response, codebases, workflows);
-
-    expect(result.workflowInvocation).not.toBeNull();
-    expect(result.workflowInvocation?.workflowName).toBe('archon-investigate');
-    expect(result.workflowInvocation?.projectName).toBe('test-project');
-    expect(result.workflowInvocation?.synthesizedPrompt).toBe(
-      'Analyze the orchestrator module architecture'
-    );
-    expect(result.workflowInvocation?.remainingMessage).toBe('I will analyze this.');
-  });
-
-  test('parses --prompt with single quotes', () => {
-    const response =
-      "/invoke-workflow fix-bug --project test-project --prompt 'Fix the null pointer in data processor'";
-    const result = parseOrchestratorCommands(response, codebases, workflows);
-
-    expect(result.workflowInvocation?.synthesizedPrompt).toBe(
-      'Fix the null pointer in data processor'
-    );
-  });
-
-  test('returns undefined synthesizedPrompt when --prompt not provided', () => {
-    const response = '/invoke-workflow fix-bug --project test-project';
-    const result = parseOrchestratorCommands(response, codebases, workflows);
-
-    expect(result.workflowInvocation).not.toBeNull();
-    expect(result.workflowInvocation?.synthesizedPrompt).toBeUndefined();
-  });
-
-  test('parses --prompt with spaces in the quoted value', () => {
-    const response =
-      '/invoke-workflow archon-investigate --project test-project --prompt "Analyze the database schema and migration patterns in the project, focusing on table structure and relationships"';
-    const result = parseOrchestratorCommands(response, codebases, workflows);
-
-    expect(result.workflowInvocation?.synthesizedPrompt).toBe(
-      'Analyze the database schema and migration patterns in the project, focusing on table structure and relationships'
-    );
-  });
-
-  test('backwards compatibility: existing format without --prompt still works', () => {
-    const response = 'I will fix this.\n/invoke-workflow fix-bug --project test-project';
-    const result = parseOrchestratorCommands(response, codebases, workflows);
-
-    expect(result.workflowInvocation).not.toBeNull();
-    expect(result.workflowInvocation?.workflowName).toBe('fix-bug');
-    expect(result.workflowInvocation?.projectName).toBe('test-project');
-    expect(result.workflowInvocation?.remainingMessage).toBe('I will fix this.');
-    expect(result.workflowInvocation?.synthesizedPrompt).toBeUndefined();
-  });
-
-  test('parses --prompt with --project= equals syntax', () => {
-    const response =
-      '/invoke-workflow archon-investigate --project=test-project --prompt "Summarize the README"';
-    const result = parseOrchestratorCommands(response, codebases, workflows);
-
-    expect(result.workflowInvocation?.projectName).toBe('test-project');
-    expect(result.workflowInvocation?.synthesizedPrompt).toBe('Summarize the README');
-  });
-
-  test('matches partial project name (last path segment)', () => {
-    const namespacedCodebases: Codebase[] = [
-      { ...mockCodebase, name: 'dynamous-community/test-project' },
-    ];
-    const response = '/invoke-workflow fix-bug --project test-project --prompt "Fix the bug"';
-    const result = parseOrchestratorCommands(response, namespacedCodebases, workflows);
-
-    expect(result.workflowInvocation).not.toBeNull();
-    expect(result.workflowInvocation?.projectName).toBe('dynamous-community/test-project');
-    expect(result.workflowInvocation?.synthesizedPrompt).toBe('Fix the bug');
-  });
-});
 
 describe('orchestrator-agent handleMessage', () => {
   let platform: MockPlatformAdapter;

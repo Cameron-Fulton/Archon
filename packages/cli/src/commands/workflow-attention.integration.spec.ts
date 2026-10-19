@@ -3,12 +3,18 @@ import { mkdirSync, mkdtempSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { trackTempRoots } from '@archon/paths/test-utils';
-import { getProjectStoragePaths, resolveProjectStorageKey } from '@archon/paths/archon-paths';
+import {
+  getProjectStoragePaths,
+  resolveProjectStorageKey,
+  projectKeyForCodebase,
+} from '@archon/paths/archon-paths';
 import { providerRegistry } from '@archon/providers';
 import { loadConfig } from '@archon/core/config/config-loader';
 import { createWorkflowOperations } from '@archon/core/operations/workflow-operations';
 import { attentionQueueSource } from '@archon/core/operations/attention-queue';
 import { InProcessWorkflowEngine } from '@archon/workflows/in-process-engine';
+import { workflowEventCursor } from '@archon/workflows/store';
+import type { AttentionStreamLine } from '@archon/workflows/attention-watch';
 import type { AttentionQueueItem } from '@archon/workflows/attention-queue';
 import type { WorkflowHost } from '@archon/core/workflows/host-store';
 import {
@@ -16,7 +22,7 @@ import {
   createInMemoryWorkflowStore,
 } from '../test-support/workflow-store';
 import { stateCommand } from './state';
-import { workflowAttentionCommand, workflowAttentionLabelCommand } from './workflow';
+import { workflowAttentionCommand, workflowAttentionLabelCommand } from './workflow-attention';
 
 const track = trackTempRoots();
 const priorEnv = { ...process.env };
@@ -175,14 +181,15 @@ test('the queue scopes by project the way archon state names it, across a rename
 
   const scratch = await list(scratchDir);
   expect(scratch.map(item => item.runId)).toEqual([unregistered]);
+  const scratchKey = await stateKey(scratchDir);
   expect(scratch[0]?.project).toEqual({
-    key: await stateKey(scratchDir),
+    key: scratchKey,
     codebaseId: null,
-    name: 'scratch',
+    name: scratchKey.slice(scratchKey.lastIndexOf('/') + 1),
   });
-  expect((await list(registeredDir, { project: '_cwd/scratch' })).map(item => item.runId)).toEqual([
-    unregistered,
-  ]);
+  expect(
+    (await list(registeredDir, { project: await stateKey(scratchDir) })).map(item => item.runId)
+  ).toEqual([unregistered]);
 
   expect((await list(registeredDir, { all: true })).map(item => item.runId).sort()).toEqual(
     [current, renamed, unregistered].sort()
@@ -295,11 +302,16 @@ async function streamed(
     return true;
   }) as typeof process.stdout.write);
   try {
-    const running = command();
+    let finished = false;
+    const running = command().then(code => {
+      finished = true;
+      return code;
+    });
     for (let waited = 0; !stopWhen(lines); waited += 5) {
       if (waited > 5000) throw new Error(`stream never satisfied: ${JSON.stringify(lines)}`);
       await Bun.sleep(5);
     }
+    expect(finished).toBe(false);
     process.emit('SIGTERM');
     return { code: await running, lines };
   } finally {
@@ -339,7 +351,8 @@ test('watch streams the queue by project, refuses list-only flags, and exits 4 o
   };
   const alphaDir = projectDir('alpha');
   const alpha = await pausedIn(alphaDir);
-  const beta = await pausedIn(projectDir('beta'));
+  const betaDir = projectDir('beta');
+  const beta = await pausedIn(betaDir);
   const watch = (opts: Partial<Parameters<typeof workflowAttentionCommand>[3]> = {}) =>
     streamed(
       () =>
@@ -355,14 +368,24 @@ test('watch streams the queue by project, refuses list-only flags, and exits 4 o
     lines.flatMap(line =>
       line.type === 'attention' ? [[(line.item as AttentionQueueItem).runId, line.project]] : []
     );
-  const alphaProject = { key: '_cwd/alpha', codebaseId: null, name: 'alpha' };
-  const betaProject = { key: '_cwd/beta', codebaseId: null, name: 'beta' };
+  const alphaKey = projectKeyForCodebase(null, alphaDir);
+  const alphaProject = {
+    key: alphaKey,
+    codebaseId: null,
+    name: alphaKey.slice(alphaKey.lastIndexOf('/') + 1),
+  };
+  const betaKey = projectKeyForCodebase(null, betaDir);
+  const betaProject = {
+    key: betaKey,
+    codebaseId: null,
+    name: betaKey.slice(betaKey.lastIndexOf('/') + 1),
+  };
 
   const own = await watch();
   expect(own.code).toBe(0);
   expect(runsOf(own.lines)).toEqual([[alpha, alphaProject]]);
   expect(
-    (await watch({ project: '_cwd/beta' })).lines.filter(line => line.type === 'attention')
+    (await watch({ project: betaKey })).lines.filter(line => line.type === 'attention')
   ).toMatchObject([{ project: betaProject, item: { runId: beta } }]);
   expect(runsOf((await watch({ all: true })).lines)).toEqual(
     expect.arrayContaining([
@@ -398,4 +421,164 @@ test('watch streams the queue by project, refuses list-only flags, and exits 4 o
       })
     )
   ).toEqual({ code: 4, json: { type: 'error', error: 'cursor_invalid' } });
+});
+
+async function streamedText(
+  command: () => Promise<number>,
+  stopWhen: (text: string) => boolean
+): Promise<{ code: number; text: string }> {
+  let text = '';
+  const write = spyOn(process.stdout, 'write').mockImplementation(((
+    chunk: string,
+    done?: (error?: Error | null) => void
+  ) => {
+    text += String(chunk);
+    done?.();
+    return true;
+  }) as typeof process.stdout.write);
+  try {
+    let finished = false;
+    const running = command().then(code => {
+      finished = true;
+      return code;
+    });
+    for (let waited = 0; !stopWhen(text); waited += 5) {
+      if (waited > 5000) throw new Error(`stream never satisfied: ${text}`);
+      await Bun.sleep(5);
+    }
+    expect(finished).toBe(false);
+    process.emit('SIGTERM');
+    return { code: await running, text };
+  } finally {
+    write.mockRestore();
+  }
+}
+
+test.each([true, false])(
+  'watch forwards degradation and continues until a signal (json=%s)',
+  async json => {
+    const host = createHost();
+    const lines: AttentionStreamLine[] = [
+      { type: 'ready', cursor: workflowEventCursor('fixture:0') },
+      { type: 'degraded', reason: 'run_unreadable', cursor: workflowEventCursor('fixture:0') },
+      {
+        type: 'resumed',
+        runId: 'healthy',
+        project: null,
+        status: 'running',
+        cursor: workflowEventCursor('fixture:2'),
+      },
+    ];
+    let closed = false;
+    const watch = spyOn(host.engine, 'watchAttention').mockImplementation(async listener => {
+      for (const line of lines) await listener(line);
+      return {
+        close: async () => {
+          closed = true;
+        },
+      };
+    });
+    const command = () =>
+      workflowAttentionCommand(host, process.cwd(), undefined, {
+        json,
+        all: true,
+        labels: [],
+        watch: true,
+      });
+    try {
+      if (json) {
+        const result = await streamed(command, output =>
+          output.some(line => line.type === 'resumed')
+        );
+        expect(result).toEqual({ code: 0, lines });
+      } else {
+        const result = await streamedText(command, text =>
+          text.includes('Run healthy resumed (running).')
+        );
+        expect(result.code).toBe(0);
+        expect(result.text).toContain(
+          'Attention stream coverage may be incomplete because a run could not be read. Check the operator log; reconnect after repairing the read failure.'
+        );
+        expect(result.text.indexOf('coverage may be incomplete')).toBeLessThan(
+          result.text.indexOf('Run healthy resumed')
+        );
+      }
+      expect(closed).toBe(true);
+    } finally {
+      watch.mockRestore();
+    }
+  }
+);
+
+test.each([
+  { phase: 'startup', json: true, type: 'degraded' },
+  { phase: 'tail', json: true, type: 'degraded' },
+  { phase: 'startup', json: false, type: 'degraded' },
+  { phase: 'tail', json: false, type: 'degraded' },
+  { phase: 'startup', json: false, type: 'error' },
+  { phase: 'tail', json: false, type: 'error' },
+])('watch handles output failures (%s)', async ({ phase, json, type }) => {
+  for (const code of ['ENOSPC', 'EPIPE', undefined]) {
+    const host = createHost();
+    const failure = Object.assign(new Error('write failed'), { code });
+    let rejected: unknown;
+    let closed = false;
+    let delivery = Promise.resolve();
+    const watch = spyOn(host.engine, 'watchAttention').mockImplementation(async listener => {
+      const deliver = async (): Promise<void> => {
+        try {
+          await listener(
+            type === 'error'
+              ? { type: 'error', error: 'cursor_invalid' }
+              : {
+                  type: 'degraded',
+                  reason: 'run_unreadable',
+                  cursor: workflowEventCursor('fixture:0'),
+                }
+          );
+        } catch (error) {
+          rejected = error;
+        }
+      };
+      if (phase === 'startup') await deliver();
+      else delivery = Bun.sleep(5).then(deliver);
+      return {
+        close: async () => {
+          await delivery;
+          closed = true;
+        },
+      };
+    });
+    const write = spyOn(
+      type === 'error' ? process.stderr : process.stdout,
+      'write'
+    ).mockImplementation(((chunk: string, done?: (error?: Error | null) => void) => {
+      done?.(
+        String(chunk).includes(
+          type === 'error'
+            ? 'The stream cursor'
+            : json
+              ? '"type":"degraded"'
+              : 'coverage may be incomplete'
+        )
+          ? failure
+          : undefined
+      );
+      return true;
+    }) as typeof process.stdout.write);
+    try {
+      const result = await workflowAttentionCommand(host, process.cwd(), undefined, {
+        json,
+        all: true,
+        labels: [],
+        watch: true,
+      });
+      expect(result).toBe(code === 'EPIPE' ? (type === 'error' ? 4 : 0) : 1);
+      expect(rejected).toBe(code === 'EPIPE' ? undefined : failure);
+      expect(closed).toBe(true);
+    } finally {
+      write.mockRestore();
+      watch.mockRestore();
+    }
+  }
 });

@@ -284,10 +284,10 @@ declared input from the environment as `$INPUTS_<UPPER_SNAKE>`, not as `$INPUTS.
 Inside an included block `$INPUTS.<name>` is shorthand for that variable; a directly run
 workflow leaves it literal (see
 [Passing values into an included block](/guides/authoring-workflows/#passing-values-into-an-included-block)).
-Note: `$nodeId.output` values are shell-escaped when substituted into `until_bash`. The same
-double-quoting footgun that applies to `bash:` nodes applies here — see
-[Shell Quoting in `bash:` vs `script:`](/reference/variables#shell-quoting-in-bash-vs-script)
-for the unquoted idiom to use.
+In `until_bash`, small output references are single-quoted inline; large outputs use
+an unquoted file-read substitution. Assign each reference to a variable, then quote
+that variable when using it. See the
+[assignment-then-quote examples](/reference/variables#shell-quoting-in-bash-vs-script).
 
 ### `until_field`
 
@@ -913,7 +913,9 @@ decides. `--json` records the decision without resuming; `archon serve`,
 
 A paused interactive loop resumes from the prompt template captured at the gate, so
 editing the YAML or command file does not change a run that is already paused. The first
-iteration after the resume sees an empty `$LOOP_PREV_OUTPUT`.
+iteration after the resume sees the gated iteration's output as `$LOOP_PREV_OUTPUT`, and
+`until_bash` sees it as `LOOP_PREV_OUTPUT`. A `loop:` node paused by an earlier Archon
+release did not record that output, so its first resumed iteration sees both as empty.
 
 ### `signal_completes` — autonomous completion
 

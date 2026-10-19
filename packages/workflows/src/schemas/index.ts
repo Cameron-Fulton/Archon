@@ -3,7 +3,7 @@
  *
  * All schemas are re-exported from this index.
  * Types are derived from schemas via `z.infer<typeof Schema>` (WorkflowDefinition
- * uses `Omit<z.infer<...>, 'nodes'>` because node parsing happens per-node in loader.ts).
+ * uses `Omit<z.infer<...>, 'nodes'>` because node parsing happens per-node in loader/node-parse.ts).
  *
  * Import `z` from plain `zod`; name OpenAPI components with `.meta({ id })`.
  */
@@ -39,9 +39,11 @@ export {
   resolvedRunModelOverridesSchema,
   resolvedAiProfileSchema,
   runModelBindingsMetadataSchema,
+  modelRefSchema,
 } from './model-binding';
 export type {
   TierName,
+  WorkflowModelRef,
   ModelAliasPreset,
   RawAliasEntry,
   RawAliasesConfig,
@@ -323,6 +325,14 @@ export type { WorkflowDefinition as DagWorkflow } from './workflow';
 export * from './workflow-run-listing';
 
 export { workflowRunOriginSchema } from './workflow-run';
+export {
+  PAUSE_CAUSE_METADATA_KEY,
+  pauseCauseSchema,
+  pauseCauseOfApproval,
+  pauseCauseOfWait,
+  readPauseCause,
+  type PauseCause,
+} from './pause-cause';
 export type { WorkflowRunOrigin } from './workflow-run';
 
 export * from './workflow-event';

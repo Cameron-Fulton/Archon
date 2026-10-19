@@ -5,7 +5,9 @@
  * never from the answer's text. The choice's ruling and the person's words are written
  * into the issue body as one dated "Current scope" section and read back, so the next
  * run and its review read the ruling as the contract. Then the answer is recorded on the
- * work item, which says what happens next, and the claim is released.
+ * work item, which says what happens next, and the claim is released. A `continue` then
+ * starts the item's next build-queue run at once, on the run config this run started
+ * with; if that launch fails, the item waits for the next queue run as before.
  *
  * Bound inputs: INPUTS_ITEM from facts; INPUTS_ASKED, what apply asked; INPUTS_CHOICE
  * and INPUTS_TEXT, the attention answer.
@@ -14,6 +16,7 @@
 import { type AskedBy, type BuildAttention, withBuild } from '../../.shared/build.ts';
 import { parseQualifiedPr } from '../../.shared/forge.ts';
 import { emit, nullableJson, refuse, text, trimmed } from '../../.shared/io.ts';
+import { launchNextRound } from '../../.shared/launch.ts';
 import { appendSection } from '../../.shared/issue.ts';
 import { chosen, rulingHeading } from '../../.shared/queue.ts';
 import { updateClaimed } from '../../.shared/workitem.ts';
@@ -71,7 +74,7 @@ function main(): void {
   emit({
     decision: choice.effect,
     section: heading,
-    summary: `Issue ${String(item.number)}: the maintainer chose ${choice.id}; ${choice.effect === 'continue' ? 'the next run launches from the ruling' : 'the queue stops working it until a re-triage'}.`,
+    summary: `Issue ${String(item.number)}: the maintainer chose ${choice.id}; ${choice.effect === 'continue' ? launchNextRound(item, runId) : 'the queue stops working it until a re-triage'}.`,
   });
 }
 

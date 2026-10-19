@@ -8,16 +8,21 @@
  * sweep wrote; `park` stops working it until the build queue readies it again. A
  * choice's ruling and the person's words are written into the issue body as one dated
  * "Current scope" section first, as the build queue does, so a returned round reads
- * them as the contract. On a red default branch the only answer is `hold`: the queue
+ * them as the contract; an enrolled own pull request has no issue body, so its ruling
+ * stays on its work item. On a red default branch the only answer is `hold`: the queue
  * merges nothing while the branch is red, which every sweep reads from the forge, so
- * nothing is written.
+ * nothing is written. A `merge` then starts a sweep at once and a `return` the item's
+ * next build-queue round, on the run config this run started with; if that launch fails,
+ * the next queue run picks the item up as before.
  *
  * Bound inputs: INPUTS_ASKED, what record asked; INPUTS_CHOICE and INPUTS_TEXT, the
  * attention answer.
  */
 
 import { withBuild } from '../../.shared/build.ts';
-import { emit, nullableJson, refuse, text, trimmed } from '../../.shared/io.ts';
+import type { QualifiedPr } from '../../.shared/forge.ts';
+import { emit, note, nullableJson, refuse, text, trimmed } from '../../.shared/io.ts';
+import { launchDetached } from '../../.shared/launch.ts';
 import { appendSection } from '../../.shared/issue.ts';
 import { type MergeAsked, type MergeAttention, type MergeDecisionEntry, type MergeStatus, withMerge } from '../../.shared/merge.ts';
 import { chosen, rulingHeading } from '../../.shared/queue.ts';
@@ -27,6 +32,36 @@ const STATUS = { merge: 'waiting', return: 'returned', park: 'parked' } as const
   MergeAttention['choices'][number]['effect'],
   MergeStatus
 >;
+
+/** Act on the answer now; on failure the released item waits for the next queue run. */
+function continueNow(effect: string, item: QualifiedPr, runId: string): string {
+  if (effect !== 'merge' && effect !== 'return') return '';
+  const repo = { repo_host: item.repo.host, repo_path: item.repo.path };
+  try {
+    const next =
+      effect === 'merge'
+        ? launchDetached('archon-merge-queue', repo, { configFromRun: runId })
+        : launchDetached('archon-build-queue', { ...repo, number: String(item.number) }, { configFromRun: runId });
+    return `; run ${next} acts on it now`;
+  } catch (error) {
+    note(`issue ${String(item.number)}: the follow-up run did not start, so the next queue run picks it up: ${error instanceof Error ? error.message : String(error)}`);
+    return '; the next queue run picks it up';
+  }
+}
+
+/**
+ * Write the ruling into the issue body as a dated section; returns its heading, or ''.
+ * An enrolled own pull request is its own work item and has no issue body to write, so
+ * its ruling stays on the work item's decision entry, which keeps the answer's text.
+ */
+function writeRuling(asked: Extract<MergeAsked, { by: 'pr' }>, ruling: string, at: string): string {
+  // Issues and pull requests share one numbering, so an item numbered as its pull request is that pull request.
+  const ownPr = asked.item.number === asked.pr.number && asked.item.repo.path === asked.pr.repo.path && asked.item.repo.host === asked.pr.repo.host;
+  if (ruling === '' || ownPr) return '';
+  const heading = rulingHeading(at, `the merge queue's question on PR ${String(asked.pr.number)}`);
+  appendSection(asked.item, heading, ruling);
+  return heading;
+}
 
 function main(): void {
   const asked = nullableJson(process.env.INPUTS_ASKED) as MergeAsked | null;
@@ -50,8 +85,7 @@ function main(): void {
   const ruling = [choice.ruling.trim(), words === '' ? '' : `The maintainer's words: ${words}`]
     .filter(part => part !== '')
     .join('\n\n');
-  const heading = ruling === '' ? '' : rulingHeading(at, `the merge queue's question on PR ${String(asked.pr.number)}`);
-  if (ruling !== '') appendSection(asked.item, heading, ruling);
+  const heading = writeRuling(asked, ruling, at);
 
   const entry: MergeDecisionEntry = {
     at,
@@ -80,7 +114,7 @@ function main(): void {
   emit({
     decision: choice.effect,
     section: heading,
-    summary: `PR ${String(asked.pr.number)}: the maintainer chose ${choice.id} (${choice.effect}).`,
+    summary: `PR ${String(asked.pr.number)}: the maintainer chose ${choice.id} (${choice.effect})${continueNow(choice.effect, asked.item, runId)}.`,
   });
 }
 

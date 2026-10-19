@@ -92,14 +92,17 @@ they cannot disagree about what a run needs.
   the run and resume or abandon it.
 - **`occurrence`** identifies an answerable pause (`attention` or `awaiting_response`).
   Pass it back with `--occurrence`; an answer or
-  label write for a pause the run has left is refused, naming the current occurrence.
+  label write for a pause the run has left is refused. If the diagnostic read succeeds
+  and the run is awaiting another answer, the refusal names the current occurrence.
+  Otherwise, fetch the current item again before retrying.
 - **`revision`** starts at 1 and grows by one with every label write on an attention
   wait. It stays 1 for other kinds, so it does not identify every item change.
 - **`project`** is the project the run belongs to, never a label. `key` is the project
   storage key that [state documents](/reference/cli/#state) scope by, so
   `archon state --project <item.project.key>` reaches the same project. `codebaseId` is
   null for a project with no codebase row, such as a run in an unregistered directory
-  (`_cwd/<name>`). `name` is the codebase's name, or otherwise the key's last segment. A
+  (`@cwd/<basename>-<digest>`). Copy the exact key from `items[].project.key`
+  in `archon workflow attention --all --json` when using `--project`. `name` is the codebase's name, or otherwise the key's last segment. A
   run started before its codebase was renamed keeps the key it started with; that is the
   key its state lives under. `project` is null only for a run with no trusted storage
   root.
@@ -153,7 +156,7 @@ archon workflow attention --watch --json --all
 
 A stream starts with one `attention` line per open item, with `snapshot: true`, then a
 `ready` line. The lines before `ready` are the complete open set: on every connect, an item
-you held that is not among them is gone. After `ready`, a line arrives for every change the
+you held that is not among them is gone. After `ready`, the stream follows changes the
 store commits, whichever process made it: a detached run, a trigger, the server, another
 host on the same database.
 
@@ -167,6 +170,7 @@ host on the same database.
 | `owner_lost` | A running run's owner process is gone | `cursor`, `project`, `runId`, `observedStatus` |
 | `ready` | The snapshot is complete | `cursor` |
 | `bookmark` | 30 seconds passed with no other line, and the stream read the store up to `cursor` | `cursor` |
+| `degraded` | Repeated failure to project a run; coverage may be incomplete. The stream keeps running | `cursor`, `reason: "run_unreadable"` |
 | `error` | The store cannot read the stream's cursor: `--after` named one this install did not issue, or the store no longer reads the stream's own position. The last line; the command exits 4 | `error: "cursor_invalid"` |
 
 - **Keep an open set keyed by `runId`.** Each `attention` line replaces that run's
@@ -176,18 +180,38 @@ host on the same database.
   when the run resumed, ended, was deleted, or moved to a different pause. A usage-limit
   wait that resumes is withdrawn, with null occurrence. `answeredAt` is null when the
   row had moved past the answer before the stream read it.
-- **Delivery is at least once.** Replacing the open item by run ID is idempotent; do not
-  dedupe all kinds by occurrence or revision, since usage-limit waits have no occurrence
+- **Readable deliveries are at least once.** Unreadable deliveries may be omitted after
+  a `degraded` warning; follow the repair instructions below. Replacing the open item by
+  run ID is idempotent; do not dedupe all kinds by occurrence or revision, since usage-limit waits have no occurrence
   and their reset time can change at revision 1. Use `(runId, occurrence, revision)` only
   for answerable pauses. Dedupe `terminal` and `resumed` on `(runId, cursor)`. `owner_lost` is a live
   observation: it is not replayed, and the next connection reports it again if the owner
   is still gone.
-- **Resume where you stopped.** Persist the `cursor` of the last line you handled and
-  restart with `--after <cursor>`. The new stream sends the snapshot and `ready`, then
-  replays every change after that cursor. `bookmark` lines keep the cursor moving while
+- **Replay from before an incomplete event.** Cursors identify feed events, not individual
+  lines. Replacing an open item can emit `resolved` and `attention` with the same cursor;
+  cancelling a paused run can emit `resolved` and `terminal` with the same cursor.
+  `--after <cursor>` excludes that entire event. Saving the cursor after only its first
+  line can therefore skip its remaining line on reconnect. Keep a checkpoint from before
+  the possibly partially handled event and replay from that earlier cursor, accepting
+  duplicate deliveries. A handled `bookmark` can checkpoint all preceding handled lines,
+  but other lines do not mark the end of an event. The new stream sends the current
+  snapshot and `ready`, then replays readable changes after the supplied cursor; the
+  snapshot restores the open set, not missed historical transitions. A `degraded` warning
+  means replay may have gaps; follow the repair instructions below.
+  `bookmark` lines keep the cursor moving while
   the queue is quiet. A stream that cannot read the store sends no `bookmark` until a read
   succeeds, so no line for well over 30 seconds means the stream is not reading. If the
   cursor is rejected, rerun without `--after`.
+- **Degraded coverage needs repair.** A failed run projection retries on the next poll.
+  If it fails again, `degraded` warns without exposing the run's identity or project;
+  the operator log names the run. Once a fresh projection of an independent run succeeds,
+  the stream retries the failed run once more and may omit its deliveries to let other
+  runs continue. If every projection fails, the stream retains its cursor and retries.
+  The warning's cursor is the last handled position, safe to retry from. Later lifecycle
+  or bookmark cursors can pass omitted deliveries; a bookmark means the feed head was
+  reached, not that coverage was repaired. After repairing the read failure, reconnect
+  to refresh the open set. Replay from a cursor before the gap to recover historical
+  transitions. The stream sends no recovered or complete signal.
 - **`--label` filters `attention` and `resolved`.** `terminal`, `resumed`, and `owner_lost` arrive for
   every run in scope. A label write that leaves an open item outside the filter sends
   `unmatched`, even for an item the stream never sent.
@@ -207,7 +231,7 @@ host on the same database.
   reported lost. Nothing here changes the run: abandon it with `workflow abandon`.
 
 The stream only reads. Stopping it, with a signal or by closing its stdout, affects no run
-and exits 0. A closed stdout is noticed when the stream next writes a line. An answered run continues where a continuation host runs: `archon serve`,
+and exits 0. A closed stdout is noticed when the stream next writes a line. Other output write failures exit 1. An answered run continues where a continuation host runs: `archon serve`,
 `archon workflow wake --watch`, or a CLI answer without `--json`, which continues the run in
 place.
 

@@ -1,4 +1,5 @@
 import {
+  CANCELLATION_NOOP_WORKFLOW_STATUSES,
   CAPACITY_WAIT_METADATA_KEY,
   SOURCE_RELEASE_METADATA_KEY,
   TOOL_CALL_ATTENTION_METADATA_KEY,
@@ -43,6 +44,11 @@ import {
   type WorkflowRun,
 } from '../schemas/workflow-run';
 import type { WorkflowEventRow } from '../schemas/workflow-event';
+import {
+  PAUSE_CAUSE_METADATA_KEY,
+  pauseCauseOfApproval,
+  pauseCauseOfWait,
+} from '../schemas/pause-cause';
 import { foldDagResumeSnapshot } from '../dag-resume-snapshot';
 import { buildTerminalRecord } from '../terminal-record';
 import { isDeepStrictEqual } from 'node:util';
@@ -358,6 +364,7 @@ export function createTransactionView(
       run.status = 'failed';
       delete run.metadata.scheduled_resume;
       delete run.metadata.stop_reason;
+      delete run.metadata[PAUSE_CAUSE_METADATA_KEY];
       run.metadata.error = error;
       if (options?.exitReason)
         run.metadata.stop_reason = {
@@ -381,6 +388,7 @@ export function createTransactionView(
       if (run.status !== 'running') throw new WorkflowRunPauseConflictError(id);
       run.status = 'paused';
       run.metadata = { ...run.metadata, ...metadata, approval: structuredClone(approval) };
+      run.metadata[PAUSE_CAUSE_METADATA_KEY] = pauseCauseOfApproval(approval);
       // A gate replaces a finished wait's context, exactly as the SQL store does.
       delete run.metadata.wait;
       if (event) record(event);
@@ -572,9 +580,18 @@ export function createTransactionView(
         ).slice(0, options?.limit ?? 50)
       ),
     listWorkflowRuns: async (options): ReturnType<IWorkflowStore['listWorkflowRuns']> => {
+      const parents =
+        options?.parentRunIds === undefined ? undefined : new Set(options.parentRunIds);
+      const excludedLeafStatuses = new Set(options?.excludeLeafStatuses);
+      const nonLeaves = new Set(
+        excludedLeafStatuses.size > 0 ? [...runs.values()].map(run => run.parent_run_id) : []
+      );
       const scoped = [...runs.values()].filter(
         run =>
           (!options?.codebaseId || run.codebase_id === options.codebaseId) &&
+          (parents === undefined ||
+            (run.parent_run_id !== null && parents.has(run.parent_run_id))) &&
+          (!excludedLeafStatuses.has(run.status) || nonLeaves.has(run.id)) &&
           (!options?.search ||
             run.workflow_name.includes(options.search) ||
             run.user_message.includes(options.search)) &&
@@ -693,7 +710,7 @@ export function createTransactionView(
     },
     cancelWorkflowRun: async (id, details) => {
       const run = structuredClone(runs.get(id));
-      if (!run || run.status === 'completed' || run.status === 'cancelled')
+      if (!run || CANCELLATION_NOOP_WORKFLOW_STATUSES.includes(run.status))
         return { cancelled: false };
       run.status = 'cancelled';
       await terminal(run, {
@@ -709,7 +726,7 @@ export function createTransactionView(
     },
     cancelFanOutRun: async (id, reason) => {
       const run = structuredClone(runs.get(id));
-      if (!run || run.status === 'completed' || run.status === 'cancelled')
+      if (!run || CANCELLATION_NOOP_WORKFLOW_STATUSES.includes(run.status))
         return { cancelled: false };
       run.status = 'cancelled';
       run.metadata.cancelled_reason = reason;
@@ -764,6 +781,7 @@ export function createTransactionView(
       // stale answered gate left beside the wait would read as a gate awaiting continuation.
       delete run.metadata.approval;
       run.metadata.wait = workflowWaitContextSchema.parse(wait);
+      run.metadata[PAUSE_CAUSE_METADATA_KEY] = pauseCauseOfWait(wait);
       if (pause.kind === 'started')
         record({
           workflow_run_id: id,

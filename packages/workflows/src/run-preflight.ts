@@ -1,7 +1,8 @@
-import { FileStoreUnsupportedError } from './file-store/errors';
-import { gateReworkNode } from './gate-rework';
+import { providerInvocation } from './dag/capability-preflight';
 import {
+  type ExecutionContext,
   type ProviderRegistry,
+  type NodeConfig,
   type StoredCredentialKind,
   consumesStoredCredential,
   requireProvider,
@@ -17,7 +18,6 @@ import type { RunAiConfigurationSnapshot } from './schemas/run-ai-configuration'
 import type { CredentialStatus } from '@archon/provider-contract';
 import type { StoredProviderCredential, WorkflowConfig, WorkflowDeps } from './deps';
 import type { ResolvedWorkflow, WorkflowRun, DagNode } from './schemas';
-import { isAgentNode, isLoopNode, isLoopGroupNode, isGateNode } from './schemas';
 import { resolvedBodyNodes } from './graph-plan';
 import {
   assistantModelDefaults,
@@ -289,6 +289,7 @@ export interface PreparedRunAiConfiguration {
   executionUserId?: string;
 }
 export interface RunCredentialRequirement {
+  settingSources?: NodeConfig['settingSources'];
   provider: string;
   model?: string;
   vendor?: string;
@@ -303,15 +304,12 @@ export function collectRunCredentialRequirements(
   const models = assistantModelDefaults(prepared.config);
   const visit = (nodes: readonly DagNode[], scope: WorkflowModelScope): void => {
     for (const node of nodes) {
-      if (isGateNode(node)) {
-        const rework = node.decisions.find(decision => decision.rework !== undefined)?.rework;
-        if (rework) visit([gateReworkNode(node, rework.prompt)], scope);
-        continue;
-      }
-      if (!isAgentNode(node) && !isLoopNode(node) && !isLoopGroupNode(node)) continue;
-      if (isLoopGroupNode(node)) {
-        const resolved = resolveNodeModelScope(node, scope, models, prepared.aiProfile);
-        visit(resolvedBodyNodes(node.loop_group), {
+      const invocation = providerInvocation(node);
+      if (invocation.kind === 'none') continue;
+      if (invocation.kind === 'group') {
+        const group = invocation.node;
+        const resolved = resolveNodeModelScope(group, scope, models, prepared.aiProfile);
+        visit(resolvedBodyNodes(group.loop_group), {
           ...scope,
           provider: resolved.provider,
           model: resolved.model,
@@ -319,15 +317,16 @@ export function collectRunCredentialRequirements(
           tier: resolved.tier,
           providerOrigin: resolved.providerOrigin,
         });
-      } else {
-        const resolved = resolveNodeModel(node, scope, models, prepared.aiProfile);
-        const { provider, model } = resolved;
-        requirements.set(JSON.stringify([provider, model]), {
-          provider,
-          model,
-          vendor: requireProvider(providers, provider).credentials.vendorFor(model),
-        });
+        continue;
       }
+      const invoked = invocation.kind === 'gate_rework' ? invocation.rework : invocation.node;
+      const { provider, model } = resolveNodeModel(invoked, scope, models, prepared.aiProfile);
+      requirements.set(JSON.stringify([provider, model, invoked.settingSources]), {
+        provider,
+        model,
+        ...(invoked.settingSources !== undefined ? { settingSources: invoked.settingSources } : {}),
+        vendor: requireProvider(providers, provider).credentials.vendorFor(model),
+      });
     }
   };
   visit(workflow.nodes, prepared.scope);
@@ -374,6 +373,42 @@ export function assertCredentialStatus(
   }
 }
 
+async function checkNativeCredential(
+  deps: Pick<WorkflowDeps, 'getAgentProvider'>,
+  prepared: PreparedRunAiConfiguration,
+  requirement: RunCredentialRequirement,
+  context: { cwd: string; execContext?: ExecutionContext }
+): Promise<CredentialStatus> {
+  // A container runs with only the environment Archon forwards, never the host's.
+  const baseEnv = context.execContext?.kind === 'container' ? {} : process.env;
+  try {
+    return await deps.getAgentProvider(requirement.provider).checkCredential({
+      ...context,
+      settingSources: requirement.settingSources,
+      model: requirement.model,
+      assistantConfig: prepared.config.assistants[requirement.provider],
+      env: {
+        ...Object.fromEntries(
+          Object.entries(baseEnv).flatMap(([key, value]) =>
+            value === undefined ? [] : [[key, value]]
+          )
+        ),
+        ...prepared.config.envVars,
+      },
+      signal: AbortSignal.timeout(20_000),
+    });
+  } catch (error) {
+    log.warn(
+      { err: error as Error, provider: requirement.provider },
+      'workflow.native_credential_check_failed'
+    );
+    throw new WorkflowCredentialPreflightError(
+      requirement,
+      'could not verify native authentication'
+    );
+  }
+}
+
 export async function assertRunCredentials(
   deps: Pick<
     WorkflowDeps,
@@ -383,18 +418,26 @@ export async function assertRunCredentials(
     | 'getUserProviderCredential'
     | 'credentialStore'
   >,
-  prepared: PreparedRunAiConfiguration
+  prepared: PreparedRunAiConfiguration,
+  // Where the provider runs, which decides the native login it sees. A host checkout and
+  // the worktree cut from it share the host login, so a host run is checked before
+  // isolation. A container sees only what Archon forwards, so before the container exists
+  // check stored credentials only; executeWorkflow checks it in the container context.
+  context: { cwd: string; execContext?: ExecutionContext } | 'pending-container'
 ): Promise<void> {
   const storedCredentials = new Map<string, StoredProviderCredential | undefined>();
   const storedStatuses = new Map<string, CredentialStatus>();
   for (const requirement of prepared.requirements) {
-    const { provider, model, vendor } = requirement;
+    const { provider, vendor } = requirement;
     // A stored credential this provider cannot consume is never delivered to it, so the
     // provider must authenticate natively; the stored kind only explains a missing login.
     let unconsumedKind: StoredCredentialKind | undefined;
-    if (prepared.executionUserId && deps.isPerUserProviderKeysEnabled?.() && vendor) {
-      if (deps.credentialStore === 'files')
-        throw new FileStoreUnsupportedError('stored per-user provider credentials');
+    if (
+      deps.credentialStore !== 'files' &&
+      prepared.executionUserId &&
+      deps.isPerUserProviderKeysEnabled?.() &&
+      vendor
+    ) {
       if (!deps.getUserProviderCredential)
         throw new WorkflowCredentialPreflightError(
           requirement,
@@ -446,27 +489,8 @@ export async function assertRunCredentials(
         }
       }
     }
-    let status: CredentialStatus;
-    try {
-      status = await deps.getAgentProvider(provider).checkCredential({
-        model,
-        assistantConfig: prepared.config.assistants[provider],
-        env: {
-          ...Object.fromEntries(
-            Object.entries(process.env).flatMap(([key, value]) =>
-              value === undefined ? [] : [[key, value]]
-            )
-          ),
-          ...prepared.config.envVars,
-        },
-        signal: AbortSignal.timeout(20_000),
-      });
-    } catch {
-      throw new WorkflowCredentialPreflightError(
-        requirement,
-        'could not verify native authentication'
-      );
-    }
+    if (context === 'pending-container') continue;
+    const status = await checkNativeCredential(deps, prepared, requirement, context);
     if (unconsumedKind && vendor && status.state === 'not_connected') {
       throw new WorkflowCredentialPreflightError(
         requirement,
