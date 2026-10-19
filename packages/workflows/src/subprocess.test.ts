@@ -1,9 +1,14 @@
-import { expect, spyOn, test } from 'bun:test';
+// @archon-test-isolated
+import { describe, expect, it, spyOn, test } from 'bun:test';
 import { existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import * as git from '@archon/git';
+import { bashInvocation } from './bash-invocation';
 import { trackTempRoots } from '@archon/paths/test-utils';
 import {
+  buildSubprocessDockerArgs,
+  containerCommandName,
   isSubprocessTimeout,
   recordNodeProcessTrees,
   runSubprocess,
@@ -14,7 +19,9 @@ const trackTempRoot = trackTempRoots();
 const posixOnly = process.platform === 'win32' ? test.skip : test;
 
 function runHostBash(script: string, timeout?: number): ReturnType<typeof runSubprocess> {
-  return runSubprocess({ kind: 'host' }, '/bin/bash', ['-c', script], {
+  const invocation = bashInvocation(script);
+  return runSubprocess({ kind: 'host' }, git.resolveBashPath(), invocation.args, {
+    input: invocation.input,
     cwd: import.meta.dir,
     timeout,
     env: {},
@@ -220,6 +227,7 @@ async function expectTimeoutEndsGrandchild(): Promise<void> {
     "setTimeout(() => require('fs').writeFileSync(process.env.MARKER, 'leaked'), 2500);";
   const wrapper = `await Bun.spawn([process.execPath, '-e', ${JSON.stringify(grandchild)}]).exited;`;
   const error = await runSubprocess({ kind: 'host' }, process.execPath, ['-e', wrapper], {
+    input: '',
     cwd: dir,
     timeout: 1500,
     env: { STARTED: started, MARKER: marker },
@@ -266,6 +274,7 @@ async function runAbortedWrapper(): Promise<{
   const wrapper = `await Bun.spawn([process.execPath, '-e', ${JSON.stringify(grandchild)}]).exited;`;
   const controller = new AbortController();
   const node = runSubprocess({ kind: 'host' }, process.execPath, ['-e', wrapper], {
+    input: '',
     cwd: dir,
     env: { STARTED: started, MARKER: marker },
     endTreeOnTimeout: true,
@@ -386,4 +395,169 @@ posixOnly('evidence keeps no GitHub App token a command obtained after it starte
   expect(retained).toContain('token=[REDACTED]');
   expect(retained).toContain('auth failed with [REDACTED]');
   expect(retained).not.toContain('ghs_');
+});
+
+describe('containerCommandName', () => {
+  it('returns a bare command unchanged', () => {
+    expect(containerCommandName('bash')).toBe('bash');
+    expect(containerCommandName('bun')).toBe('bun');
+  });
+
+  it('strips a unix directory to the basename', () => {
+    expect(containerCommandName('/usr/local/bin/bash')).toBe('bash');
+  });
+
+  it('strips a Windows path + .exe (container is always Linux)', () => {
+    expect(containerCommandName('C:\\Program Files\\Git\\bin\\bash.exe')).toBe('bash');
+  });
+});
+
+describe('subprocess input delivery', () => {
+  it.each([false, true])('delivers Unicode and EOF with recording=%s', async recorded => {
+    const trees = recorded ? recordNodeProcessTrees() : undefined;
+    try {
+      for (const input of ["€\nquote' \\ $()`\n\n", '']) {
+        expect(
+          await runSubprocess(
+            { kind: 'host' },
+            process.execPath,
+            ['-e', 'process.stdout.write(require("node:fs").readFileSync(0))'],
+            {
+              cwd: import.meta.dir,
+              env: {},
+              retention: { standalone: true },
+              input,
+            }
+          )
+        ).toMatchObject({ stdout: input, stderr: '' });
+      }
+    } finally {
+      trees?.release();
+    }
+  });
+
+  it('keeps command failure primary and rejects unsuccessful delivery in recorded nodes', async () => {
+    const trees = recordNodeProcessTrees();
+    const run = (code: number) =>
+      runSubprocess(
+        { kind: 'host' },
+        process.execPath,
+        [
+          '-e',
+          `require('node:fs').closeSync(0); process.stderr.write('evidence'); setTimeout(() => process.exit(${code}), 100)`,
+        ],
+        {
+          cwd: import.meta.dir,
+          env: {},
+          retention: { standalone: true },
+          input: 'x'.repeat(8_000_000),
+        }
+      );
+    try {
+      await expect(run(7)).rejects.toMatchObject({ code: 7, stderr: 'evidence' });
+      await expect(run(0)).rejects.toMatchObject({ code: expect.any(String), stderr: 'evidence' });
+    } finally {
+      trees.release();
+    }
+  });
+
+  it.each([undefined, '', '€\nexact\n'])(
+    'forwards input %j through Docker without putting it in argv',
+    async input => {
+      const execSpy = spyOn(git, 'execFileAsync').mockResolvedValue({ stdout: 'ok', stderr: '' });
+      try {
+        const invocation = bashInvocation(input ?? '');
+        await runSubprocess(
+          { kind: 'container', containerId: 'payload-container', execUser: '1000' },
+          git.resolveBashPath(),
+          invocation.args,
+          {
+            cwd: '/workspace',
+            env: { KEEP: 'yes', HOME: '/denied' },
+            retention: { standalone: true },
+            input,
+          }
+        );
+        expect(execSpy).toHaveBeenCalledWith(
+          'docker',
+          [
+            'exec',
+            '-w',
+            '/workspace',
+            ...(input !== undefined ? ['-i'] : []),
+            '-u',
+            '1000',
+            '-e',
+            'KEEP=yes',
+            'payload-container',
+            'bash',
+            ...invocation.args,
+          ],
+          { input, timeout: undefined }
+        );
+      } finally {
+        execSpy.mockRestore();
+      }
+    }
+  );
+});
+
+describe('buildSubprocessDockerArgs — bash/script env isolation', () => {
+  const CTX = { kind: 'container' as const, containerId: 'cid-9' };
+
+  it('delivers the Archon-managed env via -e flags only and runs at the same cwd', () => {
+    const args = buildSubprocessDockerArgs(CTX, 'bash', ['-c', 'echo hi'], {
+      cwd: '/tmp/ops-client',
+      env: { ARTIFACTS_DIR: '/a', ANTHROPIC_API_KEY: 'sk', BASE_BRANCH: 'main' },
+    });
+    expect(args.slice(0, 2)).toEqual(['exec', '-w']);
+    expect(args[2]).toBe('/tmp/ops-client');
+    // Every managed var is delivered as an explicit -e flag.
+    expect(args).toContain('-e');
+    expect(args).toContain('ARTIFACTS_DIR=/a');
+    expect(args).toContain('ANTHROPIC_API_KEY=sk');
+    expect(args).toContain('BASE_BRANCH=main');
+    // Container id, then the normalized command, then the node args.
+    const cidIdx = args.indexOf('cid-9');
+    expect(cidIdx).toBeGreaterThan(-1);
+    expect(args[cidIdx + 1]).toBe('bash');
+    expect(args.slice(cidIdx + 2)).toEqual(['-c', 'echo hi']);
+  });
+
+  it('does NOT leak host process.env (only the passed env bag is forwarded)', () => {
+    const canary = 'ARCHON_DAGEXEC_CANARY';
+    process.env[canary] = 'leaked';
+    try {
+      const args = buildSubprocessDockerArgs(CTX, 'bash', ['-c', 'true'], {
+        cwd: '/w',
+        env: { ONLY_THIS: '1' },
+      });
+      const joined = args.join(' ');
+      expect(joined).toContain('ONLY_THIS=1');
+      expect(joined).not.toContain(canary);
+    } finally {
+      delete process.env[canary];
+    }
+  });
+
+  it('normalizes a host bash path to the in-container binary name', () => {
+    const args = buildSubprocessDockerArgs(CTX, '/usr/local/bin/bash', ['-c', 'x'], {
+      cwd: '/w',
+      env: {},
+    });
+    const cidIdx = args.indexOf('cid-9');
+    expect(args[cidIdx + 1]).toBe('bash');
+  });
+
+  it('never forwards denylisted keys (PATH/HOME) — a project env var must not clobber resolution', () => {
+    const args = buildSubprocessDockerArgs(CTX, 'bash', ['-c', 'true'], {
+      cwd: '/w',
+      env: { PATH: '/evil/bin', HOME: '/evil', PWD: '/x', KEEP: '1' },
+    });
+    const joined = args.join(' ');
+    expect(joined).not.toContain('PATH=/evil/bin');
+    expect(joined).not.toContain('HOME=/evil');
+    expect(joined).not.toContain('PWD=/x');
+    expect(joined).toContain('KEEP=1'); // non-denylisted keys still forwarded
+  });
 });

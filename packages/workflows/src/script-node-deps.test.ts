@@ -1,3 +1,4 @@
+// @archon-test-isolated
 /**
  * Tests for US-005: dependency installation (deps field) in script nodes.
  *
@@ -277,6 +278,7 @@ function createMockStore(): IWorkflowStore {
       Promise.resolve({
         completedNodeOutputs: new Map<string, { output: string }>(),
         fanOutSnapshots: new Map(),
+        failedNodes: new Map(),
         unresolvedNodeStarts: new Set<string>(),
         budget: { workUnits: 0, spendUsd: 0 },
         tokens: { input: 0, output: 0 },

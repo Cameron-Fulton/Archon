@@ -1,3 +1,4 @@
+// @archon-test-isolated
 /**
  * Wires the shared `IWorkflowEngine` contract-test suite
  * (`engine-contract-tests.ts`) against `InProcessWorkflowEngine`
@@ -73,7 +74,7 @@ mock.module('@archon/git', () => ({
 }));
 
 // --- Mock dag-executor: the DAG loop itself is out of scope for this suite
-// (dag-executor.test.ts / subrun.test.ts own that); this suite only proves
+// (dag-executor.test.ts / child-runs.*.test.ts own that); this suite only proves
 // the InProcessWorkflowEngine -> executeWorkflow/hydrateResumableRun wiring. ---
 type ExecuteDagWorkflow = typeof import('./dag-executor').executeDagWorkflow;
 let executedWorkflow: Parameters<ExecuteDagWorkflow>[0]['workflow'] | undefined;
@@ -85,10 +86,6 @@ const mockExecuteDagWorkflow = mock<ExecuteDagWorkflow>(async input => {
 });
 mock.module('./dag-executor', () => ({
   executeDagWorkflow: mockExecuteDagWorkflow,
-  childOutcomeFromRun: mock((run: { id: string; status: string }) => ({
-    childRunId: run.id,
-    status: run.status,
-  })),
 }));
 
 mock.module('./logger', () => ({

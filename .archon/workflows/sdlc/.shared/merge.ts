@@ -6,14 +6,13 @@
  * `facts.build` is `ready` names its pull request in its last round. The queue claims
  * them with intake's claim, so an item has one owner at a time across the three queues.
  *
- * Every forge read here goes through the GitHub CLI. The forge contract has no read of
- * a pull request's review threads, and the gate cannot be answered without one, so the
- * merge queue refuses the forge source instead of gating on less.
+ * Every forge read here goes through the GitHub CLI. The forge contract has no read yet
+ * for the trusted review comment, the default branch's head and CI, or how far a head
+ * is behind it, and the gate cannot be answered without them, so the merge queue
+ * refuses the forge source instead of gating on less.
  */
 
-import { join } from 'node:path';
 import { forgeSource, record, type QualifiedPr } from './forge.ts';
-import { artifactsDir } from './io.ts';
 import { ghGraphql, ghIssueComments } from './pr.ts';
 import type { Attention, DecisionEntry } from './queue.ts';
 import { readReviewStamp } from './review-comment.ts';
@@ -93,10 +92,12 @@ const KEPT_TEXT = 1500;
  */
 export function mergeWaits(doc: WorkItem): boolean {
   const build = doc.facts.build;
-  if (build?.status !== 'ready') return false;
+  // A maintainer's own pull request is ready for the queue from its enrollment on.
+  const readyAt = build?.status === 'ready' ? build.at : doc.facts.own_pr?.at;
+  if (readyAt === undefined) return false;
   const merge = doc.facts.merge;
   if (merge === undefined || merge.status === 'waiting' || merge.status === 'asking') return true;
-  return build.at > merge.at;
+  return readyAt > merge.at;
 }
 
 /**
@@ -118,9 +119,10 @@ export interface MergeSettled {
 
 export const MERGE_PICKUP: Pickup = { stage: 'merge', waits: mergeWaits, takesRequests: false };
 
-/** The pull request the build queue's last round delivered on the item, or null. */
+/** The pull request the build queue's last round delivered on the item, or the enrolled own pull request, or null. */
 export function itemPr(doc: WorkItem): QualifiedPr | null {
-  const url = [...(doc.facts.build?.rounds ?? [])].reverse().find(round => round.pr_url !== '')?.pr_url;
+  const url =
+    [...(doc.facts.build?.rounds ?? [])].reverse().find(round => round.pr_url !== '')?.pr_url ?? doc.facts.own_pr?.url;
   return url === undefined ? null : prFromUrl(url);
 }
 
@@ -212,7 +214,6 @@ export interface PrFacts {
   readonly head_revision: string;
   readonly merge_commit: string | null;
   readonly mergeable: 'clean' | 'conflict' | 'unknown';
-  readonly size: { readonly additions: number; readonly deletions: number; readonly files: number };
   readonly checks: Checks;
   readonly threads: { readonly unresolved: number; readonly urls: readonly string[] };
   readonly verdict: Verdict;
@@ -238,11 +239,15 @@ function graphql(host: string, query: string, fields: Record<string, string | nu
   return repository;
 }
 
-/** The merge queue reads the forge through gh; the forge source cannot answer the gate. */
+/**
+ * The merge queue reads the forge through gh. The forge contract has no read yet for
+ * the trusted review comment, the default branch's head and CI, or how far a head is
+ * behind it, so the forge source cannot answer the gate.
+ */
 export function requireGh(): void {
   if (forgeSource() !== 'gh') {
     throw new Error(
-      'the merge queue gates every merge on unresolved review threads, which the forge contract does not report; run it with ARCHON_SDLC_FORGE=gh'
+      "the merge queue reads pull-request comments, the default branch's CI and how far a head is behind it, which the forge contract does not offer yet; run it with ARCHON_SDLC_FORGE=gh"
     );
   }
 }
@@ -320,7 +325,6 @@ const PR_QUERY = `query($owner: String!, $name: String!, $number: Int!) { reposi
   defaultBranchRef { name }
   pullRequest(number: $number) {
     url title state isDraft baseRefName headRefName headRefOid mergeable
-    additions deletions changedFiles
     mergeCommit { oid }
     commits(last: 1) { nodes { commit { oid ${ROLLUP} } } }
     reviewThreads(first: 100) { totalCount nodes { isResolved comments(first: 1) { nodes { url } } } }
@@ -332,9 +336,9 @@ const BEHIND_QUERY = `query($owner: String!, $name: String!, $head: String!) { r
 } }`;
 
 /**
- * The default branch's head and how many of its commits `head` lacks. The gate merges
- * only a head that contains the default branch, so the CI and review at that head
- * judged the composed result, not the change alone.
+ * The default branch's head and how many of its commits `head` lacks. A head that
+ * lacks some still merges when the forge reports it merges cleanly; one that conflicts,
+ * or whose mergeability the forge has not computed, is synced first.
  */
 function readBehind(repo: QualifiedPr['repo'], head: string): { default_head: string; behind: number } {
   const [owner, name] = repo.path.split('/');
@@ -382,7 +386,6 @@ export function readPr(pr: QualifiedPr, maintainers: ReadonlySet<string>): PrRea
       head_revision: row.headRefOid,
       merge_commit: typeof record(row.mergeCommit)?.oid === 'string' ? String(record(row.mergeCommit)?.oid) : null,
       mergeable: row.mergeable === 'MERGEABLE' ? 'clean' : row.mergeable === 'CONFLICTING' ? 'conflict' : 'unknown',
-      size: { additions: Number(row.additions), deletions: Number(row.deletions), files: Number(row.changedFiles) },
       checks: checksOf(commit.statusCheckRollup),
       threads: {
         unresolved: unresolved.length,
@@ -395,11 +398,14 @@ export function readPr(pr: QualifiedPr, maintainers: ReadonlySet<string>): PrRea
 }
 
 /**
- * Why the pull request may not merge at `head`; empty when it may. The three facts the
- * queue's contract names are the verdict, CI and the threads, each at the head; the
+ * Why the pull request may not merge at `head`; empty when it may. The facts the
+ * queue's contract names are the verdict and CI, each at the head. Whether an open review
+ * thread holds the merge is the sweep's judgment, from the thread facts it reads. The
  * rest keep the merge on an open, non-draft pull request into the default branch at
- * exactly the commit that was judged, and that commit containing the default branch's
- * head, so what was judged is what the merge produces.
+ * exactly the commit that was judged, and that commit either containing the default
+ * branch's head or merging into it with no conflict. A clean merge of a head that is
+ * behind is checked by the default branch's CI after the batch; whether a pull request
+ * should be synced first anyway is the sweep's judgment.
  */
 export function gateRefusals(facts: PrFacts, head: string): string[] {
   const refusals: string[] = [];
@@ -409,37 +415,20 @@ export function gateRefusals(facts: PrFacts, head: string): string[] {
     refusals.push(`it targets ${facts.base}, not the default branch ${facts.default_branch}`);
   }
   if (facts.head_revision !== head) refusals.push(`its head is ${facts.head_revision}, not ${head}`);
-  if (facts.behind > 0) {
-    refusals.push(`it lacks ${String(facts.behind)} commits of ${facts.default_branch} at ${facts.default_head}`);
+  if (facts.behind > 0 && facts.mergeable !== 'clean') {
+    refusals.push(
+      `it lacks ${String(facts.behind)} commits of ${facts.default_branch} at ${facts.default_head} and its merge is ${facts.mergeable}`
+    );
   }
   const { verdict } = facts;
+  // Which commit the verdict is for is the sweep's call: it sends a moved head to delta
+  // review unless only a clean sync moved it. The gate holds the merge to a trusted verdict.
   if (verdict.state !== 'ready') refusals.push(`its review verdict is ${verdict.state}`);
-  else if (verdict.reviewed !== facts.head_revision) {
-    refusals.push(`its Ready verdict is for ${verdict.reviewed ?? 'no commit'}, not its head`);
-  }
   if (facts.checks.state !== 'green') {
     const named = [...facts.checks.failing, ...facts.checks.pending];
     refusals.push(`CI at its head is ${facts.checks.state}${named.length === 0 ? '' : ` (${named.join(', ')})`}`);
   }
-  if (facts.threads.unresolved > 0) refusals.push(`${String(facts.threads.unresolved)} review threads are unresolved`);
   return refusals;
-}
-
-/**
- * What the gate writes for a merge the forge accepted, before it reads the merge back.
- * It stays when the merge reads back merged at its head or the read fails, and is
- * removed when the read shows the pull request unmerged, so a receipt is the record
- * node's evidence that this run merged.
- */
-export interface Receipt {
-  readonly pr: string;
-  readonly head: string;
-  readonly at: string;
-}
-
-/** Where the gate writes this run's receipts and the record node reads them. */
-export function receiptsDir(): string {
-  return join(artifactsDir(), 'merge', 'receipts');
 }
 
 /** Merge at exactly `head`; the forge refuses when the head has moved since it was read. */

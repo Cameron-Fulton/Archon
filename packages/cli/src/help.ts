@@ -77,6 +77,7 @@ const forgeOperationDescriptions = {
   'workitem.list': 'List open issues and pull requests that carry one label',
   'workitem.comment.upsert': 'Write the one marked comment on an issue or pull request',
   'workitem.close': 'Close an issue with a reason and verify the result',
+  'workitem.edit-body': 'Replace an issue body and verify the result',
   'repo.labels.list': 'List repository label names',
   'repo.label.ensure': 'Explicitly ensure one repository label exists',
   'pr.view': 'Read a pull request by number or by qualified head',
@@ -87,6 +88,9 @@ const forgeOperationDescriptions = {
   'pr.merge': 'Merge a pull request pinned to its approved head',
   'checks.rerun': 'Rerun selected failed checks at a revision',
   'pr.reviews': 'Read submitted reviews and root review comments',
+  'pr.threads': 'Read every review thread with its comments and resolution',
+  'pr.thread.reply': 'Reply on one review thread and verify the reply',
+  'pr.thread.resolve': 'Resolve one review thread and verify the result',
   'comment.upsert': 'Write the one marked comment on a pull request',
 } satisfies Record<ForgeRequest['op'], string>;
 
@@ -139,6 +143,12 @@ const commandHelp: HelpEntry[] = [
     command: 'user',
     spec: 'user <list|role|link>',
     description: 'List users, link identities and manage roles as the operator',
+  },
+  {
+    command: 'project',
+    subcommand: 'list',
+    spec: 'project list',
+    description: 'List registered projects (id, kind, name, key, path)',
   },
   {
     command: 'trigger',
@@ -196,6 +206,12 @@ const commandHelp: HelpEntry[] = [
   },
   {
     command: 'workflow',
+    subcommand: 'artifacts',
+    spec: 'workflow artifacts <run-id> [path]',
+    description: "List a run's artifact files, or print one",
+  },
+  {
+    command: 'workflow',
     subcommand: 'logs',
     spec: 'workflow logs <run-id>',
     description: "Print or follow a run's JSONL transcript",
@@ -226,9 +242,15 @@ const commandHelp: HelpEntry[] = [
       },
       {
         spec: '--watch',
-        description: 'Stream every change as lines until stopped; the open set comes first',
+        description:
+          'Stream readable changes until stopped; the open set comes first\n' +
+          'A degraded warning means coverage may have gaps. Repair and replay:\n' +
+          'https://archon.diy/guides/attention-queue/#stream-the-queue',
       },
-      { spec: '--after <cursor>', description: 'With --watch: replay after an earlier line' },
+      {
+        spec: '--after <cursor>',
+        description: 'With --watch: replay readable events after a cursor; gaps may remain',
+      },
     ],
   },
   {
@@ -793,6 +815,11 @@ const orderedFlags: FlagHelp[] = [
     owners: [{ command: 'workflow', subcommand: 'run' }],
   },
   {
+    spec: '--config-from-run <run-id>',
+    description: 'Start a fresh run with the run config another run was started with',
+    owners: [{ command: 'workflow', subcommand: 'run' }],
+  },
+  {
     spec: '--resume',
     description:
       'Resume the most recent failed or paused run of the workflow (mutually exclusive with --branch)',
@@ -864,7 +891,7 @@ const orderedFlags: FlagHelp[] = [
   {
     spec: '--json',
     description:
-      'Output machine-readable JSON (list/status/get/wait/attention/runs/approve/reject/respond/answer/cancel/abandon/resume)',
+      'Output machine-readable JSON (list/status/get/artifacts/wait/attention/runs/approve/reject/respond/answer/cancel/abandon/resume, project list)',
     owners: [],
   },
   {
@@ -1003,6 +1030,11 @@ const orderedExamples: ExampleHelp[] = [
     text: 'archon workflow get <run-id> --json',
     owner: { command: 'workflow', subcommand: 'get' },
   },
+  {
+    text: 'archon workflow artifacts <run-id> plan.md',
+    owner: { command: 'workflow', subcommand: 'artifacts' },
+  },
+  { text: 'archon project list --json', owner: { command: 'project', subcommand: 'list' } },
   {
     text: 'archon workflow logs <run-id> --follow',
     owner: { command: 'workflow', subcommand: 'logs' },

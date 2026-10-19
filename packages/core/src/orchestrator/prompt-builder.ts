@@ -21,7 +21,7 @@ import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
 import { getArchonWorkspacesPath } from '@archon/paths';
 import { isRejectableUnreadableGate } from '../operations/workflow-operations';
 
-type PromptWorkflow = Pick<WorkflowDefinition, 'name' | 'description'> & {
+type PromptWorkflow = Pick<WorkflowDefinition, 'name' | 'description' | 'deprecated' | 'inputs'> & {
   readonly nodes: readonly unknown[];
 };
 
@@ -45,6 +45,21 @@ export function formatProjectSection(
   return section;
 }
 
+function formatInputs(inputs: PromptWorkflow['inputs']): string {
+  const entries = Object.entries(inputs ?? {});
+  if (entries.length === 0) return '';
+  const lines = entries.map(([name, spec]) => {
+    const kind =
+      spec.required === true
+        ? 'required'
+        : spec.default !== undefined
+          ? `default: ${JSON.stringify(spec.default)}`
+          : 'optional';
+    return `    - ${name} (${kind})${spec.description ? `: ${spec.description}` : ''}\n`;
+  });
+  return `  Inputs:\n${lines.join('')}`;
+}
+
 /**
  * Format workflow list for the orchestrator prompt.
  */
@@ -53,14 +68,12 @@ export function formatWorkflowSection(workflows: readonly PromptWorkflow[]): str
     return 'No workflows available. Users can create workflows in `.archon/workflows/` as YAML files.\n';
   }
 
-  let section = '';
-  for (const w of workflows) {
-    section += `**${w.name}**\n`;
-    section += `  ${w.description}\n`;
-    section += `  Type: DAG (${String(w.nodes.length)} nodes)\n`;
-    section += '\n';
-  }
-  return section;
+  return workflows
+    .map(w => {
+      const deprecation = w.deprecated ? `  Deprecated: ${w.deprecated.message}\n` : '';
+      return `**${w.name}**\n  ${w.description}\n${deprecation}${formatInputs(w.inputs)}  Type: DAG (${String(w.nodes.length)} nodes)\n\n`;
+    })
+    .join('');
 }
 
 /** WorkflowResult type for prompt context injection */
@@ -330,7 +343,9 @@ export function buildRoutingRulesWithProject(channel: LaunchChannel, projectName
 3. If the user mentions a specific project → use that project's name
 ${rule4}
 5. If no project needed (general question) → answer directly without workflow
-6. If the user wants to add a new project → clone it, then register it (see below)`;
+6. If the user wants to add a new project → clone it, then register it (see below)
+
+In the examples below, {workflow-name} is an illustrative placeholder: replace it with the exact name of an appropriate workflow from Available Workflows. Never invoke the placeholder literally. If no listed workflow fits, explain that instead of inventing a name. Do not recommend deprecated workflows when a non-deprecated workflow fits; follow the deprecation guidance in Available Workflows.`;
 
   const promptRules = (
     arg: string
@@ -352,9 +367,10 @@ Use the name returned by registration for subsequent workflow and project comman
 
   if (channel === 'tools') {
     const invokeExample = {
-      workflow: 'archon-ship',
+      workflow: '{workflow-name}',
       project: 'my-project',
       prompt: exampleTask,
+      inputs: '{"base_branch":"dev"}',
     } satisfies Record<keyof typeof INVOKE_WORKFLOW_SCHEMA.properties, string>;
     const registerExample = {
       name: 'my-new-app',
@@ -372,11 +388,12 @@ ${Object.entries(INVOKE_WORKFLOW_SCHEMA.properties)
 
 Rules:
 ${promptRules('`prompt`')}
+- If the chosen workflow lists inputs, pass the values the user gave in \`inputs\`. If a required input is missing, ask the user for it before calling \`invoke_workflow\`.
 - Call \`invoke_workflow\` at most once per reply. The run starts after your reply ends: say what you launched, and never claim the run finished.
 
 Routing behavior:
 - If the user clearly wants work done (e.g., "create a plan for X", "implement Y", "fix Z") → briefly explain what you're doing and call \`invoke_workflow\`.
-- If the user is asking a question or it's unclear whether they want a workflow → answer their question directly. You may suggest a workflow by name (e.g., "I can run the **archon-investigate** workflow to find the root cause if you'd like"), but do NOT call \`invoke_workflow\`.
+- If the user is asking a question or it's unclear whether they want a workflow → answer their question directly. You may offer to run a suitable workflow from Available Workflows if one fits, but do NOT call \`invoke_workflow\`.
 
 Example (clear intent):
 User: "Fix issue #42, the login form rejects valid emails"
@@ -385,7 +402,7 @@ invoke_workflow(${INVOKE_WORKFLOW_SCHEMA.required.map(name => `${name}: "${invok
 
 Example (ambiguous — answer directly):
 User: "What do you think about adding dark mode?"
-Response: "Adding dark mode would involve... [answer the question]. If you'd like me to create a plan for this, I can run the **archon-plan** workflow." Do NOT call \`invoke_workflow\`.
+Response: "Adding dark mode would involve... [answer the question]. If you'd like me to create a plan for this, I can run one if a suitable workflow is available." Do NOT call \`invoke_workflow\`.
 
 ## Project Setup
 
@@ -418,16 +435,16 @@ ${promptRules('--prompt')}
 
 Routing behavior:
 - If the user clearly wants work done (e.g., "create a plan for X", "implement Y", "fix Z") → include a brief explanation of what you're doing, then invoke the workflow.
-- If the user is asking a question or it's unclear whether they want a workflow → answer their question directly. You may suggest a workflow by name (e.g., "I can run the **archon-investigate** workflow to find the root cause if you'd like"), but do NOT include /invoke-workflow in your response.
+- If the user is asking a question or it's unclear whether they want a workflow → answer their question directly. You may offer to run a suitable workflow from Available Workflows if one fits, but do NOT include /invoke-workflow in your response.
 
 Example (clear intent):
 User: "Fix issue #42, the login form rejects valid emails"
 Response: I'll take issue #42 through to a reviewed pull request.
-/invoke-workflow archon-ship --project my-project --prompt "${exampleTask}"
+/invoke-workflow {workflow-name} --project my-project --prompt "${exampleTask}"
 
 Example (ambiguous — answer directly):
 User: "What do you think about adding dark mode?"
-Response: "Adding dark mode would involve... [answer the question]. If you'd like me to create a plan for this, I can run the **archon-plan** workflow."
+Response: "Adding dark mode would involve... [answer the question]. If you'd like me to create a plan for this, I can run one if a suitable workflow is available."
 
 ## Project Setup
 
@@ -536,9 +553,9 @@ ${formatProjectSection(scopedCodebase, await resolveProjectAssistant(scopedCodeb
  * the `archon` CLI over bash — the delivery of the `manage-run` skill for
  * providers WITHOUT the in-process `manage_run` tool. Direct chat is the one path
  * where the `skills:` option is NOT consumed (it is workflow-node-only), so the
- * system prompt is the only channel that reaches OpenCode/Copilot. The
- * orchestrator (orchestrator-agent.ts) appends this ONLY for project-scoped chats
- * on non-nativeTools providers — Claude/Codex/Pi use the native tool instead, and the
+ * system prompt is the only channel that reaches OpenCode/Copilot.
+ * `prepareChatTurnRequest` (chat-request.ts) appends this ONLY for project-scoped
+ * chats on non-nativeTools providers — Claude/Codex/Pi use the native tool instead, and the
  * CLI commands require a git-repo cwd that unscoped chats don't have. Invocation
  * inherits the same `archon`-on-PATH convention the `archon` skill already assumes.
  */

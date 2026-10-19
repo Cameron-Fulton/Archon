@@ -30,7 +30,7 @@ import {
   recordSelectedWorkflow,
   resolveContinuationWorkflow,
   withCapturedSource,
-} from '@archon/workflows/executor';
+} from '@archon/workflows/run-source';
 import { canonicalValueText, type JsonValue } from '@archon/workflows/output-ref';
 import { resolveWorkflowName } from '@archon/workflows/router';
 import {
@@ -512,7 +512,7 @@ export async function startAdmittedResourceStart(
       }
     );
     try {
-      await assertRunCredentials(deps, preparedAiConfiguration);
+      await assertRunCredentials(deps, preparedAiConfiguration, { cwd: launch.execution.cwd });
     } catch (error) {
       if (error instanceof WorkflowCredentialPreflightError) {
         await requireTerminalStatusWrite(deps.store.failWorkflowRun(run.id, error.message), {

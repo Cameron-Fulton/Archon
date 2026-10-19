@@ -86,8 +86,8 @@ assistants:
     settingSources:   # Which sources the Claude SDK loads (default: ['project', 'user'])
       - project       # Project-level <cwd>/.claude/ (CLAUDE.md, skills, commands, agents)
       - user          # User-level ~/.claude/ (CLAUDE.md, skills, commands, agents)
-    # Optional: absolute path to the Claude Code executable.
-    # Required in compiled Archon binaries when CLAUDE_BIN_PATH is not set.
+    # Optional: absolute path to the Claude Code executable. Compiled binaries
+    # find the native installer's ~/.local/bin/claude without it.
     # Accepts the native binary (~/.local/bin/claude from the curl installer),
     # the npm-installed cli.js, or the npm platform-package directory
     # (e.g. @anthropic-ai/claude-code-win32-x64 — auto-expanded to claude/claude.exe).
@@ -102,6 +102,7 @@ assistants:
     additionalDirectories:
       - /absolute/path/to/other/repo
     # codexBinaryPath: /absolute/path/to/codex  # Optional: Codex CLI path
+    # toolFreeStructuredOutputModels: [glm-5.3]  # Optional: routes that reject tools + strict schema together
 
 # Streaming preferences per platform
 streaming:
@@ -142,7 +143,9 @@ tiers:
   medium: { provider: codex, model: gpt-5.6-terra, effort: high }
   small: { provider: pi, model: minimax-m3 }
 
-# Model aliases — optional custom refs for project workflows.
+# Model aliases — custom refs. Project workflows can name one directly; a bundled
+# workflow names one in a preference list that ends in a tier, such as the SDLC pack's
+# '@implementer' or '@reviewer', so an unset alias falls back to that tier.
 aliases:
   '@reasoning': { provider: claude, model: opus, effort: max }
 
@@ -512,7 +515,7 @@ Environment variables override all other configuration. They are organized by ca
 | --- | --- | --- |
 | `ARCHON_HOME` | Base directory for all Archon-managed files. **Ignored in Docker** — the container always uses `/.archon`. | `~/.archon` |
 | `PORT` | HTTP server listen port | `3090` (auto-allocated in worktrees) |
-| `LOG_LEVEL` | Logging verbosity (`fatal`, `error`, `warn`, `info`, `debug`, `trace`). Read from the environment or from `~/.archon/.env` or `.archon/.env`. CLI commands other than `archon serve` log at `warn` unless `--verbose` or `LOG_LEVEL=debug`/`trace` is set (a quieter `LOG_LEVEL` such as `error` is kept); see [CLI logs](/reference/cli/#logs). | `info` |
+| `LOG_LEVEL` | Logging verbosity (`fatal`, `error`, `warn`, `info`, `debug`, `trace`). Read from the environment or from `~/.archon/.env` or `.archon/.env`. CLI commands other than `archon serve` log at `warn` unless `--verbose` or `LOG_LEVEL=debug`/`trace` is set (a quieter `LOG_LEVEL` such as `error` is kept); see [CLI logs](/reference/cli/#logs). At `debug` or `trace`, each DAG run compares the usage totals it writes to the run with the sum of its node events, and logs `dag.run_usage_reconciliation_mismatch` with both figures when they differ. | `info` |
 | `BOT_DISPLAY_NAME` | Bot name shown in batch-mode "starting" messages | `Archon` |
 | `DEFAULT_AI_ASSISTANT` | Fallback AI assistant when no config file sets the assistant. Overridden by `defaultAssistant` in global config or `assistant` in repo config. Must match a registered provider id. | Only registered provider, otherwise unset |
 | `MAX_CONCURRENT_CONVERSATIONS` | Maximum concurrent AI conversations | `10` |
@@ -554,6 +557,8 @@ The Copilot provider also reads `assistants.copilot.{model, modelReasoningEffort
 
 ### Platform Adapters -- Slack
 
+These variables take effect only when the `chat-slack` plugin is installed. See the [Slack guide](/adapters/slack/).
+
 | Variable | Description | Default |
 | --- | --- | --- |
 | `SLACK_BOT_TOKEN` | Slack bot token (`xoxb-...`) | -- |
@@ -584,6 +589,7 @@ The Copilot provider also reads `assistants.copilot.{model, modelReasoningEffort
 | --- | --- | --- |
 | `GITHUB_TOKEN` | Required with `WEBHOOK_SECRET` to activate the GitHub adapter in PAT mode. Used for adapter API calls, cloning and forge credentials when `GH_TOKEN` is unset or empty. | -- |
 | `GH_TOKEN` | Preferred token for adapter API calls in PAT mode, cloning, forge credentials and the GitHub CLI. Takes precedence over `GITHUB_TOKEN`; does not activate the adapter by itself. | -- |
+| `GITHUB_URL` | Base URL of a GitHub Enterprise Server (e.g. `https://github.example.com`). The adapter and the GitHub App call `<GITHUB_URL>/api/v3`, and HTTPS clones with this exact scheme, host and port use `GH_TOKEN`/`GITHUB_TOKEN` (or the App's installation token in App mode). A value that is not a bare `http(s)://host[:port]` URL fails startup. See [GitHub Enterprise Server](/adapters/github/#github-enterprise-server). | github.com |
 | `WEBHOOK_SECRET` | HMAC SHA-256 secret for GitHub webhook signature verification | -- |
 | `GITHUB_ALLOWED_USERS` | Comma-separated GitHub usernames for whitelist (case-insensitive) | Open access |
 | `GITHUB_BOT_MENTION` | @mention name the bot responds to in issues/PRs | Falls back to `BOT_DISPLAY_NAME` |
@@ -599,7 +605,7 @@ An opt-in layer on top of [GitHub App mode](/adapters/github-app-setup/) that le
 | `ARCHON_ALLOW_ORG_GITHUB_TOKEN_FALLBACK` | When `false` (default), a workflow run by an **unconnected** user has `GH_TOKEN`/`GITHUB_TOKEN` scrubbed (so `gh`/`git` fail) rather than silently using the shared org/bot token. Set `true` to opt back into the shared token. | `false` |
 | `ARCHON_WEB_AUTH_HEADER` | Name of the reverse-proxy-set header Archon trusts to identify the web user (reverse-proxy fallback; still honored alongside Better Auth web login below). Only safe when Archon is reachable **solely** through a trusted proxy that strips client-supplied values and sets the header from the authenticated identity. Use a loopback bind for a same-host proxy or a private container interface for a container proxy; clients must not be able to reach the upstream directly. See the [reverse-proxy contract](/deployment/reverse-proxy/#authentication-and-headers). Absent header → unattributed (never elevated). | `X-Archon-User` |
 
-To connect once the vars are set: `archon auth github` (CLI), `/archon connect github` (Slack), or the Web UI **Settings → Connect GitHub** card.
+To connect once the vars are set: `archon auth github` (CLI) or the Web UI **Settings → Connect GitHub** card.
 
 ### Web UI login (Better Auth, optional)
 
@@ -665,7 +671,7 @@ Signup uses email + password (no email verification by default). **Signup postur
 
 ### Telemetry
 
-Archon sends a few anonymous events — `archon_started` (once per CLI invocation or server boot), `archon_active` (daily server heartbeat), `chat_turn_handled` (direct chat turn — platform, provider, model, duration, and usage totals, counted as failed when the provider errors mid-turn; never message content), `workflow_invoked` (workflow start or resumed segment), `workflow_completed`/`workflow_failed`/`workflow_cancelled` (sent once when the run's final status is saved), `workflow_approval_resolved` (binary approve/reject), and `codebase_registered` (pure count — no name/path/URL). Categorical only: workflow name (real for bundled workflows, `"custom"` for your own), platform, provider id (model id on `workflow_invoked`), node shape (`nodes_<type>` counts, `graph_depth`, `max_fan_out`, `command_refs`, `prompt_chars_bucket`) and feature flags, `derived_from`/`derived_similarity` naming the bundled workflow a custom one was copied from (never the copy's own name), outcome/duration, aggregate provider-reported usage (gross input, output, optional cache-read/cache-write totals plus a flag when those totals are a floor, cost, and loop iterations), a fixed-enum failure class and exit/cancel reason (never error text), a `run_ref` hash that joins one run's events without sending its id, deployment shape (adapter/db/auth booleans), OS/arch/version, install channel (`binary`/`docker`/`source`) and build commit, a `schema_version`, and a random install UUID stored at `$ARCHON_HOME/telemetry-id`. No code, prompts, paths, IP, geo, or error text. Any one of the variables below disables it. See `archon telemetry status` to inspect the live state.
+Archon sends a few anonymous events — `archon_started` (once per CLI invocation or server boot), `archon_active` (daily server heartbeat), `chat_turn_handled` (direct chat turn — platform, provider, model, duration, and usage totals, counted as failed when the provider errors mid-turn; never message content), `workflow_invoked` (workflow start or resumed segment), `workflow_completed`/`workflow_failed`/`workflow_cancelled` (sent once when the run's final status is saved), `workflow_approval_resolved` (binary approve/reject), and `codebase_registered` (pure count — no name/path/URL). Categorical only: workflow name (real for bundled workflows, `"custom"` for your own), platform, provider id (model id on `workflow_invoked`), node shape (`nodes_<type>` counts, `graph_depth`, `max_fan_out`, `command_refs`, `prompt_chars_bucket`) and feature flags, `derived_from`/`derived_similarity` naming the bundled workflow a custom one was copied from (never the copy's own name), outcome/duration, aggregate provider-reported usage (gross input, output, optional cache-read/cache-write totals plus a flag when those totals are a floor, cost, and loop iterations), a fixed-enum failure class and exit/cancel reason (never error text), a `run_ref` hash that joins one run's events without sending its id, deployment shape (adapter/db/auth booleans and a chat plugin count), OS/arch/version, install channel (`binary`/`docker`/`source`) and build commit, a `schema_version`, and a random install UUID stored at `$ARCHON_HOME/telemetry-id`. No code, prompts, paths, IP, geo, or error text. Any one of the variables below disables it. See `archon telemetry status` to inspect the live state.
 
 | Variable | Description | Default |
 | --- | --- | --- |
@@ -816,7 +822,9 @@ DISCORD_STREAMING_MODE=stream
 
 ### Batch Mode
 
-Only the final summary message is sent after AI completes processing.
+The assistant reply is sent after AI completes processing. Batch mode filters sections that start with tool-indicator emoji. If filtering leaves no text, it sends the original assistant messages joined with separators, including those indicators. Provider warnings are sent as they arrive unless an orchestrator command prefix has already been detected.
+
+Filtering operates on provider text blocks, including continuations split by an immediate warning. Adapters may split long replies into multiple platform messages or comments.
 
 ```ini
 TELEGRAM_STREAMING_MODE=batch
@@ -825,14 +833,14 @@ DISCORD_STREAMING_MODE=batch
 ```
 
 **Pros:**
-- Single coherent message/comment
+- One assembled assistant reply before delivery; adapters may split long replies
 - Fewer API calls
 - No spam or clutter
 
 **Cons:**
-- No progress indication during processing
+- Assistant text is held until processing completes
 - Longer wait for first response
-- Can't see intermediate steps
+- Intermediate tool-indicator sections are normally omitted; the all-filtered fallback includes them
 
 **Best for:** Issue trackers and async platforms (GitHub)
 
@@ -918,7 +926,9 @@ Returns: `{"status":"ok","database":"connected"}`
 ```bash
 curl http://localhost:3090/health/concurrency
 ```
-Returns: `{"status":"ok","active":0,"queued":0,"maxConcurrent":10}`
+Returns: `{"status":"ok","active":0,"queuedTotal":0,"maxConcurrent":10}`
+
+Per-conversation acquisition and queue times are on the authenticated `GET /api/dashboard/conversations`.
 
 **Use cases:**
 - Docker healthcheck configuration

@@ -634,6 +634,22 @@ describe('workflow run config argument', () => {
     expect(message).toContain('--config cannot be used when continuing');
   });
 
+  it('names --config-from-run when it is the flag passed on run --resume', () => {
+    expect(rejectConfigOnContinue(true, undefined, 'paused-run')).toBe(
+      'Error: --config-from-run cannot be used when continuing an existing workflow run. ' +
+        'The run keeps the config it started with.'
+    );
+  });
+
+  it('refuses --config-from-run on the trigger commands that take --config', () => {
+    for (const subcommand of ['fire', 'schedule']) {
+      expect(rejectConfigOutsideRun('trigger', subcommand, undefined, 'paused-run')).toBe(
+        'Error: --config-from-run can only be used with workflow run.'
+      );
+    }
+    expect(rejectConfigOutsideRun('workflow', 'run', undefined, 'paused-run')).toBeUndefined();
+  });
+
   it('rejects --config outside workflow run before dispatch', () => {
     // Pure pre-dispatch argv guard — no I/O, so asserted in-process.
     const message = rejectConfigOutsideRun('chat', undefined, './does-not-exist.yaml');
@@ -1833,7 +1849,7 @@ describe('main catch --json error envelope', () => {
     //
     // `--dry-run` is not part of the contract; it is how this test avoids
     // paying for one. A real run freezes the workflow source BEFORE resolving
-    // the name (workflow.ts: prepareWorkflowSource precedes
+    // the name (workflow-run-admission.ts: selectRunWorkflow captures the source before
     // resolveWorkflowName, deliberately — discovery must read the frozen
     // bytes, #2660/#2747), so without the flag this single spawn copies and
     // digests every project, global, and bundled workflow file the run can
@@ -2502,7 +2518,7 @@ describe('setup provider selection dispatch', () => {
 import { mock } from 'bun:test';
 mock.module('@archon/core/providers/register-host-providers', () => ({ registerHostProviders: async () => {} }));
 const setupPath = ${JSON.stringify(join(repoRoot, 'packages/cli/src/commands/setup.ts'))};
-const { selectSetupProviders } = await import(setupPath);
+const { selectSetupProviders } = await import(${JSON.stringify(join(repoRoot, 'packages/cli/src/commands/setup-ai.ts'))});
 mock.module(setupPath, () => ({
   setupCommand: async options => {
     let prompts = 0;

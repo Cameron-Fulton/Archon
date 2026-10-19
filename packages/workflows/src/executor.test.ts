@@ -1,20 +1,22 @@
+// @archon-test-isolated
 import * as checkout from './checkout-observation';
-import { prepareRunAiConfiguration } from './run-preflight';
 import type { WorkflowEmitterEvent } from './event-emitter';
 import type { ExecuteWorkflowOptions } from './executor';
+import { prepareRunAiConfiguration } from './run-preflight';
 /**
  * Tests for executeWorkflow() — the top-level orchestration function.
  * Covers concurrent-run guards, model/provider resolution, and resume logic
  * that the inner dag-executor.test.ts cannot reach.
  */
-import { providerRegistry } from '@archon/providers';
-import type { CheckoutObservation } from './schemas/checkout-observation';
-import { NodeEventWriteError } from './node-event-write';
-import { describe, it, expect, mock, beforeEach, afterEach, spyOn } from 'bun:test';
 import { removeTempTree } from '@archon/paths/test-utils';
+import { providerRegistry } from '@archon/providers';
+import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from 'bun:test';
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { hostname, tmpdir } from 'node:os';
-import { delimiter, dirname, join } from 'path';
+import { dirname, join, relative } from 'path';
+import * as realStorage from '@archon/paths/archon-paths';
+import { NodeEventWriteError } from './node-event-write';
+import type { CheckoutObservation } from './schemas/checkout-observation';
 
 // --- Mock logger ---
 const mockLogFn = mock(() => {});
@@ -38,29 +40,11 @@ const mockCaptureWorkflowInvoked = mock<typeof import('@archon/paths').captureWo
 const mockCaptureWorkflowTerminal = mock<typeof import('@archon/paths').captureWorkflowTerminal>(
   _props => {}
 );
-/**
- * Deterministic stand-ins for the shared identity→paths resolver (#2200). They
- * mirror the real branch order and layout, so `resolveProjectPaths` is exercised
- * as delegation rather than re-implementation, while the asserted paths stay
- * readable literals rooted at `/tmp/ws`.
- */
-type FakeStorageKey =
-  | { kind: 'repo'; owner: string; repo: string }
-  | { kind: 'folder'; slug: string }
-  | { kind: 'cwd'; cwd: string };
-function fakeResolveProjectStorageKey(
-  codebase: { kind?: string | null; name: string; default_cwd: string } | null | undefined,
-  cwd: string
-): FakeStorageKey {
-  if (codebase) {
-    if (codebase.kind === 'folder') return { kind: 'folder', slug: codebase.name };
-    const [owner, repo] = codebase.name.split('/');
-    if (owner && repo) return { kind: 'repo', owner, repo };
-    const base = codebase.default_cwd.split(/[\\/]/).filter(Boolean).pop();
-    if (base && base !== '.' && base !== '..') return { kind: 'repo', owner: '_local', repo: base };
-  }
-  return { kind: 'cwd', cwd };
-}
+const realParseOwnerRepo = realStorage.parseOwnerRepo;
+const realResolveRepoProjectIdentity = realStorage.resolveRepoProjectIdentity;
+const fakeResolveProjectStorageKey = realStorage.resolveProjectStorageKey;
+const realGetProjectStoragePaths = realStorage.getProjectStoragePaths;
+const realGetArchonWorkspacesPath = realStorage.getArchonWorkspacesPath;
 /** Root of the fake workspace tree; segments joined so win32 separators match. */
 const WS = join('/tmp', 'ws');
 function wsPath(...segments: string[]): string {
@@ -85,21 +69,21 @@ function fakeStoragePathsForRoot(root: string): {
   };
 }
 function fakeGetProjectStoragePaths(
-  key: FakeStorageKey
+  key: realStorage.ProjectStorageKey
 ): ReturnType<typeof fakeStoragePathsForRoot> {
-  const root =
-    key.kind === 'repo'
-      ? wsPath(key.owner, key.repo)
-      : key.kind === 'folder'
-        ? wsPath('_folder', key.slug)
-        : wsPath('_cwd', key.cwd.split(/[\\/]/).filter(Boolean).pop() ?? '_');
+  const root = wsPath(
+    relative(realGetArchonWorkspacesPath(), realGetProjectStoragePaths(key).root)
+  );
   return fakeStoragePathsForRoot(root);
+}
+function cwdPath(cwd: string, ...segments: string[]): string {
+  return join(fakeGetProjectStoragePaths({ kind: 'cwd', cwd }).root, ...segments);
 }
 
 mock.module('@archon/paths', () => ({
   createLogger: mock(() => mockLogger),
-  parseOwnerRepo: mock(() => null),
-  resolveRepoProjectIdentity: mock(() => null),
+  parseOwnerRepo: mock(realParseOwnerRepo),
+  resolveRepoProjectIdentity: mock(realResolveRepoProjectIdentity),
   getRunArtifactsPath: mock(() => '/tmp/artifacts'),
   getProjectLogsPath: mock(() => '/tmp/logs'),
   getProjectArtifactsPath: mock(() => '/tmp/artifacts-root'),
@@ -139,13 +123,6 @@ type ExecuteDagWorkflow = typeof import('./dag-executor').executeDagWorkflow;
 const mockExecuteDagWorkflow = mock<ExecuteDagWorkflow>(async () => undefined);
 mock.module('./dag-executor', () => ({
   executeDagWorkflow: mockExecuteDagWorkflow,
-  // Passthrough for the sub-run outcome mapper (#2121) — executor.ts imports it;
-  // no test here exercises the sub-run path, but the export must exist so the
-  // mocked module doesn't shadow it with `undefined`.
-  childOutcomeFromRun: mock((run: { id: string; status: string }) => ({
-    childRunId: run.id,
-    status: run.status,
-  })),
 }));
 
 // --- Mock logger functions ---
@@ -173,18 +150,11 @@ registerBuiltinProviders();
 registerCommunityProviders();
 
 // --- Import after mocks ---
-import {
-  executeWorkflow,
-  hydrateResumableRun,
-  inspectResumableRun,
-  resolveProjectPaths,
-  resolveScopeArtifactsDir,
-  resolveWorkflowGithubEnvironment,
-} from './executor';
+import type { IWorkflowPlatform, WorkflowConfig, WorkflowDeps } from './deps';
+import { executeWorkflow } from './executor';
+import { hydrateResumableRun } from './run-resume';
+import { substituteWorkflowVariables } from './workflow-variables';
 import { resolveWorkflow } from './graph-plan';
-import { keepAwake } from './utils/keep-awake';
-import type { WorkflowDeps, IWorkflowPlatform, WorkflowConfig } from './deps';
-import type { IWorkflowStore } from './store';
 import type {
   ResolvedWorkflow,
   WorkflowDefinition,
@@ -198,8 +168,9 @@ import {
   workflowDefinitionSchema,
 } from './schemas';
 import type { WorkflowRunConfigMetadata } from './schemas/run-config';
-import { substituteWorkflowVariables } from './executor-shared';
+import type { DagResumeSnapshot, IWorkflowStore } from './store';
 import { TerminalStatusWriteError } from './terminal-status-write';
+import { keepAwake } from './utils/keep-awake';
 
 // --- Helpers ---
 
@@ -355,6 +326,7 @@ function makeStore(overrides: Partial<IWorkflowStore> = {}): IWorkflowStore {
     getDagResumeSnapshot: mock(async () => ({
       completedNodeOutputs: new Map(),
       fanOutSnapshots: new Map(),
+      failedNodes: new Map(),
       unresolvedNodeStarts: new Set<string>(),
       budget: { workUnits: 0, spendUsd: 0 },
       tokens: { input: 0, output: 0 },
@@ -396,6 +368,10 @@ function makePlatform(): IWorkflowPlatform {
     sendMessage: mock(async () => {}),
     getPlatformType: mock(() => 'test' as const),
   } as unknown as IWorkflowPlatform;
+}
+
+function sentMessages(platform: IWorkflowPlatform): string[] {
+  return (platform.sendMessage as ReturnType<typeof mock>).mock.calls.map(call => String(call[1]));
 }
 
 function makeDeps(store?: IWorkflowStore): WorkflowDeps {
@@ -1007,72 +983,97 @@ describe('executeWorkflow', () => {
       expect(result.success).toBe(true);
     });
 
-    it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
-      'a resumed container run whose source cannot be read is told to resume by hand',
-      async () => {
-        const captureRoot = await mkdtemp(join(tmpdir(), 'archon-unreadable-capture-'));
-        const release = mock(async () => ({ released: true }));
-        const store = makeStore({ releaseRunForUnreadableSource: release });
-        const platform = makePlatform();
-        const preCreatedRun = makeRun({
-          id: 'crun3',
-          metadata: {
-            isolation: 'container',
-            isolation_env_id: 'env-x',
-            workflow_source: {
-              version: 1,
-              root: captureRoot,
-              origin: captureRoot,
-              captured_at: new Date().toISOString(),
-              digest: 'unread',
-              file_count: 0,
-              byte_count: 0,
-            },
-          },
-        });
-        await chmod(captureRoot, 0o000);
-        try {
-          const result = await executeWorkflow(
-            makeDeps(store),
-            platform,
-            'conv-1',
-            '/tmp/ops',
-            makeWorkflow(),
-            'msg',
-            { conversationId: 'db-conv-1' },
-            {
-              preCreatedRun,
-              priorCompletedNodes: new Map([['node1', { output: 'out' }]]),
-              execContext: { kind: 'container', containerId: 'cid' },
-              container: {
-                envId: 'env-x',
-                writeBack: 'approve',
-                backend: {
-                  suspend: mock(async () => {}),
-                  finalize: mock(async () => ({ requiresApproval: false })),
-                  applyChanges: mock(async () => ({
-                    filesApplied: 0,
-                    filesDeleted: 0,
-                    warnings: [],
-                  })),
-                  discardChanges: mock(async () => {}),
-                },
+    describe.each([
+      ['no adoption', undefined],
+      ['an adopted run with no output root', null],
+      [
+        'an adopted run with an out-of-tree output root',
+        '/old-machine/.archon/workspaces/old/name',
+      ],
+    ] as const)('unreadable container source with %s', (_label, outputRoot) => {
+      it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+        'refuses invalid adoption before releasing the run for unreadable source',
+        async () => {
+          const captureRoot = await mkdtemp(join(tmpdir(), 'archon-unreadable-capture-'));
+          const release = mock(async () => ({ released: true }));
+          const store = makeStore({
+            releaseRunForUnreadableSource: release,
+            getWorkflowRun: mock(async () => makeRun({ output_root: outputRoot ?? null })),
+          });
+          const platform = makePlatform();
+          const preCreatedRun = makeRun({
+            id: 'crun3',
+            adopted_from_run_id: outputRoot === undefined ? null : 'prior-run',
+            metadata: {
+              isolation: 'container',
+              isolation_env_id: 'env-x',
+              workflow_source: {
+                version: 1,
+                root: captureRoot,
+                origin: captureRoot,
+                captured_at: new Date().toISOString(),
+                digest: 'unread',
+                file_count: 0,
+                byte_count: 0,
               },
+            },
+          });
+          await chmod(captureRoot, 0o000);
+          try {
+            const result = await executeWorkflow(
+              makeDeps(store),
+              platform,
+              'conv-1',
+              '/tmp/ops',
+              makeWorkflow(),
+              'msg',
+              { conversationId: 'db-conv-1' },
+              {
+                preCreatedRun,
+                priorCompletedNodes: new Map([['node1', { output: 'out' }]]),
+                execContext: { kind: 'container', containerId: 'cid' },
+                container: {
+                  envId: 'env-x',
+                  writeBack: 'approve',
+                  backend: {
+                    suspend: mock(async () => {}),
+                    finalize: mock(async () => ({ requiresApproval: false })),
+                    applyChanges: mock(async () => ({
+                      filesApplied: 0,
+                      filesDeleted: 0,
+                      warnings: [],
+                    })),
+                    discardChanges: mock(async () => {}),
+                  },
+                },
+              }
+            );
+            if (outputRoot === undefined) {
+              expect(result).toMatchObject({ success: true, paused: true });
+            } else {
+              expect(result).toMatchObject({
+                success: false,
+                error: expect.stringContaining("Cannot adopt run 'prior-run'"),
+              });
+              expect(store.failWorkflowRun).toHaveBeenCalledTimes(1);
+              expect(mockExecuteDagWorkflow).not.toHaveBeenCalled();
+              expect(keepAwake.activeCount()).toBe(0);
             }
+          } finally {
+            await chmod(captureRoot, 0o755);
+            await removeTempTree(captureRoot);
+          }
+          expect(release).toHaveBeenCalledTimes(outputRoot === undefined ? 1 : 0);
+          const sent = (platform.sendMessage as ReturnType<typeof mock>).mock.calls.map(c =>
+            String(c[1])
           );
-          expect(result).toMatchObject({ success: true, paused: true });
-        } finally {
-          await chmod(captureRoot, 0o755);
-          await removeTempTree(captureRoot);
+          expect(sent.some(text => text.includes('resume it by hand'))).toBe(
+            outputRoot === undefined
+          );
+          expect(sent.some(text => text.includes('continuation scan'))).toBe(false);
         }
-        expect(release).toHaveBeenCalledTimes(1);
-        const sent = (platform.sendMessage as ReturnType<typeof mock>).mock.calls.map(c =>
-          String(c[1])
-        );
-        expect(sent.some(text => text.includes('resume it by hand'))).toBe(true);
-        expect(sent.some(text => text.includes('continuation scan'))).toBe(false);
-      }
-    );
+      );
+    });
   });
 
   // -------------------------------------------------------------------------
@@ -1275,24 +1276,81 @@ describe('executeWorkflow', () => {
   // -------------------------------------------------------------------------
 
   describe('adopted run dir containment (#3097)', () => {
-    it('refuses to adopt from a run whose persisted output_root is outside ARCHON_HOME with no codebase re-derivation', async () => {
-      const adoptedId = 'prior-run';
+    for (const resume of [false, true]) {
+      for (const outputRoot of [null, '/old-machine/.archon/workspaces/old/name']) {
+        it(`${resume ? 'resume' : 'fresh'}: fails the run when the adopted output root is ${outputRoot === null ? 'missing' : 'outside ARCHON_HOME'}`, async () => {
+          const run = makeRun({ status: 'running', adopted_from_run_id: 'prior-run' });
+          const failRun = mock<IWorkflowStore['failWorkflowRun']>(async (_id, error) => {
+            run.status = 'failed';
+            run.metadata.error = error;
+            return { failed: true };
+          });
+          const store = makeStore({
+            createWorkflowRun: mock(async () => run),
+            getWorkflowRun: mock(async (id: string) =>
+              id === 'prior-run'
+                ? makeRun({ id, status: 'completed', output_root: outputRoot, codebase_id: null })
+                : run
+            ),
+            getWorkflowRunStatus: mock(async () => run.status),
+            failWorkflowRun: failRun,
+          });
+          const acquireSpy = spyOn(keepAwake, 'acquire');
+          const releaseSpy = spyOn(keepAwake, 'release');
+          try {
+            const result = await executeWorkflow(
+              makeDeps(store),
+              makePlatform(),
+              'conv-1',
+              '/tmp/ops',
+              makeWorkflow(),
+              'msg',
+              { conversationId: 'db-conv-1' },
+              resume
+                ? { preCreatedRun: run, priorCompletedNodes: new Map() }
+                : { adoptedFromRunId: 'prior-run', continuationMode: 'adopt' }
+            );
+            const message =
+              outputRoot === null
+                ? "Cannot adopt run 'prior-run': it has no persisted output root, so its artifact directory cannot be addressed."
+                : "Cannot adopt run 'prior-run': its persisted output root is outside ARCHON_HOME and cannot be re-derived, so its artifact directory cannot be addressed.";
+            expect(result).toEqual({ success: false, workflowRunId: run.id, error: message });
+            expect(run.status).toBe('failed');
+            expect(run.metadata.error).toBe(message);
+            expect(failRun).toHaveBeenCalledTimes(1);
+            expect(failRun).toHaveBeenCalledWith(run.id, message, {
+              exitReason: 'unhandled_error',
+            });
+            expect(mockEmitter.emit).toHaveBeenCalledWith({
+              type: 'workflow_failed',
+              runId: run.id,
+              workflowName: 'test-workflow',
+              error: message,
+            });
+            expect(store.createWorkflowEvent).not.toHaveBeenCalledWith(
+              expect.objectContaining({ event_type: 'workflow.run_adopted' })
+            );
+            expect(mockExecuteDagWorkflow).not.toHaveBeenCalled();
+            expect(acquireSpy).toHaveBeenCalledTimes(1);
+            expect(releaseSpy).toHaveBeenCalledTimes(1);
+            expect(keepAwake.activeCount()).toBe(0);
+          } finally {
+            acquireSpy.mockRestore();
+            releaseSpy.mockRestore();
+          }
+        });
+      }
+    }
+
+    it('surfaces a rejected adoption failure write without retrying or announcing failure', async () => {
+      const writeError = new Error('terminal store unavailable');
+      const failRun = mock<IWorkflowStore['failWorkflowRun']>(async () => {
+        throw writeError;
+      });
       const store = makeStore({
-        getWorkflowRun: mock(async (id: string) =>
-          id === adoptedId
-            ? makeRun({
-                id: adoptedId,
-                status: 'completed',
-                // Out-of-tree root — not under /tmp/ws (this suite's fake
-                // ARCHON_HOME), and no codebase row to re-derive from. The
-                // shared resolver returns null and the executor refuses,
-                // matching the CLI leave-behind and server readers.
-                output_root: '/old-machine/.archon/workspaces/old/name',
-                checkout_baseline: null,
-                codebase_id: null,
-              })
-            : { ...makeRun(), status: 'completed' as const }
-        ),
+        getWorkflowRun: mock(async () => makeRun({ output_root: null })),
+        getWorkflowRunStatus: mock(async () => 'running' as const),
+        failWorkflowRun: failRun,
       });
       await expect(
         executeWorkflow(
@@ -1303,12 +1361,15 @@ describe('executeWorkflow', () => {
           makeWorkflow(),
           'msg',
           { conversationId: 'db-conv-1' },
-          {
-            adoptedFromRunId: adoptedId,
-            continuationMode: 'adopt',
-          }
+          { adoptedFromRunId: 'prior-run', continuationMode: 'adopt' }
         )
-      ).rejects.toThrow(/outside ARCHON_HOME/);
+      ).rejects.toMatchObject({ name: 'TerminalStatusWriteError', cause: writeError });
+      expect(failRun).toHaveBeenCalledTimes(1);
+      expect(store.getWorkflowRunStatus).not.toHaveBeenCalled();
+      expect(mockEmitter.emit).not.toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'workflow_failed' })
+      );
+      expect(keepAwake.activeCount()).toBe(0);
     });
 
     it('re-derives a relocated adopted run dir through the adopted codebase', async () => {
@@ -1371,44 +1432,6 @@ describe('executeWorkflow', () => {
       expect(capturedVar!).toBe(
         `Read ${join(WS, 'acme', 'widget', 'artifacts', 'runs', adoptedId)}/report.md`
       );
-    });
-
-    // Same containment rules apply on the RESUME path — `adoptedFromRunId`
-    // is not in opts; the executor reads `adopted_from_run_id` from the
-    // pre-created persisted row. The resolver call site is identical
-    // (executor.ts:2578), but a future regression that adds a resume-specific
-    // bypass before the resolver would not fail the fresh-path tests above.
-
-    it('resume: refuses adoption when the persisted output_root is outside ARCHON_HOME with no codebase', async () => {
-      const adoptedId = 'prior-run';
-      const store = makeStore({
-        getWorkflowRun: mock(async (id: string) =>
-          id === adoptedId
-            ? makeRun({
-                id: adoptedId,
-                status: 'completed',
-                output_root: '/old-machine/.archon/workspaces/old/name',
-                checkout_baseline: null,
-                codebase_id: null,
-              })
-            : { ...makeRun(), status: 'completed' as const }
-        ),
-      });
-      await expect(
-        executeWorkflow(
-          makeDeps(store),
-          makePlatform(),
-          'conv-1',
-          '/tmp/ops',
-          makeWorkflow(),
-          'msg',
-          { conversationId: 'db-conv-1' },
-          {
-            preCreatedRun: makeRun({ status: 'running', adopted_from_run_id: adoptedId }),
-            priorCompletedNodes: new Map([['node1', { output: 'out' }]]),
-          }
-        )
-      ).rejects.toThrow(/outside ARCHON_HOME/);
     });
 
     it('resume: re-derives a relocated adopted run dir through the adopted codebase', async () => {
@@ -2101,9 +2124,8 @@ describe('executeWorkflow', () => {
   // Resume orphan cleanup
   // -------------------------------------------------------------------------
 
-  // Resume-pipeline coverage lives in the "hydrateResumableRun" suite at the
-  // bottom of this file (executor no longer queries findResumableRun on its
-  // own, so there is no orphan to clean up).
+  // Resume-pipeline coverage lives in run-resume.test.ts (executor no longer
+  // queries findResumableRun on its own, so there is no orphan to clean up).
 
   // -------------------------------------------------------------------------
   // Model/provider resolution
@@ -2612,16 +2634,37 @@ describe('executeWorkflow', () => {
             preCreatedRun,
             modelOverrideLayer: {
               kind: 'raw',
-              overrides: { aliases: { '@missing': 'codex/gpt-5.6-sol' } },
+              overrides: { aliases: { '@missing': 'gpt-5.6-sol' } },
             },
           }
         )
-      ).rejects.toThrow(/unknown alias '@missing'/);
+      ).rejects.toThrow(/'@missing' is not configured/);
       expect(failRun).toHaveBeenCalledWith(
         'invalid-model-run',
-        expect.stringContaining("unknown alias '@missing'")
+        expect.stringContaining("'@missing' is not configured")
       );
       expect(mockExecuteDagWorkflow).not.toHaveBeenCalled();
+    });
+
+    it('names the selected ref, not the whole preference list, in a provider-conflict warning', async () => {
+      const platform = makePlatform();
+      await executeWorkflow(
+        makeDeps(),
+        platform,
+        'conv-1',
+        '/tmp',
+        makeWorkflow({ provider: 'claude', model: ['@cx', 'large'] }),
+        'msg',
+        { conversationId: 'db-conv-1' },
+        {
+          modelOverrideLayer: {
+            kind: 'raw',
+            overrides: { aliases: { '@cx': 'codex/gpt-5.6-sol' } },
+          },
+        }
+      );
+      const warning = sentMessages(platform).find(message => message.includes('sets provider'));
+      expect(warning).toContain("model '@cx' resolves to provider 'codex'");
     });
 
     it('keeps concurrent profiles isolated and leaves no residue', async () => {
@@ -3649,6 +3692,64 @@ describe('executeWorkflow', () => {
       expect(store.createWorkflowRun).not.toHaveBeenCalled();
     });
 
+    it('announces a resume with the count of nodes it skips', async () => {
+      const platform = makePlatform();
+      await executeWorkflow(
+        makeDeps(),
+        platform,
+        'conv-1',
+        '/tmp',
+        makeWorkflow(),
+        'test message',
+        { conversationId: 'db-conv-1' },
+        {
+          preCreatedRun: makeRun({ id: 'prior-run', status: 'running' }),
+          priorCompletedNodes: new Map([['node-a', { output: 'a-output' }]]),
+        }
+      );
+      expect(sentMessages(platform)).toContainEqual(
+        expect.stringContaining(
+          '**Resuming** workflow `test-workflow` — skipping 1 already-completed node(s).'
+        )
+      );
+    });
+
+    it('announces an interactive-loop resume when no node has completed', async () => {
+      const platform = makePlatform();
+      await executeWorkflow(
+        makeDeps(),
+        platform,
+        'conv-1',
+        '/tmp',
+        makeWorkflow(),
+        'test message',
+        { conversationId: 'db-conv-1' },
+        {
+          preCreatedRun: makeRun({ id: 'paused-loop-run', status: 'running' }),
+          priorCompletedNodes: new Map(),
+        }
+      );
+      expect(sentMessages(platform)).toContainEqual(
+        expect.stringContaining('— continuing interactive loop.')
+      );
+    });
+
+    it('does not announce a resume on a fresh run', async () => {
+      const platform = makePlatform();
+      await executeWorkflow(
+        makeDeps(),
+        platform,
+        'conv-1',
+        '/tmp',
+        makeWorkflow(),
+        'test message',
+        {
+          conversationId: 'db-conv-1',
+        }
+      );
+      expect(sentMessages(platform).some(message => message.includes('Resuming'))).toBe(false);
+    });
+
     it('rejects prior node sessions owned by a different workflow run at ingress', async () => {
       const preCreatedRun = makeRun({ id: 'run-a', status: 'running' });
       const foreignSession: WorkflowRunNodeSession = {
@@ -3690,15 +3791,17 @@ describe('executeWorkflow', () => {
       const completedNodeOutputs = new Map([['node-a', { output: 'first output' }]]);
       const tokens = { input: 40, output: 4 };
       const costUsd = 0.25;
+      const snapshot: DagResumeSnapshot = {
+        completedNodeOutputs,
+        fanOutSnapshots: new Map(),
+        failedNodes: new Map(),
+        unresolvedNodeStarts: new Set<string>(),
+        budget: { workUnits: 0, spendUsd: 0 },
+        tokens,
+        costUsd,
+      };
       const store = makeStore({
-        getDagResumeSnapshot: mock(async () => ({
-          completedNodeOutputs,
-          fanOutSnapshots: new Map(),
-          unresolvedNodeStarts: new Set<string>(),
-          budget: { workUnits: 0, spendUsd: 0 },
-          tokens,
-          costUsd,
-        })),
+        getDagResumeSnapshot: mock(async () => snapshot),
         listWorkflowRunNodeSessions: mock(async () => [
           {
             workflow_run_id: 'failed-run',
@@ -3730,9 +3833,7 @@ describe('executeWorkflow', () => {
 
       const dagCall = mockExecuteDagWorkflow.mock.calls[0];
       expect(dagCall?.[0].priorCompletedNodes).toBe(completedNodeOutputs);
-      // Both usage axes travel as one `priorUsage` bundle (#2469) — cost is restored
-      // across resume exactly like tokens, so a resumed run's total never regresses.
-      expect(dagCall?.[0].priorUsage).toEqual({ tokens, costUsd });
+      expect(dagCall?.[0].priorUsage).toBe(snapshot);
       expect(dagCall?.[0].priorNodeSessions).toEqual(hydrated.priorNodeSessions);
       expect(store.createWorkflowRun).not.toHaveBeenCalled();
     });
@@ -3942,13 +4043,11 @@ describe('executeWorkflow', () => {
         { conversationId: 'db-conv-1' }
       );
       // Positional arg 20 = scopeArtifactsDir (after workflowPreset). Root is the
-      // unregistered-cwd project (`_cwd/tmp`, #2200); scope = workflow name +
+      // unregistered-cwd project (`@cwd/<basename>-<digest>`, #2200); scope = workflow name +
       // conversation UUID ('conv-1' from the createWorkflowRun mock;
       // getScopeArtifactsPath is mocked to `${root}/scopes/${wf}/${scope}`).
       const scopeArg = mockExecuteDagWorkflow.mock.calls[0]?.[0].scopeArtifactsDir;
-      expect(scopeArg).toBe(
-        wsPath('_cwd', 'tmp', 'artifacts', 'scopes', 'test-workflow', 'conv-1')
-      );
+      expect(scopeArg).toBe(cwdPath('/tmp', 'artifacts', 'scopes', 'test-workflow', 'conv-1'));
     });
 
     it('passes undefined scopeArtifactsDir when the workflow uses no session persistence', async () => {
@@ -4326,131 +4425,8 @@ describe('executeWorkflow', () => {
       });
     }
 
-    describe('gh shim activation', () => {
-      let previousPort: string | undefined;
-      beforeEach(() => {
-        previousPort = process.env.ARCHON_PORT;
-      });
-      afterEach(() => {
-        if (previousPort === undefined) delete process.env.ARCHON_PORT;
-        else process.env.ARCHON_PORT = previousPort;
-      });
-
-      function githubDeps(perUser?: { token: string | undefined }): Parameters<
-        typeof resolveWorkflowGithubEnvironment
-      >[0] & {
-        githubApp: { installCliShim: ReturnType<typeof mock> };
-      } {
-        return {
-          store: {
-            getCodebase: mock(async () => ({
-              id: 'codebase-1',
-              name: 'demo',
-              repository_url: 'https://github.com/acme/demo',
-              default_cwd: '/tmp',
-              kind: 'repo' as const,
-            })),
-          },
-          githubApp: {
-            resolveInstallationToken: mock(async () => 'ghs_dispatch'),
-            installCliShim: mock(() => '/archon/bin/gh-shim'),
-          },
-          isPerUserGitHubEnabled: () => perUser !== undefined,
-          getUserGithubToken: mock(async () => perUser?.token),
-        };
-      }
-
-      it.skipIf(process.platform === 'win32')(
-        'puts the shim first on PATH when ARCHON_PORT names the App server',
-        async () => {
-          process.env.ARCHON_PORT = '3090';
-          const deps = githubDeps();
-          const environment = await resolveWorkflowGithubEnvironment(
-            deps,
-            'codebase-1',
-            undefined,
-            {
-              envVars: { PATH: '/run/bin' },
-            }
-          );
-          expect(environment.envVars).toEqual({
-            GH_TOKEN: 'ghs_dispatch',
-            GITHUB_TOKEN: 'ghs_dispatch',
-            PATH: `/archon/bin/gh-shim${delimiter}/run/bin`,
-            ARCHON_PORT: '3090',
-            ARCHON_GITHUB_APP_REPO: 'acme/demo',
-          });
-          expect(environment.protectedEnvKeys).toEqual(['GH_TOKEN', 'GITHUB_TOKEN']);
-        }
-      );
-
-      it.skipIf(process.platform === 'win32')(
-        'keeps the dispatch token and warns once without ARCHON_PORT',
-        async () => {
-          delete process.env.ARCHON_PORT;
-          const deps = githubDeps();
-          mockLogFn.mockClear();
-          const environment = await resolveWorkflowGithubEnvironment(
-            deps,
-            'codebase-1',
-            undefined,
-            {}
-          );
-          expect(environment.envVars).toEqual({
-            GH_TOKEN: 'ghs_dispatch',
-            GITHUB_TOKEN: 'ghs_dispatch',
-          });
-          expect(deps.githubApp.installCliShim).not.toHaveBeenCalled();
-          const warnings = (mockLogFn.mock.calls as unknown[][]).filter(
-            call => call[1] === 'workflow.gh_token_refresh_unavailable'
-          );
-          expect(warnings).toEqual([
-            [
-              { repo: 'acme/demo', reason: 'archon_port_unset' },
-              'workflow.gh_token_refresh_unavailable',
-            ],
-          ]);
-        }
-      );
-
-      for (const [name, token, expected] of [
-        ['a per-user token', 'gho_user', 'gho_user'],
-        ['the per-user scrub', undefined, ''],
-      ] as const) {
-        it(`leaves ${name} unrefreshed`, async () => {
-          process.env.ARCHON_PORT = '3090';
-          const deps = githubDeps({ token });
-          const environment = await resolveWorkflowGithubEnvironment(deps, 'codebase-1', 'u-1', {});
-          expect(environment.envVars?.GH_TOKEN).toBe(expected);
-          expect(environment.envVars).not.toHaveProperty('PATH');
-          expect(environment.envVars).not.toHaveProperty('ARCHON_GITHUB_APP_REPO');
-          expect(deps.githubApp.installCliShim).not.toHaveBeenCalled();
-        });
-      }
-
-      it('hides stored logins from the per-user scrub without redacting its config values', async () => {
-        const environment = await resolveWorkflowGithubEnvironment(
-          githubDeps({ token: undefined }),
-          'codebase-1',
-          'u-1',
-          {}
-        );
-        expect(environment.envVars?.GH_CONFIG_DIR).toContain('archon-gh-scrubbed-');
-        expect(environment.envVars?.GIT_CONFIG_PARAMETERS).toBe("'credential.helper='");
-        // Only secrets are protected: protecting the scrub's config values would redact
-        // them, and every `credential.helper` mention, from node output.
-        expect(environment.protectedEnvKeys).toEqual([
-          'GH_TOKEN',
-          'GITHUB_TOKEN',
-          'GH_ENTERPRISE_TOKEN',
-          'GITHUB_ENTERPRISE_TOKEN',
-          'COPILOT_GITHUB_TOKEN',
-        ]);
-      });
-    });
-
     it('removes stale credential files before a credential refresh failure', async () => {
-      const artifactsDir = wsPath('_cwd', 'tmp', 'artifacts', 'runs', 'run-123');
+      const artifactsDir = cwdPath('/tmp', 'artifacts', 'runs', 'run-123');
       const codexAuthPath = join(artifactsDir, 'codex-home', 'auth.json');
       const piAuthPath = join(artifactsDir, 'pi-home', 'auth.json');
       await mkdir(dirname(codexAuthPath), { recursive: true });
@@ -4571,8 +4547,7 @@ describe('executeWorkflow', () => {
   // -------------------------------------------------------------------------
 
   describe('lock cleanup on failure paths', () => {
-    // resumeWorkflowRun DB-error coverage lives in the hydrateResumableRun
-    // suite — those errors surface at the caller now, not in the executor.
+    // resumeWorkflowRun DB-error coverage lives in run-resume.test.ts — those errors surface at the caller now, not in the executor.
 
     it('cancels workflowRun when guard query throws (no zombie row)', async () => {
       const cancelSpy = mock(async () => ({ cancelled: true }));
@@ -5584,753 +5559,6 @@ describe('telemetry wiring', () => {
   });
 });
 
-// ───────────────────────────────────────────────────────────────────────────
-// hydrateResumableRun
-//
-// Resume preparation is a caller-side primitive: callers look up the
-// candidate themselves (via findResumableRun or
-// findResumableRunByParentConversation) and call hydrateResumableRun to
-// turn it into the form executeWorkflow expects. The executor only consumes
-// what this returns.
-// ───────────────────────────────────────────────────────────────────────────
-
-describe('hydrateResumableRun', () => {
-  it('inspects resumable state without claiming the run', async () => {
-    const candidate = makeRun({ id: 'read-only-prior', status: 'paused' });
-    const priorNodes = new Map([['n1', { output: 'out1' }]]);
-    const store = makeStore({
-      getDagResumeSnapshot: mock(async () => ({
-        completedNodeOutputs: priorNodes,
-        fanOutSnapshots: new Map(),
-        unresolvedNodeStarts: new Set<string>(),
-        budget: { workUnits: 0, spendUsd: 0 },
-        tokens: { input: 4, output: 1 },
-        costUsd: 0.1,
-      })),
-    });
-
-    const result = await inspectResumableRun(makeDeps(store), candidate);
-
-    expect(result).toEqual({
-      priorCompletedNodes: priorNodes,
-      priorUsage: { tokens: { input: 4, output: 1 }, costUsd: 0.1 },
-    });
-    expect(store.resumeWorkflowRun).not.toHaveBeenCalled();
-    expect(store.listWorkflowRunNodeSessions).not.toHaveBeenCalled();
-  });
-
-  it('returns hydrated run + prior outputs for a candidate with completed nodes', async () => {
-    const candidate = makeRun({ id: 'prior-failed', status: 'failed' });
-    const resumed = makeRun({ id: 'prior-failed', status: 'running' });
-    const priorNodes = new Map([['n1', { output: 'out1' }]]);
-    const store = makeStore({
-      getDagResumeSnapshot: mock(async () => ({
-        completedNodeOutputs: priorNodes,
-        fanOutSnapshots: new Map(),
-        unresolvedNodeStarts: new Set<string>(),
-        budget: { workUnits: 0, spendUsd: 0 },
-        tokens: { input: 40, output: 4 },
-        costUsd: 0.75,
-      })),
-      listWorkflowRunNodeSessions: mock(async () => [
-        {
-          workflow_run_id: 'prior-failed',
-          node_id: 'n1',
-          provider: 'claude',
-          provider_session_id: 'session-n1',
-          created_at: '2026-08-19T00:00:00Z',
-          updated_at: '2026-08-19T00:00:00Z',
-        },
-        {
-          workflow_run_id: 'prior-failed',
-          node_id: 'not-completed',
-          provider: 'claude',
-          provider_session_id: 'must-be-filtered',
-          created_at: '2026-08-19T00:00:00Z',
-          updated_at: '2026-08-19T00:00:00Z',
-        },
-      ]),
-      resumeWorkflowRun: mock(async () => resumed),
-    });
-    const deps = makeDeps(store);
-    const result = await hydrateResumableRun(deps, candidate);
-    expect(result).not.toBeNull();
-    expect(result?.preCreatedRun).toBe(resumed);
-    expect(result?.priorCompletedNodes).toBe(priorNodes);
-    expect(result?.priorUsage).toEqual({ tokens: { input: 40, output: 4 }, costUsd: 0.75 });
-    expect(result?.priorNodeSessions.map(row => row.node_id)).toEqual(['n1']);
-    expect(store.listWorkflowRunNodeSessions).toHaveBeenCalledWith('prior-failed');
-    expect(store.resumeWorkflowRun).toHaveBeenCalledWith('prior-failed');
-  });
-
-  it('returns null when candidate has no completed nodes and no interactive-loop state', async () => {
-    const candidate = makeRun({ id: 'empty-prior', status: 'failed' });
-    const store = makeStore({
-      getDagResumeSnapshot: mock(async () => ({
-        completedNodeOutputs: new Map(),
-        fanOutSnapshots: new Map(),
-        unresolvedNodeStarts: new Set<string>(),
-        budget: { workUnits: 0, spendUsd: 0 },
-        tokens: { input: 0, output: 0 },
-        costUsd: 0,
-      })),
-    });
-    const deps = makeDeps(store);
-    const result = await hydrateResumableRun(deps, candidate);
-    expect(result).toBeNull();
-    // Must not transition the run — there is nothing to resume.
-    expect(store.resumeWorkflowRun).not.toHaveBeenCalled();
-  });
-
-  it('hydrates fan-out-only recovery state before any inner node completed', async () => {
-    const fanOutSnapshots = new Map([
-      [
-        'fan',
-        [
-          {
-            ordinal: 0,
-            identity: 'instance-a',
-            item: 'a',
-            inputs: { item: 'a' },
-          },
-        ],
-      ],
-    ]);
-    const candidate = makeRun({ id: 'fan-out-only', status: 'failed' });
-    const resumed = makeRun({ id: 'fan-out-only', status: 'running' });
-    const store = makeStore({
-      getDagResumeSnapshot: mock(async () => ({
-        completedNodeOutputs: new Map(),
-        fanOutSnapshots,
-        unresolvedNodeStarts: new Set(['fan__instance-a']),
-        budget: { workUnits: 0, spendUsd: 0 },
-        tokens: { input: 0, output: 0 },
-        costUsd: 0,
-      })),
-      resumeWorkflowRun: mock(async () => resumed),
-    });
-
-    const result = await hydrateResumableRun(makeDeps(store), candidate);
-
-    expect(result).not.toBeNull();
-    expect(store.resumeWorkflowRun).toHaveBeenCalledWith('fan-out-only');
-  });
-
-  it('returns hydrated run when interactive-loop state is present even with zero completed nodes', async () => {
-    const candidate = makeRun({
-      id: 'paused-loop',
-      status: 'paused',
-      metadata: {
-        approval: { type: 'interactive_loop', nodeId: 'loop-1', message: 'Iterate?', iteration: 2 },
-      },
-    });
-    const resumed = makeRun({ id: 'paused-loop', status: 'running' });
-    const store = makeStore({
-      getDagResumeSnapshot: mock(async () => ({
-        completedNodeOutputs: new Map(),
-        fanOutSnapshots: new Map(),
-        unresolvedNodeStarts: new Set<string>(),
-        budget: { workUnits: 0, spendUsd: 0 },
-        tokens: { input: 0, output: 0 },
-        costUsd: 0,
-      })),
-      resumeWorkflowRun: mock(async () => resumed),
-    });
-    const deps = makeDeps(store);
-    const result = await hydrateResumableRun(deps, candidate);
-    expect(result).not.toBeNull();
-    expect(result?.priorCompletedNodes.size).toBe(0);
-    expect(store.resumeWorkflowRun).toHaveBeenCalledWith('paused-loop');
-  });
-
-  it.each([
-    [
-      'first-node wait',
-      'paused',
-      {
-        wait: {
-          owner: 'node',
-          nodeId: 'delay',
-          kind: 'time',
-          waitingSince: '2026-08-24T10:00:00.000Z',
-          resumeAt: '2026-08-24T11:00:00.000Z',
-        },
-      },
-    ],
-    [
-      'first-node quota continuation',
-      'failed',
-      {
-        scheduled_resume: {
-          reason: 'quota',
-          resumeAt: '2026-08-24T11:00:00.000Z',
-          deadlineAt: '2026-08-25T11:00:00.000Z',
-          attempt: 1,
-          maxAttempts: 1,
-          error: 'usage limit reached',
-        },
-      },
-    ],
-  ] as const)('hydrates a %s with zero completed nodes', async (_label, status, metadata) => {
-    const candidate = makeRun({ id: 'first-node-continuation', status, metadata });
-    const resumed = makeRun({ id: 'first-node-continuation', status: 'running', metadata });
-    const store = makeStore({
-      getDagResumeSnapshot: mock(async () => ({
-        completedNodeOutputs: new Map(),
-        fanOutSnapshots: new Map(),
-        unresolvedNodeStarts: new Set<string>(),
-        budget: { workUnits: 0, spendUsd: 0 },
-        tokens: { input: 0, output: 0 },
-        costUsd: 0,
-      })),
-      resumeWorkflowRun: mock(async () => resumed),
-    });
-
-    const result = await hydrateResumableRun(makeDeps(store), candidate);
-
-    expect(result).not.toBeNull();
-    expect(result?.priorCompletedNodes.size).toBe(0);
-    expect(store.resumeWorkflowRun).toHaveBeenCalledWith('first-node-continuation');
-  });
-
-  it('#2714 regression: resumes a first-node legacy on_reject gate with a genuinely staged rework, even with zero completed nodes', async () => {
-    // rejectWorkflow's stage-rework path (workflow-operations.ts) never writes
-    // node_completed — it only stamps metadata.approval.resolved/rejection_reason
-    // on the run. Before the reRunsOwnNodeOnResume fix, a first-node gate in
-    // this state was unresumable: priorCompletedNodes.size === 0 and the old
-    // hasReRunGateState check omitted 'approval' entirely.
-    const candidate = makeRun({
-      id: 'paused-first-gate',
-      status: 'paused',
-      metadata: {
-        approval: {
-          type: 'approval',
-          nodeId: 'review',
-          message: 'Please review',
-          resolved: 'rejected',
-          onRejectPrompt: 'Fix: $REJECTION_REASON',
-        },
-        rejection_reason: 'needs more tests',
-        rejection_count: 1,
-      },
-    });
-    const resumed = makeRun({ id: 'paused-first-gate', status: 'running' });
-    const store = makeStore({
-      getDagResumeSnapshot: mock(async () => ({
-        completedNodeOutputs: new Map(),
-        fanOutSnapshots: new Map(),
-        unresolvedNodeStarts: new Set<string>(),
-        budget: { workUnits: 0, spendUsd: 0 },
-        tokens: { input: 0, output: 0 },
-        costUsd: 0,
-      })),
-      resumeWorkflowRun: mock(async () => resumed),
-    });
-    const deps = makeDeps(store);
-    const result = await hydrateResumableRun(deps, candidate);
-    expect(result).not.toBeNull();
-    expect(result?.priorCompletedNodes.size).toBe(0);
-    expect(store.resumeWorkflowRun).toHaveBeenCalledWith('paused-first-gate');
-  });
-
-  it('#2714: an unresolved (not-yet-rejected) legacy on_reject gate with zero completed nodes is NOT resumable', async () => {
-    // A fresh pause (nobody has rejected it yet) has onRejectPrompt set but no
-    // rejection_reason and resolved !== 'rejected' — there is nothing staged
-    // to re-run, so this must still return null (approve/reject, not resume,
-    // is the correct next action).
-    const candidate = makeRun({
-      id: 'paused-unresolved-gate',
-      status: 'paused',
-      metadata: {
-        approval: {
-          type: 'approval',
-          nodeId: 'review',
-          message: 'Please review',
-          onRejectPrompt: 'Fix: $REJECTION_REASON',
-        },
-      },
-    });
-    const store = makeStore({
-      getDagResumeSnapshot: mock(async () => ({
-        completedNodeOutputs: new Map(),
-        fanOutSnapshots: new Map(),
-        unresolvedNodeStarts: new Set<string>(),
-        budget: { workUnits: 0, spendUsd: 0 },
-        tokens: { input: 0, output: 0 },
-        costUsd: 0,
-      })),
-    });
-    const deps = makeDeps(store);
-    const result = await hydrateResumableRun(deps, candidate);
-    expect(result).toBeNull();
-    expect(store.resumeWorkflowRun).not.toHaveBeenCalled();
-  });
-
-  it('#2707 new-mode gate needs no carve-out: resolving it writes node_completed, so priorCompletedNodes already covers resume', async () => {
-    // A new-mode gate (no onRejectPrompt) never stages anything outside a
-    // node_completed event — this is the structural closure argument for
-    // #2714: the bug's mechanism (resolved-but-zero-completed-nodes) cannot
-    // occur for this path. Simulated here via the ORDINARY completed-nodes
-    // route, not the gate-state carve-out.
-    const candidate = makeRun({ id: 'paused-new-mode-gate', status: 'paused' });
-    const resumed = makeRun({ id: 'paused-new-mode-gate', status: 'running' });
-    const priorNodes = new Map([
-      ['review', { output: JSON.stringify({ decision: 'reject', text: 'needs changes' }) }],
-    ]);
-    const store = makeStore({
-      getDagResumeSnapshot: mock(async () => ({
-        completedNodeOutputs: priorNodes,
-        fanOutSnapshots: new Map(),
-        unresolvedNodeStarts: new Set<string>(),
-        budget: { workUnits: 0, spendUsd: 0 },
-        tokens: { input: 0, output: 0 },
-        costUsd: 0,
-      })),
-      resumeWorkflowRun: mock(async () => resumed),
-    });
-    const deps = makeDeps(store);
-    const result = await hydrateResumableRun(deps, candidate);
-    expect(result).not.toBeNull();
-    expect(result?.priorCompletedNodes).toBe(priorNodes);
-  });
-
-  it('propagates DB errors from getDagResumeSnapshot (no silent fallback)', async () => {
-    const candidate = makeRun({ id: 'prior-failed', status: 'failed' });
-    const store = makeStore({
-      getDagResumeSnapshot: mock(async () => {
-        throw new Error('DB read failed');
-      }),
-    });
-    const deps = makeDeps(store);
-    await expect(hydrateResumableRun(deps, candidate)).rejects.toThrow('DB read failed');
-  });
-
-  it('propagates DB errors from resumeWorkflowRun (no silent fallback)', async () => {
-    const candidate = makeRun({ id: 'prior-failed', status: 'failed' });
-    const store = makeStore({
-      getDagResumeSnapshot: mock(async () => ({
-        completedNodeOutputs: new Map([['n1', { output: 'v1' }]]),
-        fanOutSnapshots: new Map(),
-        unresolvedNodeStarts: new Set<string>(),
-        budget: { workUnits: 0, spendUsd: 0 },
-        tokens: { input: 0, output: 0 },
-        costUsd: 0,
-      })),
-      resumeWorkflowRun: mock(async () => {
-        throw new Error('DB write failed');
-      }),
-    });
-    const deps = makeDeps(store);
-    await expect(hydrateResumableRun(deps, candidate)).rejects.toThrow('DB write failed');
-  });
-});
-
-describe('resolveProjectPaths', () => {
-  const RUN_ID = 'run-xyz';
-
-  it('routes folder projects to _folder/<slug>/ storage', async () => {
-    const store = makeStore({
-      getCodebase: mock(async () => ({
-        id: 'cb-folder',
-        name: 'My Platform',
-        repository_url: null,
-        default_cwd: '/tmp/platform',
-        kind: 'folder' as const,
-      })),
-    });
-    const deps = makeDeps(store);
-
-    const paths = await resolveProjectPaths(deps, '/tmp/platform', RUN_ID, 'cb-folder');
-
-    expect(paths.artifactsDir).toBe(
-      wsPath('_folder', 'My Platform', 'artifacts', 'runs', 'run-xyz')
-    );
-    expect(paths.logDir).toBe(wsPath('_folder', 'My Platform', 'logs'));
-    expect(paths.artifactsRoot).toBe(wsPath('_folder', 'My Platform', 'artifacts'));
-    expect(paths.stateDir).toBe(wsPath('_folder', 'My Platform', 'state'));
-    expect(paths.outputRoot).toBe(wsPath('_folder', 'My Platform'));
-  });
-
-  // #2304: a transient lookup fault used to drop the run onto `_cwd/<basename>` and,
-  // because `output_root` is write-once, pin it there for the run's whole life —
-  // including its `$STATE_DIR`, so a stateful workflow silently read an empty state
-  // directory. Asserting the RESOLVED PATH rather than the call count: the failure is
-  // success-shaped (a valid location, no error), so only the destination proves it.
-  it('retries a transient getCodebase fault instead of pinning the cwd fallback (#2304)', async () => {
-    let calls = 0;
-    const store = makeStore({
-      getCodebase: mock(async () => {
-        calls++;
-        if (calls === 1) throw new Error('connection reset by peer');
-        return {
-          id: 'cb-repo',
-          name: 'acme/widget',
-          repository_url: 'https://github.com/acme/widget',
-          default_cwd: '/repos/widget',
-          kind: 'repo' as const,
-        };
-      }),
-    });
-    const deps = makeDeps(store);
-
-    const result = await resolveProjectPaths(deps, '/repos/widget', RUN_ID, 'cb-repo');
-
-    expect(calls).toBe(2);
-    expect(result.artifactsDir).toBe(wsPath('acme', 'widget', 'artifacts', 'runs', 'run-xyz'));
-    expect(result.stateDir).toBe(wsPath('acme', 'widget', 'state'));
-    expect(result.outputRoot).toBe(wsPath('acme', 'widget'));
-  });
-
-  // The retry addresses the TRANSIENT case only. A sustained fault must still reach the
-  // fallback rather than throwing — the fallback exists precisely so a registry outage
-  // does not kill a run, and that trade was settled before #2304.
-  it('still falls back to cwd storage when the fault persists across the retry', async () => {
-    let calls = 0;
-    const store = makeStore({
-      getCodebase: mock(async () => {
-        calls++;
-        throw new Error('connection reset by peer');
-      }),
-    });
-    const deps = makeDeps(store);
-
-    const result = await resolveProjectPaths(deps, '/repos/widget', RUN_ID, 'cb-repo');
-
-    expect(calls).toBe(2);
-    expect(result.artifactsDir).toBe(wsPath('_cwd', 'widget', 'artifacts', 'runs', 'run-xyz'));
-  });
-
-  it('routes repo projects to owner/repo/ storage (unchanged)', async () => {
-    const store = makeStore({
-      getCodebase: mock(async () => ({
-        id: 'cb-repo',
-        name: 'acme/widget',
-        repository_url: 'https://github.com/acme/widget',
-        default_cwd: '/repos/widget',
-        kind: 'repo' as const,
-      })),
-    });
-    const deps = makeDeps(store);
-
-    const result = await resolveProjectPaths(deps, '/repos/widget', RUN_ID, 'cb-repo');
-
-    expect(result.artifactsDir).toBe(wsPath('acme', 'widget', 'artifacts', 'runs', 'run-xyz'));
-    expect(result.logDir).toBe(wsPath('acme', 'widget', 'logs'));
-    expect(result.artifactsRoot).toBe(wsPath('acme', 'widget', 'artifacts'));
-    expect(result.stateDir).toBe(wsPath('acme', 'widget', 'state'));
-    expect(result.outputRoot).toBe(wsPath('acme', 'widget'));
-  });
-
-  it('routes a no-remote local repo to _local/<basename> storage (#2132)', async () => {
-    const paths = await import('@archon/paths');
-    const store = makeStore({
-      getCodebase: mock(async () => ({
-        id: 'cb-local',
-        name: 'workspace',
-        repository_url: null,
-        default_cwd: '/home/username/workspace',
-        kind: 'repo' as const,
-      })),
-    });
-    const deps = makeDeps(store);
-
-    const result = await resolveProjectPaths(deps, '/home/username/workspace', RUN_ID, 'cb-local');
-
-    // Delegates to the ONE shared resolver rather than re-deriving identity.
-    expect(paths.resolveProjectStorageKey).toHaveBeenCalled();
-    expect(result.artifactsDir).toBe(wsPath('_local', 'workspace', 'artifacts', 'runs', 'run-xyz'));
-    expect(result.logDir).toBe(wsPath('_local', 'workspace', 'logs'));
-    expect(result.stateDir).toBe(wsPath('_local', 'workspace', 'state'));
-  });
-
-  it('routes an unregistered cwd to _cwd/<basename> UNDER ARCHON_HOME, never into the repo', async () => {
-    const store = makeStore({ getCodebase: mock(async () => null) });
-    const deps = makeDeps(store);
-
-    const result = await resolveProjectPaths(deps, '/some/cwd', RUN_ID, 'missing-id');
-
-    // Breaking change (#2200 A4): this used to be <cwd>/.archon/artifacts/...
-    expect(result.artifactsDir).toBe(wsPath('_cwd', 'cwd', 'artifacts', 'runs', 'run-xyz'));
-    expect(result.logDir).toBe(wsPath('_cwd', 'cwd', 'logs'));
-    expect(result.stateDir).toBe(wsPath('_cwd', 'cwd', 'state'));
-    // Positive form: asserting only `!startsWith('/some/cwd')` passes trivially
-    // on win32 (where the result is backslash-separated), so assert the path is
-    // actually rooted in the workspace tree.
-    expect(result.artifactsDir.startsWith(wsPath('_cwd'))).toBe(true);
-  });
-
-  it('routes to _cwd/<basename> when no codebaseId is provided', async () => {
-    const deps = makeDeps();
-
-    const result = await resolveProjectPaths(deps, '/some/cwd', RUN_ID);
-
-    expect(result.artifactsDir).toBe(wsPath('_cwd', 'cwd', 'artifacts', 'runs', 'run-xyz'));
-    expect(result.logDir).toBe(wsPath('_cwd', 'cwd', 'logs'));
-    expect(result.artifactsRoot).toBe(wsPath('_cwd', 'cwd', 'artifacts'));
-    expect(result.stateDir).toBe(wsPath('_cwd', 'cwd', 'state'));
-  });
-
-  it('still returns all five paths when the codebase lookup throws', async () => {
-    const store = makeStore({
-      getCodebase: mock(() => Promise.reject(new Error('db down'))),
-    });
-    const deps = makeDeps(store);
-
-    const result = await resolveProjectPaths(deps, '/some/cwd', RUN_ID, 'cb-boom');
-
-    expect(result.artifactsDir).toBe(wsPath('_cwd', 'cwd', 'artifacts', 'runs', 'run-xyz'));
-    expect(result.stateDir).toBe(wsPath('_cwd', 'cwd', 'state'));
-    expect(result.outputRoot).toBe(wsPath('_cwd', 'cwd'));
-  });
-
-  it('a persisted output_root short-circuits identity resolution entirely', async () => {
-    const paths = await import('@archon/paths');
-    const getCodebase = mock(async () => ({
-      id: 'cb-repo',
-      name: 'acme/renamed-since',
-      repository_url: null,
-      default_cwd: '/repos/widget',
-      kind: 'repo' as const,
-    }));
-    const deps = makeDeps(makeStore({ getCodebase }));
-    (paths.resolveProjectStorageKey as ReturnType<typeof mock>).mockClear();
-
-    const result = await resolveProjectPaths(deps, '/repos/widget', RUN_ID, 'cb-repo', {
-      persistedOutputRoot: wsPath('acme', 'original'),
-    });
-
-    // The codebase was renamed since the run started — the durable pointer wins
-    // and the row is never even read (#1192 decoupling).
-    expect(getCodebase).not.toHaveBeenCalled();
-    expect(paths.resolveProjectStorageKey).not.toHaveBeenCalled();
-    expect(result.outputRoot).toBe(wsPath('acme', 'original'));
-    expect(result.artifactsDir).toBe(wsPath('acme', 'original', 'artifacts', 'runs', 'run-xyz'));
-    expect(result.logDir).toBe(wsPath('acme', 'original', 'logs'));
-    expect(result.stateDir).toBe(wsPath('acme', 'original', 'state'));
-  });
-
-  it('an output_root outside ARCHON_HOME is refused and re-derived', async () => {
-    // The engine only ever persists an in-tree root, so this is corruption or a
-    // hand edit. Acting on it would scatter artifacts AND shared state under the
-    // server's cwd. Two shapes that both escape: absolute-elsewhere and relative.
-    const store = makeStore({
-      getCodebase: mock(async () => ({
-        id: 'cb-repo',
-        name: 'acme/widget',
-        repository_url: null,
-        default_cwd: '/repos/widget',
-        kind: 'repo' as const,
-      })),
-    });
-    const deps = makeDeps(store);
-
-    for (const hostile of ['/etc', '   ', 'relative/path']) {
-      const result = await resolveProjectPaths(deps, '/repos/widget', RUN_ID, 'cb-repo', {
-        persistedOutputRoot: hostile,
-      });
-      expect(result.outputRoot).toBe(wsPath('acme', 'widget'));
-      expect(result.stateDir).toBe(wsPath('acme', 'widget', 'state'));
-    }
-  });
-
-  it('a null persisted output_root re-derives from identity', async () => {
-    const store = makeStore({
-      getCodebase: mock(async () => ({
-        id: 'cb-repo',
-        name: 'acme/widget',
-        repository_url: null,
-        default_cwd: '/repos/widget',
-        kind: 'repo' as const,
-      })),
-    });
-    const deps = makeDeps(store);
-
-    const result = await resolveProjectPaths(deps, '/repos/widget', RUN_ID, 'cb-repo', {
-      persistedOutputRoot: null,
-    });
-
-    expect(result.outputRoot).toBe(wsPath('acme', 'widget'));
-  });
-
-  // #2304: identityResolution is the row-level flag the persistence block reads to
-  // decide whether to write `output_root` or stamp `metadata.identity_unresolved`.
-  // The five cases below cover every branch in `resolveProjectPaths`:
-  //   • registered repo / folder / _local  → 'resolved'
-  //   • codebase row exists, no identity   → 'unregistered' (the WARN arm)
-  //   • no codebaseId                      → 'unregistered' (no lookup attempted)
-  //   • codebase lookup returns null       → 'unregistered' (no row)
-  //   • both attempts throw                → 'faulted' (the ERROR arm)
-  //   • persisted-output-root short-circuit → undefined (a resume, no fresh flag)
-  describe('identityResolution (#2304)', () => {
-    it('is "resolved" for a repo codebase', async () => {
-      const store = makeStore({
-        getCodebase: mock(async () => ({
-          id: 'cb-repo',
-          name: 'acme/widget',
-          repository_url: 'https://github.com/acme/widget',
-          default_cwd: '/repos/widget',
-          kind: 'repo' as const,
-        })),
-      });
-      const deps = makeDeps(store);
-
-      const result = await resolveProjectPaths(deps, '/repos/widget', RUN_ID, 'cb-repo');
-
-      expect(result.identityResolution).toBe('resolved');
-    });
-
-    it('is "resolved" for a folder codebase', async () => {
-      const store = makeStore({
-        getCodebase: mock(async () => ({
-          id: 'cb-folder',
-          name: 'My Platform',
-          repository_url: null,
-          default_cwd: '/tmp/platform',
-          kind: 'folder' as const,
-        })),
-      });
-      const deps = makeDeps(store);
-
-      const result = await resolveProjectPaths(deps, '/tmp/platform', RUN_ID, 'cb-folder');
-
-      expect(result.identityResolution).toBe('resolved');
-    });
-
-    it('is "unregistered" when the lookup returns a codebase row that resolves to a cwd key (WARN arm)', async () => {
-      // The fake resolver only falls back to { kind: 'cwd', cwd } when the basename
-      // is '.' or '..' (the corner that excludes owner/repo and `_local` derivation).
-      const store = makeStore({
-        getCodebase: mock(async () => ({
-          id: 'cb-noop',
-          name: 'orphan',
-          repository_url: null,
-          default_cwd: '/tmp/.',
-          kind: 'repo' as const,
-        })),
-      });
-      const deps = makeDeps(store);
-
-      const result = await resolveProjectPaths(deps, '/tmp/.', RUN_ID, 'cb-noop');
-
-      expect(result.identityResolution).toBe('unregistered');
-    });
-
-    it('is "unregistered" when no codebaseId is provided (no lookup attempted)', async () => {
-      const deps = makeDeps();
-
-      const result = await resolveProjectPaths(deps, '/some/cwd', RUN_ID);
-
-      expect(result.identityResolution).toBe('unregistered');
-    });
-
-    it('is "unregistered" when the lookup returns null (no codebase row)', async () => {
-      const store = makeStore({ getCodebase: mock(async () => null) });
-      const deps = makeDeps(store);
-
-      const result = await resolveProjectPaths(deps, '/some/cwd', RUN_ID, 'missing-id');
-
-      expect(result.identityResolution).toBe('unregistered');
-    });
-
-    it('is "faulted" when both getCodebase attempts throw (ERROR arm)', async () => {
-      const store = makeStore({
-        getCodebase: mock(async () => {
-          throw new Error('db down');
-        }),
-      });
-      const deps = makeDeps(store);
-
-      const result = await resolveProjectPaths(deps, '/some/cwd', RUN_ID, 'cb-boom');
-
-      expect(result.identityResolution).toBe('faulted');
-    });
-
-    it('is undefined on the persisted-output-root short-circuit (resume reading an existing row)', async () => {
-      // A resume reads its `output_root` from the row and re-derives nothing; the
-      // persistence block has nothing to flag on a branch that never resolved.
-      const store = makeStore();
-      const deps = makeDeps(store);
-
-      const result = await resolveProjectPaths(deps, '/repos/widget', RUN_ID, 'cb-repo', {
-        persistedOutputRoot: wsPath('acme', 'original'),
-      });
-
-      expect(result.identityResolution).toBeUndefined();
-      // The resolved paths still come from the persisted root, not from a fresh lookup.
-      expect(result.outputRoot).toBe(wsPath('acme', 'original'));
-    });
-  });
-});
-
-describe('resolveScopeArtifactsDir', () => {
-  // join()-built: getScopeArtifactsPath composes with join(), so a template
-  // literal expectation is forward-slashed and never matches on win32.
-  const ROOT = join('/tmp', 'artifacts-root');
-  const scopeDir = (wf: string, scope: string): string => join(ROOT, 'scopes', wf, scope);
-
-  it('returns the scope dir for a workflow with a persist_session node', () => {
-    const workflow = {
-      name: 'feature-dev',
-      nodes: [
-        {
-          id: 'planner',
-          kind: 'agent',
-          source: { kind: 'inline', prompt: 'plan' },
-          persist_session: true,
-        },
-      ] as WorkflowDefinition['nodes'],
-    };
-    expect(resolveScopeArtifactsDir(workflow, 'conv-1', ROOT)).toBe(
-      scopeDir('feature-dev', 'conv-1')
-    );
-  });
-
-  it('returns the scope dir for workflow-level persist_sessions', () => {
-    const workflow = {
-      name: 'feature-dev',
-      persist_sessions: true,
-      nodes: [
-        { id: 'planner', kind: 'agent', source: { kind: 'inline', prompt: 'plan' } },
-      ] as WorkflowDefinition['nodes'],
-    };
-    expect(resolveScopeArtifactsDir(workflow, 'conv-1', ROOT)).toBe(
-      scopeDir('feature-dev', 'conv-1')
-    );
-  });
-
-  it('returns undefined when the workflow uses no session persistence (opt-in)', () => {
-    const workflow = {
-      name: 'plain',
-      nodes: [
-        { id: 'a', kind: 'agent', source: { kind: 'inline', prompt: 'x' } },
-      ] as WorkflowDefinition['nodes'],
-    };
-    expect(resolveScopeArtifactsDir(workflow, 'conv-1', ROOT)).toBeUndefined();
-  });
-
-  it('returns undefined when the only AI node opts out with context: fresh', () => {
-    const workflow = {
-      name: 'feature-dev',
-      persist_sessions: true,
-      nodes: [
-        { id: 'a', kind: 'agent', source: { kind: 'inline', prompt: 'x' }, context: 'fresh' },
-        { id: 'b', kind: 'exec', runtime: 'sh', script: 'echo hi' },
-      ] as WorkflowDefinition['nodes'],
-    };
-    expect(resolveScopeArtifactsDir(workflow, 'conv-1', ROOT)).toBeUndefined();
-  });
-
-  it('returns undefined without a conversation scope (same guard as persistScopeKey)', () => {
-    const workflow = {
-      name: 'feature-dev',
-      persist_sessions: true,
-      nodes: [] as WorkflowDefinition['nodes'],
-    };
-    expect(resolveScopeArtifactsDir(workflow, null, ROOT)).toBeUndefined();
-    expect(resolveScopeArtifactsDir(workflow, undefined, ROOT)).toBeUndefined();
-  });
-});
-
 describe('run checkout baseline (#3305)', () => {
   let repo: string;
 
@@ -6527,6 +5755,35 @@ describe('credential preflight lifecycle', () => {
     expect(storedStatus).not.toHaveBeenCalled();
     expect(getUserProviderEnv).not.toHaveBeenCalled();
     expect(mockExecuteDagWorkflow).toHaveBeenCalledTimes(1);
+  });
+
+  it('checks native authentication in the run checkout and container before DAG entry', async () => {
+    const store = makeStore();
+    const deps = makeDeps(store);
+    const checkCredential = mock(async () => ({ state: 'not_connected', source: 'native' }));
+    deps.getAgentProvider = mock(() => ({
+      run: mock(async () => {}),
+      checkCredential,
+    })) as unknown as WorkflowDeps['getAgentProvider'];
+    mockExecuteDagWorkflow.mockClear();
+    const execContext = { kind: 'container', containerId: 'cid' } as const;
+    const result = await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv',
+      '/tmp/run-checkout',
+      makeWorkflow(),
+      'start',
+      { conversationId: 'db' },
+      { execContext }
+    );
+    if (result.success) throw new Error('Expected credential refusal');
+    expect(result.error).toStartWith("Credential preflight failed for provider 'claude'");
+    expect(checkCredential).toHaveBeenCalledWith(
+      expect.objectContaining({ cwd: '/tmp/run-checkout', execContext })
+    );
+    expect(mockExecuteDagWorkflow).not.toHaveBeenCalled();
+    expect(store.failWorkflowRun).toHaveBeenCalledWith('run-123', result.error, expect.anything());
   });
 
   it('a delivery refusal after a successful check blocks rather than using ambient credentials', async () => {

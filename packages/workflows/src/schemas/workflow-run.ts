@@ -37,7 +37,7 @@ import { isAbsolute } from 'path';
  * `'paused'` is treated as a still-live status for in-flight sibling node streaming:
  * a concurrent gate pausing the run must not tear down an unrelated node's
  * already-streaming output in the same topological layer. See
- * `shouldContinueStreamingForStatus` in dag-executor.ts, which encodes this policy.
+ * `shouldContinueStreamingForStatus` in dag/run-control.ts, which encodes this policy.
  */
 export const workflowRunStatusSchema = z.enum([
   'pending',
@@ -126,6 +126,7 @@ const workflowWaitAttentionFields = {
   answeredAt: z.string().datetime().optional(),
   labels: attentionLabelsSchema.optional(),
   revision: z.number().int().positive().optional(),
+  reaskedFrom: z.string().min(1).optional(), // occurrence whose answer was discarded as stale
 } as const;
 const workflowWaitNodeOwnerFields = {
   owner: z.literal('node'),
@@ -326,6 +327,10 @@ export type RunTerminalStatus = (typeof TERMINAL_STATUS_TUPLE)[number];
 export function isTerminalRunStatus(status: WorkflowRunStatus): status is RunTerminalStatus {
   return TERMINAL_STATUS_TUPLE.some(terminal => terminal === status);
 }
+
+/** Cancellation leaves these statuses untouched; failed runs remain cancellable because they can resume. */
+export const CANCELLATION_NOOP_WORKFLOW_STATUSES: readonly WorkflowRunStatus[] =
+  workflowRunStatusSchema.extract(['completed', 'cancelled']).options;
 
 /** Statuses that allow a user to resume execution. */
 export const RESUMABLE_WORKFLOW_STATUSES: readonly WorkflowRunStatus[] = [
@@ -677,7 +682,7 @@ export function readSubrunMetadata(metadata: Record<string, unknown> | undefined
  * now share a symbol instead of agreeing by luck.
  *
  * `identity_unresolved` — TRUE on a fresh run whose `output_root` was deliberately NOT
- *                       written because `resolveProjectPaths` returned the `_cwd/<basename>`
+ *                       written because `resolveProjectPaths` returned the `@cwd/<basename>-<digest>`
  *                       fallback AFTER `getCodebase` threw on both retry attempts (#2304).
  *                       Distinguishes "this run is on the cwd fallback because the codebase
  *                       had no owner/repo or `_local` identity" (legitimate, the WARN arm
@@ -1097,6 +1102,13 @@ const approvalContextBaseSchema = z.object({
    */
   signaledStructuredOutput: z.unknown().optional(),
   /**
+   * Single-node `loop` gate only. The paused iteration's (stripped) output, whether or not
+   * it signaled, restored on resume as the previous output that `$LOOP_PREV_OUTPUT` and
+   * until_bash read. A `loop_group` restores it from its body's persisted rows instead.
+   * Absent on gates paused by builds predating this field; those resume with it empty.
+   */
+  iterationOutput: z.string().optional(),
+  /**
    * Interactive-loop only, and written by the single-node `loop` gate ONLY. Cumulative
    * token usage through this pause, restored when the loop resumes so later gates and
    * terminal metadata retain every pre-gate iteration. The historical name remains for
@@ -1321,7 +1333,7 @@ export const runAttentionSchema = createRunAttentionSchema(z.date());
  * `blocked_on_child` is deliberately NOT an answer to "does someone need to respond".
  * A parent pauses blocked on a child whether that child is sitting on its own gate
  * or merely still running (`pauseParentOnChild` is reached from two sites in
- * dag-executor.ts, the second on a child that is `paused`, `running`, OR `pending`),
+ * `executeWorkflowNode`, the second on a child that is `paused`, `running`, OR `pending`),
  * and the parent row cannot tell those apart. Claiming `awaiting_response` here would
  * wake a host for normal progress; returning null would strand one when the child
  * really is on a gate. So the projection reports what it knows — this run is blocked
@@ -1567,7 +1579,7 @@ export function isAttentionQueueRow(run: RunAttentionInput): boolean {
  * - `interactive_loop` / `child_workflow` / `fan_out` — always true: these kinds
  *   are re-entered by the node executor's own re-read of its state,
  *   independent of `priorCompletedNodes` (`executeLoopNode`/
- *   `executeLoopGroupNode`/`executeWorkflowNode` in dag-executor.ts).
+ *   `executeLoopGroupNode`/`executeWorkflowNode` under dag/nodes/).
  * - `writeback` — always false: there is no DAG node behind this gate to
  *   re-run (`nodeId` is the synthetic `__writeback__`); resolving it flows
  *   through the container write-back resume path, never a node re-run.
