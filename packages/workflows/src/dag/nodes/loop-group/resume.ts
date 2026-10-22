@@ -1,3 +1,5 @@
+import { ParentStatusReadError } from '../../../parent-status-read';
+import { BASE_COMPLETION_CHANNELS } from '../../../schemas/loop';
 import { resolveBashPath } from '@archon/git';
 import { executeWaitNode } from '../wait/wait';
 import { snapshotBodySessionCursorAncestry } from '../../pause';
@@ -34,6 +36,7 @@ import {
 import { nodeTemplateReferences } from '../../references';
 import {
   findLoopGroupTerminalSuspendNode,
+  ownsTerminalWait,
   loopGroupIterationOutput,
   type LoopGroupBodyResult,
   type LoopGroupProgress,
@@ -331,13 +334,20 @@ export async function resumeTerminalWait(
       ...snapshotBodySessionCursorAncestry(resume.bodySessionCursorAncestry),
     }
   );
-  const status = await ctx.deps.store.getWorkflowRunStatus(ctx.workflowRun.id);
-  if (status === 'paused') {
+  let status;
+  try {
+    status = await ctx.deps.store.getWorkflowRunStatus(ctx.workflowRun.id);
+  } catch (cause) {
+    throw new ParentStatusReadError(ctx.workflowRun.id, node.id, cause);
+  }
+  if (ctx.containerPause?.publish !== undefined || status === 'paused') {
     return {
       state: 'running',
       output: '',
       loopIterations: resumeIteration,
-      suspensionPoint: 'wait',
+      ...((await ownsTerminalWait(run, resumeIteration, terminalNode.id))
+        ? { suspensionPoint: 'wait' as const }
+        : {}),
     };
   }
   ctx.nodeOutputs.set(bodyStepNamePrefix + terminalNode.id, waitOutput);
@@ -408,25 +418,39 @@ export async function completeEscalatedResume(
   if (currentBodyOutputs === undefined) return undefined;
   const terminalNode = findLoopGroupTerminalSuspendNode(bodyNodes);
   if (terminalNode === undefined || !currentBodyOutputs.has(terminalNode.id)) return undefined;
-  const group = run.node.loop_group;
   const resumedResult = loopGroupIterationOutput(bodyNodes, currentBodyOutputs);
   const rawIterationOutput = resumedResult?.output ?? '';
-  const resumedSignalDetected =
-    group.until !== undefined && detectCompletionSignal(rawIterationOutput, group.until);
-  let resumedBashComplete = false;
-  if (group.until_bash && !resumedSignalDetected) {
-    const previousBodyOutputs = await restorePreviousIteration(run);
-    const bash = await resumedUntilBash(
-      run,
-      group.until_bash,
-      currentBodyOutputs,
-      previousBodyOutputs
-    );
-    if (typeof bash !== 'boolean') return bash;
-    resumedBashComplete = bash;
-  }
-  if (!resumedSignalDetected && !resumedBashComplete) return undefined;
+  const completed = await resumedCompletion(run, currentBodyOutputs, rawIterationOutput);
+  if (typeof completed !== 'boolean') return completed;
+  if (!completed) return undefined;
   return completeResumedIteration(run, resumedResult, rawIterationOutput);
+}
+
+async function resumedCompletion(
+  run: LoopGroupRun,
+  currentBodyOutputs: Map<string, NodeOutput>,
+  rawIterationOutput: string
+): Promise<boolean | LoopGroupBodyResult> {
+  const group = run.node.loop_group;
+  for (const { field } of BASE_COMPLETION_CHANNELS) {
+    switch (field) {
+      case 'until':
+        if (group.until !== undefined && detectCompletionSignal(rawIterationOutput, group.until)) {
+          return true;
+        }
+        break;
+      case 'until_bash': {
+        if (group.until_bash === undefined) break;
+        const previousBodyOutputs = await restorePreviousIteration(run);
+        return resumedUntilBash(run, group.until_bash, currentBodyOutputs, previousBodyOutputs);
+      }
+      default: {
+        const unhandled: never = field;
+        return unhandled;
+      }
+    }
+  }
+  return false;
 }
 
 async function completeResumedIteration(
