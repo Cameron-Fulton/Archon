@@ -108,41 +108,31 @@ export const mockLogger = {
   child: mock(() => mockLogger),
 };
 
-export const mockDetachedTargetStop = mock((): Promise<void> => Promise.resolve());
+export const mockDetachedTargetStop = mock(async () => ({ warnings: [] }));
 export const mockDetachedTargetRelease = mock((): undefined => undefined);
 export const mockReclaimContainerEnv = mock((): Promise<void> => Promise.resolve());
 export const mockRequestDetachedRunStop = mock<typeof RunOwnerStop.requestDetachedRunStop>(() =>
   Promise.resolve({ pid: 4242, stop: mockDetachedTargetStop, release: mockDetachedTargetRelease })
 );
 export const mockRunLiveOwnerClose = mock((): Promise<void> => Promise.resolve());
-export const mockAssertDetachedRunProcessOwner = mock((): undefined => undefined);
+export const mockClaimDetachedRunProcessOwner = mock((): Promise<void> => Promise.resolve());
 let mockDetachedStopRequested = false;
 export function setMockDetachedStopRequested(value: boolean): void {
   mockDetachedStopRequested = value;
 }
-export const mockStartRunLiveOwner = mock(
-  (
-    _runId: string
-  ): Promise<{
-    close: typeof mockRunLiveOwnerClose;
-    isStopRequested: () => boolean;
-  }> =>
-    Promise.resolve({
-      close: mockRunLiveOwnerClose,
-      isStopRequested: (): boolean => mockDetachedStopRequested,
-    })
-);
+export const mockStartRunLiveOwner = mock<
+  typeof import('@archon/core/services/run-live-owner').startRunLiveOwner
+>(async () => ({
+  close: mockRunLiveOwnerClose,
+  isStopRequested: (): boolean => mockDetachedStopRequested,
+  registerTerminationPreparation: () => () => undefined,
+}));
 
-mock.module(
-  '../utils/detached-run-control',
-  (): {
-    assertDetachedRunProcessOwner: typeof mockAssertDetachedRunProcessOwner;
-    DETACHED_RUN_OWNER_ENV: string;
-  } => ({
-    assertDetachedRunProcessOwner: mockAssertDetachedRunProcessOwner,
-    DETACHED_RUN_OWNER_ENV: 'ARCHON_DETACHED_RUN_OWNER',
-  })
-);
+const realDetachedControl = { ...(await import('../utils/detached-run-control')) };
+mock.module('../utils/detached-run-control', () => ({
+  ...realDetachedControl,
+  claimDetachedRunProcessOwner: mockClaimDetachedRunProcessOwner,
+}));
 
 // Capture the real class before mock.module replaces the module, so the mock
 // can re-export it without a hand-declared copy that would silently drift.
@@ -578,7 +568,7 @@ mock.module('@archon/core/db/conversations', () => ({
 
 mock.module('@archon/core/db/codebases', () => ({
   findCodebaseByDefaultCwd: mock(() => Promise.resolve(null)),
-  listCodebases: mock(() => Promise.resolve([])),
+  listCodebaseClaims: mock(() => Promise.resolve([])),
   findCodebaseByPathPrefix: mock(() => Promise.resolve(null)),
   getCodebase: mock(() => Promise.resolve(null)),
 }));
@@ -828,6 +818,7 @@ mock.module('@archon/core/workflows/sql-host', () => ({
     createWorkflowOperations({
       getUserRole: async () => undefined,
       store: {
+        persistWorkflowEvent: mockPersistWorkflowEvent,
         signalWorkflowWait: (...args) => operationWorkflowDb.signalWorkflowWait(...args),
         deleteWorkflowRun: (...args) => operationWorkflowDb.deleteWorkflowRun(...args),
         getWorkflowRun: (...args) => operationWorkflowDb.getWorkflowRun(...args),

@@ -293,6 +293,18 @@ export async function createFileWorkflowHost(root: string): Promise<WorkflowHost
           row.status = 'destroyed';
           return { result: undefined, changes: { documents: { 'host/isolation.json': rows } } };
         }),
+      withWorktreeRegistration: (observed, remove) =>
+        commit(root, 'all', async () => {
+          const rows = await environments();
+          const row = rows.find(row => row.id === observed.id);
+          if (!row || row.status !== 'active' || !sameWorktreeRegistration(row, observed)) {
+            throw new WorktreeRegistrationChangedError(observed.id);
+          }
+          const result = await remove(async () => {
+            row.status = 'destroyed';
+          });
+          return { result, changes: { documents: { 'host/isolation.json': rows } } };
+        }),
       countActiveByCodebase: async id => (await records.isolation.listByCodebase(id)).length,
       listActive: async () => (await readEnvironments()).filter(row => row.status === 'active'),
       listByCodebase: async id =>
@@ -310,6 +322,14 @@ export async function createFileWorkflowHost(root: string): Promise<WorkflowHost
   const store = await createFileWorkflowStore({
     root,
     getCodebase: id => records.codebases.getCodebase(id),
+    listReusableCheckouts: async () =>
+      (await environments())
+        .filter(row => row.status === 'active' && row.workflow_type === 'task')
+        .map(row => ({
+          codebaseId: row.codebase_id,
+          branch: row.workflow_id,
+          workingPath: row.working_path,
+        })),
     isCheckoutReleased: async (run, path) => {
       const matching = (await environments()).filter(
         row =>

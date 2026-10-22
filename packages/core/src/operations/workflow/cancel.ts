@@ -1,3 +1,4 @@
+import { releaseRunScratch } from '@archon/workflows/run-scratch';
 import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
 import type { RunActor } from '../run-authorization';
 import type { OperationContext } from './context';
@@ -38,7 +39,7 @@ export class CancelRefusedError extends Error {
  * process executes the run, or the run is a `workflow:` sub-run with no live owner of
  * its own whose root run's owner answers: it executes inside that process while the
  * root's row keeps the worktree lock and resource slot. `cancelled` is false when the run finished first.
- * `stopped`: another live process owned the run; its process tree was terminated
+ * `stopped`: another live process owned the run; its process was stopped, with any output-holder warnings reported
  * before the run was recorded `cancelled`.
  */
 export type CancelWorkflowResult =
@@ -118,7 +119,7 @@ export async function cancelWorkflow(
     }
   }
 
-  const { cancelled, ...recorded } = await recordAbandoned(ctx, run);
+  const { cancelled, ...recorded } = await recordAbandoned(ctx, run, owner.cleanupWarnings);
   if (!cancelled) {
     const latest = await ctx.store.getWorkflowRun(run.id);
     throw new Error(
@@ -126,6 +127,8 @@ export async function cancelWorkflow(
         `The run status is ${latest?.status ?? 'unknown'}; it was not reported as cancelled.`
     );
   }
+  // An output holder the stop left running may still write scratch.
+  if (!owner.cleanupWarnings?.length) await releaseRunScratch(run);
   return { kind: 'stopped', pid: owner.pid, ...recorded };
 }
 

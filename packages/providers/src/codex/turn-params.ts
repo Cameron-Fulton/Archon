@@ -12,6 +12,7 @@ import type {
   SendQueryOptions,
 } from '../types';
 import { loadMcpConfig } from '../mcp/config';
+import { ClassifiedProviderError } from '../shared/failure';
 import {
   hasOpenAdditionalProperties,
   normalizeJsonSchemaForOpenAiStrict,
@@ -162,8 +163,9 @@ export function buildThreadConfig(
 }
 
 /**
- * The thread config that attaches no tool to a model request. Codex has no single "no tools"
- * switch, so this turns each one off; an unknown `features` key is accepted silently. The
+ * The thread config that turns off every tool Codex adds from its own config. Codex has no
+ * single "no tools" switch, so this turns each one off; an unknown `features` key is accepted
+ * silently. A model catalog entry's tools win over it; see `toolFreeModelCatalog`. The
  * real-binary test in `scope.boundary.test.ts` pins it on the bundled Codex.
  */
 export const TOOL_FREE_THREAD_CONFIG: CodexConfig = {
@@ -184,6 +186,45 @@ export const TOOL_FREE_THREAD_CONFIG: CodexConfig = {
     computer_use: false,
   },
 };
+
+/**
+ * The model catalog the tool-free turn's process loads in place of the user's: one entry for
+ * `model` with no tools, so the catalog's own tools (`tool_mode`, `experimental_supported_tools`,
+ * `apply_patch_tool_type`) leave the request; thread config cannot do this, because Codex
+ * loads the catalog per process. Codex rejects an empty catalog and an entry missing any
+ * field below.
+ *
+ * `contextWindow` is the window Codex reported for the tool turn, already net of its reserve,
+ * so the entry keeps all of it. It decides whether Codex compacts the thread before the turn:
+ * at 90% of it, slightly before the tool turn's own threshold. Without it the entry has no
+ * window and Codex does not compact, as on a tool turn that reported none.
+ *
+ * A catalog entry's `multi_agent_version: v2` is persisted with the thread, so its
+ * collaboration tools stay on the final request. The real-binary test in
+ * `scope.boundary.test.ts` pins both on the bundled Codex.
+ */
+export function toolFreeModelCatalog(model: string, contextWindow: number | undefined): JsonValue {
+  return {
+    models: [
+      {
+        slug: model,
+        display_name: model,
+        supported_reasoning_levels: [],
+        shell_type: 'disabled',
+        visibility: 'hide',
+        supported_in_api: false,
+        priority: 0,
+        support_verbosity: false,
+        truncation_policy: { mode: 'tokens', limit: 10000 },
+        experimental_supported_tools: [],
+        base_instructions: '',
+        ...(contextWindow !== undefined
+          ? { context_window: contextWindow, effective_context_window_percent: 100 }
+          : {}),
+      },
+    ],
+  };
+}
 
 /**
  * Whether a structured-output turn on `model` runs its tools first and gets a separate
@@ -270,6 +311,13 @@ export async function loadNodeMcpServers(
     ...requestEnv,
   });
   const mcpServers = buildCodexMcpServers(servers);
+  const missing = serverNames.find(name => !Object.hasOwn(mcpServers ?? {}, name));
+  if (missing !== undefined) {
+    throw new ClassifiedProviderError(
+      'misconfigured',
+      `Required MCP server "${missing}" has no supported Codex configuration fields`
+    );
+  }
   getLog().info({ serverNames, mcpPath }, 'codex.mcp_config_loaded');
   if (missingVars.length === 0) return { mcpServers, warnings: [] };
   const uniqueVars = [...new Set(missingVars)];

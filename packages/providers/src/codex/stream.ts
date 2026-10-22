@@ -3,10 +3,11 @@
  * thread, start the turn, and map its notifications into MessageChunks until the
  * parent turn completes and the background work it started has drained.
  */
+import { requireMcpConnections, type McpStatus } from '../mcp/readiness';
 import { BUNDLED_VERSION, createLogger } from '@archon/paths';
 import { sessionPreview, toolCallSchema, truncateToolOutput } from '@archon/provider-contract';
 import type { MessageChunk, ProviderEvent, ResultChunk, TokenUsage } from '../types';
-import { failureResult } from '../shared/failure';
+import { ClassifiedProviderError, failureResult } from '../shared/failure';
 import type { AppServerConnection, ParamsOf } from './app-server';
 import { withDeliveredCredentialConfig, type CodexLogin, type ThreadParams } from './login';
 import { toolResponse, type buildCodexNativeTools } from './native-tools';
@@ -17,8 +18,15 @@ import type { ThreadItem } from './protocol/v2/ThreadItem';
 import type { ThreadTokenUsage } from './protocol/v2/ThreadTokenUsage';
 import type { TokenUsageBreakdown } from './protocol/v2/TokenUsageBreakdown';
 import type { Turn } from './protocol/v2/Turn';
+import type { McpServerConnectionStatus } from './protocol/v2/McpServerConnectionStatus';
 import type { TurnError } from './protocol/v2/TurnError';
-import { applyNodeScope, checkThreadMcpScope, readCodexInventory } from './scope';
+import {
+  applyNodeScope,
+  checkThreadMcpScope,
+  declaredServers,
+  readCodexInventory,
+  readThreadMcpStatuses,
+} from './scope';
 import {
   MANAGED_CHATGPT_TOKEN_REJECTED,
   classifyTurnError,
@@ -243,6 +251,8 @@ export interface TurnRequest {
   onThread: (threadId: string) => void;
   /** Receives the turn id as soon as it exists, so cancel can interrupt it. */
   onTurn: (turnId: string) => void;
+  /** Receives the context window Codex reports for the turn's model. */
+  onContextWindow: (tokens: number) => void;
 }
 
 /** The ids of the parent thread and turn this stream observes. */
@@ -272,6 +282,40 @@ interface TurnObservation {
   retries: number;
 }
 
+const MCP_READINESS = {
+  notStarted: 'pending',
+  starting: 'pending',
+  connected: 'connected',
+  authenticationRequired: 'needs_auth',
+  failed: 'failed',
+  cancelled: 'failed',
+  disabled: 'disabled',
+} as const satisfies Record<McpServerConnectionStatus, McpStatus['status']>;
+
+async function readDeclaredMcpStatuses(
+  connection: AppServerConnection,
+  threadId: string,
+  declared: readonly string[]
+): Promise<McpStatus[]> {
+  const statuses = await readThreadMcpStatuses(connection, threadId);
+  return statuses
+    .filter(server => declared.includes(server.name))
+    .map(server => {
+      if (server.runtimeStatus === null) {
+        throw new ClassifiedProviderError(
+          'misconfigured',
+          `Cannot establish connection readiness for MCP server "${server.name}": unknown runtime status`
+        );
+      }
+      return {
+        type: 'mcp_server_status',
+        server: server.name,
+        status: MCP_READINESS[server.runtimeStatus],
+        ...(server.toolsError !== null ? { error: server.toolsError } : {}),
+      };
+    });
+}
+
 /**
  * Keeps observing background work after the parent completes.
  * Lost observation is thrown for `sendQuery` to classify; it never settles.
@@ -279,6 +323,12 @@ interface TurnObservation {
 export async function* streamTurn(request: TurnRequest): AsyncGenerator<MessageChunk> {
   const { connection } = request;
   const threadId = await openThread(request);
+  const declared = Object.keys(declaredServers(request.threadParams.config ?? {}));
+  yield* requireMcpConnections(
+    declared,
+    () => readDeclaredMcpStatuses(connection, threadId, declared),
+    request.abortSignal
+  );
   const observation: TurnObservation = {
     parentCompleted: false,
     startedToolIds: new Set(),
@@ -418,6 +468,8 @@ async function* observeNotification(
       // Usage reported for another turn of the thread is not this turn's.
       const { params } = notification;
       if (params.threadId === ids.threadId && params.turnId === ids.turnId) {
+        const contextWindow = params.tokenUsage.modelContextWindow;
+        if (contextWindow !== null) request.onContextWindow(contextWindow);
         observation.usageSpan = {
           first: observation.usageSpan?.first ?? params.tokenUsage,
           end: params.tokenUsage.total,

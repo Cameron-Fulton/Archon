@@ -4,6 +4,7 @@ import type { IStateDocumentStore } from './state-document-store';
 import type { IResourceStartStore, ResourceBlocker } from './resource-start-store';
 import type { WorkflowEventRow } from './schemas/workflow-event';
 import {
+  TERMINAL_RUN_EVENT_TYPES,
   answeredPauseContinuation,
   continuablePause,
   attentionLabels,
@@ -299,8 +300,7 @@ export const WORKFLOW_EVENT_TYPES = [
   'run_attention_changed',
   'attention_notice_sent',
   'workflow_started',
-  'workflow_completed',
-  'workflow_failed',
+  ...TERMINAL_RUN_EVENT_TYPES,
   // Written for failed-run resume, engine-cancelled fan-out recovery, and resume of
   // paused or stale-running runs with a nonempty metadata.error. Optional data.error
   // preserves cleared legacy failure evidence (#2348); the event does not imply a
@@ -352,7 +352,6 @@ export const WORKFLOW_EVENT_TYPES = [
   // paused instead of failed. `data` carries `node_id`, `path` (when known), `error` and
   // `retry_at`; any host that can read the source continues it.
   'source_released',
-  'workflow_cancelled',
   'workflow_artifact',
   'integration_operation',
   'node_session_resumed',
@@ -384,6 +383,7 @@ export const WORKFLOW_EVENT_TYPES = [
   // deliverable. `data.warnings` is the message list. Absence means the YAML was
   // clean OR the run predates this event type — never that delivery failed.
   'workflow_parse_warnings',
+  'workflow_cleanup_warning',
   // #2781 — the run's workflow declares `deprecated:`. Written by the executor at
   // run start for every deprecated workflow, whatever surface started it (the
   // chat/console message is best-effort; this is the durable trace).
@@ -459,6 +459,7 @@ export function waitContinuedEvent(
   };
 }
 
+export const DETACHED_LAUNCH_METADATA_KEY = 'cli_detached_launch_token';
 export const EXECUTION_CLAIM_METADATA_KEY = 'execution_claim';
 
 /** The initial execution has no token; resumes mint one so old executors cannot release a later claim. */
@@ -641,6 +642,7 @@ export const FAN_OUT_CANCEL_REASONS = [
 export type FanOutCancelReason = (typeof FAN_OUT_CANCEL_REASONS)[number];
 
 export interface WorkflowCancellationEventDetails {
+  warnings?: string[];
   step_name?: string;
   reason?: string;
   /** Categorical cause, reported to telemetry; `reason` is free text and never is. */
@@ -921,6 +923,11 @@ export interface IWorkflowStore
       working_path?: string;
     }
   ): Promise<void>;
+  /** Atomically merge metadata only while running; false means nothing was written. */
+  updateWorkflowRunMetadataIfRunning(
+    id: string,
+    metadata: WorkflowRun['metadata']
+  ): Promise<boolean>;
   updateWorkflowActivity(id: string): Promise<void>;
   getWorkflowRunStatus(id: string): Promise<WorkflowRunStatus | null>;
   /**
@@ -942,6 +949,8 @@ export interface IWorkflowStore
    * `failed` is false when the run was already terminal: a no-op that leaves the winning
    * outcome in place, so the caller must not announce its own failure. Missing runs and
    * other start states reject.
+   * `pendingLaunchToken` restricts the write to the matching detached launch while
+   * still pending; any ownership or status mismatch returns false without writing.
    * `exitReason` is recorded on that event as the run's categorical failure cause, and — with
    * `signal`, when a signal arriving at the owning process is what stopped the run —
    * on the run row as `metadata.stop_reason`, which is what the operator surfaces
@@ -950,7 +959,7 @@ export interface IWorkflowStore
   failWorkflowRun(
     id: string,
     error: string,
-    options?: { exitReason?: RunExitReason; signal?: RunStopSignal }
+    options?: { exitReason?: RunExitReason; signal?: RunStopSignal; pendingLaunchToken?: string }
   ): Promise<{ failed: boolean }>;
   /**
    * Pause a running run for human review, stamping the approval context. Optional
@@ -967,15 +976,15 @@ export interface IWorkflowStore
     event?: GatePauseEventInput
   ): Promise<void>;
   /**
-   * Release a running run this host could not read the frozen source for (#4209): a
-   * compare-and-swap from `running` to `paused` that writes `source_release` with a
-   * store-minted `releaseId` and `releasedAt`, sets `continuation_retry_at` to `retryAt`, and commits
-   * `source_released` in the same transaction. Writes nothing, and returns
-   * `released: false`, when status or `claimId` no longer matches: another execution owns it.
+   * Claim-checked release from running to paused for unreadable source; status/claim losers write nothing.
+   * Atomically writes source_release (store-minted releaseId/releasedAt), continuation_retry_at, and source_released.
+   * beforePublish runs under exclusion against resume; rejection aborts the transition.
+   * It must be repeatable (SQL may retry), without store I/O or event publication.
    */
   releaseRunForUnreadableSource(
     id: string,
-    release: SourceReleaseWrite
+    release: SourceReleaseWrite,
+    beforePublish?: () => Promise<void>
   ): Promise<{ released: boolean }>;
   /**
    * Pause a running run on a wait, committing `wait_started` for a new wait or

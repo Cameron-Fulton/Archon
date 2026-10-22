@@ -75,6 +75,14 @@ export interface FakeTurnScript {
   ignoreInterrupt?: boolean;
   /** Keep running when stdin closes; only a signal ends the process. */
   ignoreStdinClose?: boolean;
+  /** Exit with this code when stdin closes (default 0). */
+  stdinCloseExitCode?: number;
+  /**
+   * Exit this long after stdin closes, and let no signal end the process sooner, as a
+   * Codex still shutting down on a loaded machine does. The exit is clean unless a
+   * SIGTERM arrived in that window, which makes a real Codex exit 1.
+   */
+  exitsAfterStdinCloseMs?: number;
   /** MCP server names the user's config defines, as `config/read` reports them. */
   configuredServers?: string[];
   /** Installed plugins in one local marketplace: id (`name@fixture`) to its MCP server names. */
@@ -84,7 +92,8 @@ export interface FakeTurnScript {
 }
 
 /** The `mcpServerStatus/list` fields a test sets; the rest are filled in. */
-export type ServerStatus = Pick<McpServerStatus, 'name' | 'pluginId' | 'runtimeStatus'>;
+export type ServerStatus = Pick<McpServerStatus, 'name' | 'pluginId' | 'runtimeStatus'> &
+  Partial<Pick<McpServerStatus, 'toolsError'>>;
 
 export interface FakeRequest {
   method: string;
@@ -153,6 +162,7 @@ export function createFakeAppServer(script: () => FakeTurnScript = () => ({})): 
     };
     processes.push(record);
     let closed = false;
+    let terminatedWhileExiting = false;
     const close = (code: number | null, signal: string | null): void => {
       if (closed) return;
       closed = true;
@@ -167,7 +177,8 @@ export function createFakeAppServer(script: () => FakeTurnScript = () => ({})): 
       pid: 4242,
       kill: (signal: string = 'SIGTERM') => {
         record.signals.push(signal);
-        close(null, signal);
+        if (turn.exitsAfterStdinCloseMs === undefined) close(null, signal);
+        else terminatedWhileExiting = true;
         return true;
       },
     });
@@ -355,7 +366,9 @@ export function createFakeAppServer(script: () => FakeTurnScript = () => ({})): 
     });
     stdin.on('finish', () => {
       record.stdinEnded = true;
-      if (!turn.ignoreStdinClose) close(0, null);
+      if (turn.exitsAfterStdinCloseMs !== undefined)
+        setTimeout(() => close(terminatedWhileExiting ? 1 : 0, null), turn.exitsAfterStdinCloseMs);
+      else if (!turn.ignoreStdinClose) close(turn.stdinCloseExitCode ?? 0, null);
     });
     return child;
   }) as unknown as Spawner & { processes: FakeProcess[] };
@@ -548,7 +561,7 @@ function mcpStatusResponse(pages: ServerStatus[][], index: number): ListMcpServe
       serverInfo: null,
       serverCapabilities: null,
       tools: {},
-      toolsError: null,
+      toolsError: server.toolsError ?? null,
       resources: [],
       resourceTemplates: [],
       authStatus: 'unsupported',

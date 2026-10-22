@@ -25,7 +25,7 @@ import { FileStoreUnsupportedError } from '@archon/workflows/file-store';
 import { CLIAdapter } from '../adapters/cli-adapter';
 import { writeJsonLine } from '../utils/stdout';
 import {
-  assertDetachedRunProcessOwner,
+  claimDetachedRunProcessOwner,
   DETACHED_RUN_OWNER_ENV,
 } from '../utils/detached-run-control';
 import { registerOwnedRunTermination } from '../utils/owned-run-termination';
@@ -244,10 +244,7 @@ async function drainReceipt(
     }
     // Other pending work on the host can fail in the same drain; only this receipt's
     // failures are this command's failure.
-    // A failure with no receipt id could be this one, so it counts as ours.
-    const others = error.failures.filter(
-      failure => failure.receiptId !== undefined && failure.receiptId !== receiptId
-    );
+    const others = error.failures.filter(failure => failure.receiptId !== receiptId);
     const own = error.failures.filter(failure => !others.includes(failure));
     if (own.length > 0)
       throw new Error(
@@ -255,7 +252,7 @@ async function drainReceipt(
         { cause: error }
       );
     process.stderr.write(
-      `Warning: ${String(others.length)} other start(s) on this host failed and are not part of receipt ${receiptId}: ${drainFailureReasons(others.map(failure => failure.error))}\n`
+      `Warning: ${String(others.length)} other or unattributed start operation(s) on this host failed while draining receipt ${receiptId}: ${drainFailureReasons(others.map(failure => failure.error))}\n`
     );
   }
 }
@@ -278,12 +275,12 @@ async function triggerExecute(
   if (!args[0] || !options.host)
     throw new Error('Usage: archon trigger execute <admitted-request-id> --host <configured-host>');
   // Read the marker `spawnAdmitted` sets, then clear it before any node subprocess
-  // can inherit it. Only a marked process that leads its own process group registers
-  // its PID, because `archon workflow cancel` terminates that whole group.
+  // can inherit it. Only a marked process that holds what `archon workflow cancel`
+  // terminates (its own process group, or on Windows its job object) registers its PID.
   const detachedProcessOwner = process.env[DETACHED_RUN_OWNER_ENV] === '1';
   if (detachedProcessOwner) {
     Reflect.deleteProperty(process.env, DETACHED_RUN_OWNER_ENV);
-    assertDetachedRunProcessOwner();
+    await claimDetachedRunProcessOwner();
   }
   const { deps } = host;
   const result = await startAdmittedResourceStart({
@@ -310,7 +307,7 @@ async function triggerExecute(
         store: deps.store,
         ...owned,
         logModule: 'cli.trigger',
-        endNodeProcessTrees: !detachedProcessOwner,
+        detachedProcessOwner,
       }),
     ...(detachedProcessOwner ? { detachedProcessPid: process.pid } : {}),
   });
@@ -387,10 +384,9 @@ async function recoverTriggerPreparation(
 
 async function withdrawTrigger(host: WorkflowHost, args: string[]): Promise<void> {
   if (!args[0]) throw new Error('Usage: archon trigger withdraw <queued-request-id>');
-  const request = await host.deps.store.getResourceStartRequest(args[0]);
-  if (!request || !(await host.deps.store.withdrawQueuedResourceStart(args[0])))
-    throw new Error('Only untouched queued requests can be withdrawn.');
-  const source = readWorkflowSourceState(request.launch.run.metadata);
+  const launch = await host.deps.store.withdrawQueuedResourceStart(args[0]);
+  if (!launch) throw new Error('Only untouched queued requests can be withdrawn.');
+  const source = readWorkflowSourceState(launch.run.metadata);
   if (source.kind === 'recorded') await rm(source.record.root, { recursive: true, force: true });
   if (source.kind === 'unreadable')
     throw new Error(

@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, readFile, readdir, realpath, stat, writeFile } from 'node:fs/promises';
+import { readFile, readdir, realpath, stat } from 'node:fs/promises';
+import { readArtifactFile, writeArtifactFile } from './artifact-writes';
 import { join, sep } from 'node:path';
 import { createLogger, isPathInside, RUN_ARTIFACTS_ENGINE_SUBDIR } from '@archon/paths';
 import {
@@ -76,17 +77,12 @@ function sameArtifactOwner(left: ArtifactOwner, right: ArtifactOwner): boolean {
 
 /**
  * Read the owner recorded in an existing `.meta.json`, or `undefined` if the
- * file is missing or corrupt. Used only by the collision guard in
- * `writeNodeArtifact`. Real filesystem failures remain visible to the caller.
+ * file is missing, corrupt, or a link under the container scope. Used only by the
+ * collision guard in `writeNodeArtifact`. Real filesystem failures remain visible.
  */
 async function readArtifactOwner(metaPath: string): Promise<ArtifactOwner | undefined> {
-  let rawMetadata: string;
-  try {
-    rawMetadata = await readFile(metaPath, 'utf8');
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
-    throw err;
-  }
+  const rawMetadata = await readArtifactFile(metaPath);
+  if (rawMetadata === undefined) return undefined;
 
   try {
     const parsed = nodeArtifactOwnerSchema.safeParse(JSON.parse(rawMetadata));
@@ -119,7 +115,6 @@ export async function writeNodeArtifact(
   // durable constructor before creating either sidecar.
   const parsedParams = nodeArtifactWriteParamsSchema.parse(params);
   const nodesDir = join(artifactsDir, NODES_SUBDIR);
-  await mkdir(nodesDir, { recursive: true });
   const owner: ArtifactOwner = {
     nodeId: parsedParams.nodeId,
     ...(parsedParams.loopGroupPath !== undefined
@@ -141,7 +136,7 @@ export async function writeNodeArtifact(
   }
 
   const relPath = join(NODES_SUBDIR, `${stem}.md`);
-  await writeFile(join(artifactsDir, relPath), outputText, 'utf8');
+  await writeArtifactFile(join(artifactsDir, relPath), outputText);
   const meta: NodeArtifact = {
     nodeId: parsedParams.nodeId,
     outputType: parsedParams.outputType,
@@ -153,7 +148,7 @@ export async function writeNodeArtifact(
     producedAt: parsedParams.producedAt,
     size: Buffer.byteLength(outputText, 'utf8'),
   };
-  await writeFile(metaPath, JSON.stringify(meta, null, 2), 'utf8');
+  await writeArtifactFile(metaPath, JSON.stringify(meta, null, 2));
   return meta;
 }
 
@@ -370,8 +365,7 @@ export async function writeNodeArtifactsListing(
   const result = await readNodeArtifacts(artifactsDir, { scope: 'current-run', runId });
   const listing: NodeArtifactsListing = { runId, ...result };
   const listingDir = join(artifactsDir, LISTINGS_SUBDIR);
-  await mkdir(listingDir, { recursive: true });
   const listingPath = join(listingDir, `${randomUUID()}.json`);
-  await writeFile(listingPath, JSON.stringify(listing, null, 2), 'utf8');
+  await writeArtifactFile(listingPath, JSON.stringify(listing, null, 2));
   return listingPath;
 }

@@ -19,6 +19,7 @@ import {
   itemPullRequest,
   ROUTE_DECISIONS,
 } from '../../workflows/sdlc/.shared/build';
+import { BUILD_QUEUE_SELECTIONS } from '../../workflows/sdlc/.shared/launch';
 import { CONFIDENCES, checkAttention, chosen, renderAttention, withOther } from '../../workflows/sdlc/.shared/queue';
 import { stateGet, statePut } from '../../workflows/sdlc/.shared/state';
 import {
@@ -29,7 +30,10 @@ import {
   type TriageFacts,
   type WorkItem,
 } from '../../workflows/sdlc/.shared/workitem';
-import { type GhApiIssue, type GhPr, gitCheckout, hostCli, PACK, packScriptRunner, PR, type ScriptRun } from './deliver-checks-harness';
+import {
+  type GhApiIssue, type GhPr, type ScriptOptions, type ScriptRun,
+  forgePrRecord, gitCheckout, hostCli, PACK, packScriptRunner, PR,
+} from './deliver-checks-harness';
 
 const { runPackScript } = packScriptRunner();
 const track = trackTempRoots();
@@ -170,7 +174,9 @@ describe('the build record', () => {
     };
     const workflow = Bun.YAML.parse(
       readFileSync(join(PACK, 'build-queue/archon-build-queue.yaml'), 'utf8')
-    ) as { nodes: { id: string; output_format?: { properties: Record<string, unknown> } }[] };
+    ) as { inputs: Record<string, unknown>; nodes: { id: string; output_format?: { properties: Record<string, unknown> } }[] };
+    // A new input fails here until someone decides whether a next round keeps it.
+    expect(Object.keys(workflow.inputs).sort()).toEqual([...BUILD_QUEUE_SELECTIONS, 'number', 'repo_host', 'repo_path'].sort());
     const field = (id: string, name: string) =>
       workflow.nodes.find(node => node.id === id)?.output_format?.properties[name] as
         | (Enum & AttentionSchema)
@@ -243,12 +249,20 @@ function stored(at: Install): { revision: number; value: WorkItem | null } {
 
 function run(
   at: Install,
-  script: 'facts' | 'apply' | 'ruling' | 'retriage',
+  script: 'facts' | 'apply' | 'checkout' | 'ruling' | 'retriage',
   inputs: Record<string, string>,
-  options: { issue?: GhApiIssue; pr?: GhPr; writeLost?: boolean } = {}
+  options: {
+    issue?: GhApiIssue;
+    pr?: GhPr;
+    writeLost?: boolean;
+    source?: ScriptOptions['source'];
+    preload?: ScriptOptions['preload'];
+  } = {}
 ): ScriptRun {
   return runPackScript(`build-queue/scripts/${script}`, {
     cwd: at.checkout,
+    source: options.source,
+    preload: options.preload,
     forge: { kind: 'command', argv: [process.execPath, FAKE_ARCHON] },
     gh: {
       issue: { number: 7, author: 'Maintainer', body: 'The contract.', ...options.issue },
@@ -277,6 +291,21 @@ function ok(result: ScriptRun): Record<string, unknown> {
 const ENDING = { delivered: false, reason: 'review_open', pr_url: 'https://ghe.example.com/example/repo/pull/42', summary: 'Not ready: one finding' };
 const CLAIMED = { claim: { run_id: 'run-1', at: AT, requests: [] } };
 
+/** Non-default selections on a run that named no item, so its own `number` is empty. */
+const SELECTED = { INPUTS_ORDER: '["size asc"]', INPUTS_RETRIAGE_AS: 'maintainer', INPUTS_ROUND_LIMIT: '5', INPUTS_NUMBER: '' };
+
+/** The next round keeps the run's config and selections, and targets the item it continues. */
+function expectNextRound(calls: string): void {
+  const launch = readFileSync(calls, 'utf8').trim().split('\n').map(line => JSON.parse(line) as string[]).find(argv => argv[1] === 'run');
+  expect(launch).toEqual(
+    expect.arrayContaining([
+      'archon-build-queue', 'order=["size asc"]', 'retriage_as=maintainer', 'round_limit=5', 'number=7',
+      '--config-from-run', 'run-1', '--detach',
+    ])
+  );
+  expect(launch?.filter(arg => arg.startsWith('number='))).toEqual(['number=7']);
+}
+
 function applyInputs(answer: Record<string, unknown>, atCap = false): Record<string, string> {
   return {
     INPUTS_PATH: 'route',
@@ -291,12 +320,188 @@ function applyInputs(answer: Record<string, unknown>, atCap = false): Record<str
 const CONTINUE = { decision: 'continue', brief: 'continue PR 42 on R1', push: null, reason: 'R1 is correctable', attention: null };
 const ASK = { decision: 'ask', brief: 'continue PR 42 under the ruling', push: null, reason: 'the plan asks to relax a constraint', attention: ATTENTION };
 
+const HEAD_A = 'a'.repeat(40);
+const HEAD_B = 'b'.repeat(40);
+const HEAD_C = 'c'.repeat(40);
+const READY_CASES = [
+  'matching', 'prewrite', 'raced', 'moved-again', 'already-draft',
+  'closed', 'merged', 'refused', 'unknown', 'readback-failed', 'diagnostic-failed',
+] as const;
+type ReadyCase = (typeof READY_CASES)[number];
+
+function readyPreload(source: 'gh' | 'forge', scenario: ReadyCase): string {
+  return `
+import { writeFileSync } from 'node:fs';
+import { forgeOperation, forgeFailure } from ${JSON.stringify(resolve(import.meta.dir, 'deliver-checks-harness.ts'))};
+const scenario = ${JSON.stringify(scenario)};
+const selected = ${JSON.stringify(source)};
+const current = ${JSON.stringify(forgePrRecord({ head_revision: HEAD_A }))};
+const calls = [];
+const writes = [];
+let readyReturned = false;
+let correctionStarted = false;
+let correctionFailed = false;
+let failReadback = false;
+const delegate = Bun.spawnSync.bind(Bun);
+const save = () => writeFileSync('{ARTIFACTS}/ready-state.json', JSON.stringify({ current, calls, writes }));
+const response = (op, failure) => {
+  save();
+  const ghRow = {
+    number: current.number, url: current.url, state: current.state.toUpperCase(),
+    isDraft: current.is_draft, headRefOid: current.head_revision,
+    headRefName: current.head, baseRefName: current.base,
+    headRepository: { name: 'repo' }, headRepositoryOwner: { login: 'example' },
+    maintainerCanModify: null,
+  };
+  const stdout = selected === 'forge'
+    ? failure ? forgeFailure(op, scenario === 'unknown' ? 'outcome_unknown' : scenario === 'readback-failed' ? 'verification_failed' : 'refused', failure, { leaveBehind: 'draft state may have changed' })
+      : forgeOperation(op, op === 'pr.view' ? { pr: current } : { target: { repo: current.repo, number: current.number }, outcome: 'applied', changed: writes.at(-1) === op, pr: current })
+    : op === 'pr.view' ? JSON.stringify(ghRow) : '';
+  return { exitCode: failure ? 1 : 0, stdout: Buffer.from(stdout), stderr: Buffer.from(failure ?? '') };
+};
+Object.defineProperty(Bun, 'spawnSync', { value: (argv, settings) => {
+  const isGh = argv[0] === 'gh' && argv[1] === 'pr';
+  const forgeAt = argv.indexOf('forge');
+  const isForge = forgeAt >= 0 && ['pr.view', 'pr.ready', 'pr.draft'].includes(argv[forgeAt + 1]);
+  if (!isGh && !isForge) return delegate(argv, settings);
+  if ((selected === 'gh') !== isGh) throw new Error('unexpected forge source');
+  const op = isGh ? argv[2] === 'view' ? 'pr.view' : argv.includes('--undo') ? 'pr.draft' : 'pr.ready' : argv[forgeAt + 1];
+  calls.push(op);
+  if (scenario === 'prewrite') current.head_revision = '${HEAD_B}';
+  if (readyReturned && !correctionStarted) {
+    correctionStarted = true;
+    if (scenario === 'moved-again') current.head_revision = '${HEAD_C}';
+    if (scenario === 'already-draft') current.is_draft = true;
+    if (scenario === 'closed' || scenario === 'merged') current.state = scenario;
+  }
+  if (op === 'pr.view') {
+    if (failReadback) { failReadback = false; return response(op, 'read-back unavailable'); }
+    if (correctionFailed && scenario === 'diagnostic-failed') return response(op, 'diagnostic unavailable');
+    if (writes.includes('pr.ready')) readyReturned = true;
+    return response(op);
+  }
+  if (op === 'pr.ready') {
+    writes.push(op);
+    current.is_draft = false;
+    if (scenario !== 'matching') current.head_revision = '${HEAD_B}';
+    if (selected === 'forge') readyReturned = true;
+    return response(op);
+  }
+  if (current.state !== 'open') { correctionFailed = true; return response(op, 'cannot draft ' + current.state); }
+  if (current.is_draft) return response(op);
+  writes.push(op);
+  if (['refused', 'unknown', 'diagnostic-failed'].includes(scenario)) {
+    correctionFailed = true;
+    if (scenario === 'refused') current.head_revision = '${HEAD_C}';
+    return response(op, 'draft permission denied; mutation evidence retained');
+  }
+  current.is_draft = true;
+  if (scenario === 'readback-failed') {
+    correctionFailed = true;
+    if (selected === 'forge') return response(op, 'read-back unavailable');
+    failReadback = true;
+  }
+  return response(op);
+} });
+`;
+}
+
+interface ReadyObservation {
+  current: { head_revision: string; is_draft: boolean; state: string };
+  calls: string[];
+  writes: string[];
+}
+
+function failedCorrection(scenario: ReadyCase): boolean {
+  return ['refused', 'unknown', 'diagnostic-failed', 'closed', 'merged', 'readback-failed'].includes(scenario);
+}
+
+function expectCorrectionError(result: ScriptRun, observed: ReadyObservation, scenario: ReadyCase, source: 'gh' | 'forge'): void {
+  expect(result.stderr).toContain('draft correction failed');
+  expect(result.stderr).toContain('Inspect');
+  const expectedError = scenario === 'closed' || scenario === 'merged' ? scenario
+    : scenario === 'readback-failed' ? 'read-back unavailable' : 'draft permission denied; mutation evidence retained';
+  expect(result.stderr).toContain(expectedError);
+  expect(observed.calls.at(-1)).toBe('pr.view');
+  if (source === 'forge') expect(result.stderr).toContain('draft state may have changed');
+  if (scenario === 'unknown') expect(result.stderr).toContain('outcome_unknown');
+  if (scenario === 'readback-failed' && source === 'forge') expect(result.stderr).toContain('verification_failed');
+  if (scenario === 'diagnostic-failed') {
+    expect(result.stderr).toContain('final state unknown');
+    expect(result.stderr).toContain('diagnostic unavailable');
+  } else {
+    expect(result.stderr).toContain(`observed ${observed.current.state}, draft=${String(observed.current.is_draft)} at ${observed.current.head_revision}`);
+    if (scenario === 'refused') expect(observed.current.head_revision).toBe(HEAD_C);
+  }
+}
+
+function expectDraftObservation(result: ScriptRun, observed: ReadyObservation, scenario: ReadyCase): void {
+  expect(observed.current.is_draft).toBe(true);
+  expect(result.stderr).toContain('observed open, draft=true');
+  if (scenario === 'moved-again') {
+    expect(observed.current.head_revision).toBe(HEAD_C);
+    expect(result.stderr).toContain(HEAD_C);
+  }
+}
+
 describe('the build queue scripts', () => {
+  describe('the ready transition', () => {
+    for (const source of ['gh', 'forge'] as const) {
+      test.each(READY_CASES.filter(scenario => source === 'forge' || scenario !== 'unknown'))(`${source}: %s`, scenario => {
+        const at = install();
+        seed(at, triaged(CLAIMED));
+        const before = stored(at);
+        const result = run(at, 'apply', {
+          INPUTS_PATH: 'route',
+          INPUTS_ITEM: JSON.stringify(SUBJECT),
+          INPUTS_ROUTE: JSON.stringify({ decision: 'ready', ready_head: HEAD_A, reason: 'reviewed', brief: '', attention: null }),
+          INPUTS_PULL_REQUEST: JSON.stringify(forgePrRecord({ head_revision: HEAD_A })),
+          INPUTS_ENDING: 'null',
+          INPUTS_ANSWER: 'null',
+          INPUTS_AT_CAP: 'false',
+        }, { source, preload: readyPreload(source, scenario) });
+        const observed = JSON.parse(readFileSync(join(result.artifacts, 'ready-state.json'), 'utf8')) as ReadyObservation;
+        if (scenario === 'matching') {
+          expect(ok(result).summary).toContain(`marked ready at ${HEAD_A}`);
+          expect(observed.current).toMatchObject({ head_revision: HEAD_A, is_draft: false });
+          expect(observed.writes).toEqual(['pr.ready']);
+          expect(stored(at).value).toMatchObject({ claim: null, facts: { build: { status: 'ready', decisions: [{ decision: 'ready' }] } } });
+          return;
+        }
+        if (scenario === 'raced') expect(observed.current.is_draft).toBe(true);
+        expect(result.code).not.toBe(0);
+        expect(result.stdout).toBe('');
+        expect(stored(at)).toEqual(before);
+        expect(result.stderr).toContain(HEAD_A);
+        expect(result.stderr).toContain(HEAD_B);
+        if (scenario === 'prewrite') {
+          expect(observed.writes).toEqual([]);
+          return;
+        }
+        const noDraftWrite = ['already-draft', 'closed', 'merged'].includes(scenario);
+        expect(observed.writes).toEqual(noDraftWrite ? ['pr.ready'] : ['pr.ready', 'pr.draft']);
+        if (failedCorrection(scenario)) expectCorrectionError(result, observed, scenario, source);
+        else expectDraftObservation(result, observed, scenario);
+        if (scenario === 'readback-failed') expect(observed.current.is_draft).toBe(true);
+        if (['refused', 'unknown', 'diagnostic-failed'].includes(scenario)) expect(observed.current.is_draft).toBe(false);
+        expect(observed.calls.filter(op => op === 'pr.draft')).toHaveLength(source === 'gh' && noDraftWrite ? 0 : 1);
+      });
+    }
+  });
+
   test("facts claims a triaged item without taking intake's requests, and writes the issue the agents read", () => {
     const at = install();
     const request = { at: AT, run_id: 'event', action: 'edited' as const, label: null, actor: null, body_digest: null };
     seed(at, triaged({ requests: [request] }));
-    const picked = run(at, 'facts', {});
+    const parentNumber = process.env.INPUTS_NUMBER;
+    let picked: ScriptRun;
+    try {
+      process.env.INPUTS_NUMBER = '4807';
+      picked = run(at, 'facts', {});
+    } finally {
+      if (parentNumber === undefined) delete process.env.INPUTS_NUMBER;
+      else process.env.INPUTS_NUMBER = parentNumber;
+    }
     expect(ok(picked)).toMatchObject({ path: 'route', item: SUBJECT, url: ISSUE_URL, brief: '', at_cap: false });
     expect(stored(at).value).toMatchObject({ claim: { run_id: 'run-1', requests: [] }, requests: [request] });
     expect(readFileSync(join(picked.artifacts, 'build/issue.md'), 'utf8')).toContain('The contract.');
@@ -424,11 +629,10 @@ describe('the build queue scripts', () => {
     const at = install();
     seed(at, triaged(CLAIMED));
     const calls = join(track(mkdtempSync(join(tmpdir(), 'archon-calls-'))), 'calls.jsonl');
-    const applied = run(at, 'apply', { ...applyInputs(CONTINUE), ARCHON_CALL_LOG: calls });
+    const applied = run(at, 'apply', { ...applyInputs(CONTINUE), ...SELECTED, ARCHON_CALL_LOG: calls });
     expect(ok(applied)).toMatchObject({ decision: 'continue', attention: '', options: [], asked: null });
-    // The next round runs on the run config this run started with.
-    const launch = readFileSync(calls, 'utf8').trim().split('\n').map(line => JSON.parse(line) as string[]).find(argv => argv[1] === 'run');
-    expect(launch).toEqual(expect.arrayContaining(['archon-build-queue', 'number=7', '--config-from-run', 'run-1', '--detach']));
+    // The next round runs on the run config and the input selections this run started with.
+    expectNextRound(calls);
     expect(ok(applied).summary).toContain('next round started at once (run launched-archon-build-queue)');
     const doc = stored(at).value;
     expect(doc).toMatchObject({
@@ -569,12 +773,12 @@ describe('the build queue scripts', () => {
       INPUTS_ASKED: ASKED,
       INPUTS_CHOICE: 'relax',
       INPUTS_TEXT: 'Only for this item.',
+      ...SELECTED,
       ARCHON_CALL_LOG: calls,
     });
     const output = ok(ruled);
-    // The answer continues the item at once, on the run config the answered run started with.
-    const launch = readFileSync(calls, 'utf8').trim().split('\n').map(line => JSON.parse(line) as string[]).find(argv => argv[1] === 'run');
-    expect(launch).toEqual(expect.arrayContaining(['archon-build-queue', 'number=7', '--config-from-run', 'run-1', '--detach']));
+    // The answer continues the item at once, on the run config and input selections the answered run started with.
+    expectNextRound(calls);
     expect(output.summary).toContain('next round started at once (run launched-archon-build-queue)');
     const heading = output.section as string;
     expect(heading).toMatch(/^Current scope \(maintainer ruling on the build queue's question on a stopped run, \d{4}-\d{2}-\d{2}\)$/);
@@ -637,5 +841,30 @@ describe('the build queue scripts', () => {
     expect(lost.code).not.toBe(0);
     expect(lost.stderr).toContain('does not read back with the section');
     expect(stored(at).revision).toBe(before);
+  }, 60_000);
+});
+
+describe('the build queue checkout', () => {
+  function git(cwd: string, ...args: string[]): string {
+    const result = spawnSync('git', args, { cwd, encoding: 'utf8' });
+    expect(result.status).toBe(0);
+    return result.stdout.trim();
+  }
+
+  test('a continued round starts at the PR head on its queue branch', () => {
+    const at = install();
+    git(at.checkout, 'push', '-q', 'upstream', 'feature');
+    const head = git(at.checkout, 'rev-parse', 'feature');
+    const branch = 'build/7-continued-round';
+    git(at.checkout, 'checkout', '-q', '-b', branch, 'dev');
+    const result = run(
+      at,
+      'checkout',
+      { INPUTS_CONTINUES: '42', INPUTS_PULL_REQUEST: JSON.stringify({ repo: PR.repo, number: 42 }) },
+      { pr: { headRefOid: head } }
+    );
+    expect(ok(result)).toEqual({ head });
+    expect(git(at.checkout, 'rev-parse', 'HEAD')).toBe(head);
+    expect(git(at.checkout, 'branch', '--show-current')).toBe(branch);
   }, 60_000);
 });

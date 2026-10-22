@@ -55,8 +55,29 @@ export function generateBranchName(request: IsolationRequest): string {
       if (request.taskBranch?.branch) {
         return request.taskBranch.branch;
       }
-      return `archon/task-${slugify(request.identifier)}`;
+      return generatedTaskBranch(request.identifier);
   }
+}
+
+function generatedTaskBranch(identifier: string): string {
+  return `archon/task-${slugify(identifier)}`;
+}
+
+/**
+ * True when a task worktree's branch is the one generated for its own identifier,
+ * not one its launch named. A named-branch launch uses the branch as its identifier,
+ * so the generated name can never equal it.
+ */
+export function isGeneratedTaskBranch(env: {
+  workflow_type: string;
+  workflow_id: string;
+  branch_name: string;
+}): boolean {
+  return (
+    env.workflow_type === 'task' &&
+    env.branch_name !== env.workflow_id &&
+    env.branch_name === generatedTaskBranch(env.workflow_id)
+  );
 }
 
 /**
@@ -294,7 +315,7 @@ export async function createNewBranch(
   baseBranch: string,
   setupLockReason: string,
   remote = 'origin'
-): Promise<{ cutFromCommit?: string; branchCreated: boolean }> {
+): Promise<{ cutFromCommit?: string; resolvedBaseBranch?: string; branchCreated: boolean }> {
   const fromBranch =
     request.workflowType === 'task' && request.taskBranch?.kind === 'new'
       ? request.taskBranch.fromBranch
@@ -304,7 +325,14 @@ export async function createNewBranch(
   const localExists = await localBranchExists(repoPath, branchName);
   const remoteExists = await remoteBranchExists(repoPath, remote, branchName);
   if (!localExists && !remoteExists) {
-    return cutBranch(repoPath, worktreePath, branchName, startPoint, setupLockReason);
+    const checkout = await cutBranch(
+      repoPath,
+      worktreePath,
+      branchName,
+      startPoint,
+      setupLockReason
+    );
+    return { ...checkout, resolvedBaseBranch: baseBranch };
   }
 
   if (fromBranch) {

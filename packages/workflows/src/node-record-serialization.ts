@@ -7,13 +7,13 @@ import { z } from 'zod';
 import type { TokenUsage } from '@archon/provider-contract';
 import { providerFailureSchema } from '@archon/provider-contract';
 import type { NodeOutput } from './schemas/workflow-run';
+import { fanOutOutcomeSchema } from './schemas/fan-out-outcome';
 import { nodeSkipReasonSchema, skipCauseSchema } from './schemas/node-state';
 import {
-  nodeDescriptorSchema,
-  nodeInvocationSchema,
   executionBindingSchema,
   executionSpendSchema,
   nodeExecutionMetadataSchema,
+  nodeExecutionMetadataPayloadSchema,
   nodeFailureKindSchema,
   mcpUnavailableSchema,
   type NodeCostScope,
@@ -28,13 +28,7 @@ import type { DagNode } from './schemas';
 
 /** Existing flat wire keys remain readable by older binaries. */
 export const serializedNodeDataSchema = z.object({
-  node: nodeDescriptorSchema.optional(),
-  invocation: nodeInvocationSchema.optional(),
-  attempt: nodeExecutionMetadataSchema.shape.attempt.optional(),
-  binding: executionBindingSchema.optional(),
-  timing: nodeExecutionMetadataSchema.shape.timing.optional(),
-  spend: executionSpendSchema.optional(),
-  accounting: nodeExecutionMetadataSchema.shape.accounting.optional(),
+  ...nodeExecutionMetadataPayloadSchema.partial().shape,
   type: z.string().optional(),
   command: z.string().nullable().optional(),
   runtime: z.string().optional(),
@@ -81,6 +75,7 @@ export const serializedNodeDataSchema = z.object({
   child_run_id: z.string().optional(),
   blocked_on_child_run_id: z.string().optional(),
   fan_out: z.boolean().optional(),
+  fan_out_outcome: fanOutOutcomeSchema.optional(),
   identity: z.string().optional(),
   ordinal: z.number().optional(),
   approval_decision: z.string().optional(),
@@ -237,29 +232,13 @@ export function serializeNodeStateRecord(record: NodeStateRecord): SerializedNod
       },
     };
   }
-  const {
-    node,
-    invocation,
-    attempt,
-    binding,
-    timing,
-    spend,
-    accounting,
-    lifecycle,
-    diagnostics: d,
-  } = record;
+  const { node, binding, timing, spend, lifecycle, diagnostics: d } = record;
   const legacyType = node.kind === 'exec' ? (node.runtime === 'sh' ? 'bash' : 'script') : node.kind;
   return {
     ...identity,
     event_type: executionEventTypes[lifecycle.status],
     data: {
-      node,
-      invocation,
-      attempt,
-      binding,
-      timing,
-      spend,
-      accounting,
+      ...nodeExecutionMetadataPayloadSchema.parse(record),
       type: legacyType,
       ...(node.kind === 'agent'
         ? { command: node.source.kind === 'command' ? node.source.name : null }
@@ -321,6 +300,7 @@ export function serializeNodeStateRecord(record: NodeStateRecord): SerializedNod
         ? { blocked_on_child_run_id: d.blockedOnChildRunId }
         : {}),
       ...(d?.fanOut !== undefined ? { fan_out: d.fanOut } : {}),
+      ...(d?.fanOutOutcome !== undefined ? { fan_out_outcome: d.fanOutOutcome } : {}),
       ...(d?.identity !== undefined ? { identity: d.identity } : {}),
       ...(d?.ordinal !== undefined ? { ordinal: d.ordinal } : {}),
       ...(d?.approvalDecision !== undefined ? { approval_decision: d.approvalDecision } : {}),

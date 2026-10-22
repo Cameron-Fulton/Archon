@@ -27,7 +27,8 @@ import { attentionAnswerLines } from '@archon/workflows/deps';
 import { CLI_WORKFLOW_SURFACE } from '../utils/workflow-surface';
 import { writeStderr } from '../utils/stdout';
 import { formatAge, getLog } from './workflow-shared';
-import { printVerboseNodes } from './workflow-node-summaries';
+import { formatRunUsage } from './workflow-usage';
+import { formatFanOutOutcome, printVerboseNodes } from './workflow-node-summaries';
 
 export function usageLimitWaitLine(nodeId: string, resumeAt: string): string {
   return `  Wait:   provider usage or rate limit at '${nodeId}' — tries again at ${resumeAt}`;
@@ -44,7 +45,7 @@ export function formatToolAttention(
           `  ${call.nodeId} · ${call.provider} · ${call.name}: ${call.title || call.name} (running ${Math.floor(call.elapsedMs / 1000)}s; no progress ${Math.floor(call.stalledForMs / 1000)}s)`
       )
       .join('\n') +
-    `\nInspect with archon workflow logs ${attention.runId}, or explicitly cancel the run.`
+    `\nInspect with archon workflow logs ${attention.runId}, or request recovery with archon workflow end-turn ${attention.runId}.`
   );
 }
 
@@ -376,6 +377,7 @@ export function printRunDetail(
   console.log(`  Status: ${run.status}`);
   if (run.outcome) console.log(`  Authored outcome: ${run.outcome}`);
   console.log(`  Age:    ${formatAge(run.started_at)}`);
+  for (const line of formatRunUsage(run.metadata)) console.log(line);
   printRunPauseLines(run);
   // Only a failed run's stop reason describes how it ended. A run can leave 'failed'
   // with the key still set (cancelWorkflowRun abandons a failed run without touching
@@ -480,12 +482,23 @@ function printAttentionWaitLines(
       console.log(`    ${line}`);
 }
 
+/** Unfinished fan-out child work under each node of a finished run. */
+function terminalFanOutLines(nodes: NonNullable<TerminalRecord>['nodes']): string[] {
+  return nodes.flatMap(node => {
+    const lines = formatFanOutOutcome(node.fan_out_outcome);
+    return lines.length === 0
+      ? []
+      : [`    Node ${node.node_id}:`, ...lines.map(line => `      ${line}`)];
+  });
+}
+
 function printTerminalRecord(terminalRecord: TerminalRecord): void {
   if (terminalRecord) {
     console.log('  Terminal record:');
     if (terminalRecord.first_failed_node) {
       console.log(`    First failed node: ${terminalRecord.first_failed_node}`);
     }
+    terminalFanOutLines(terminalRecord.nodes).forEach(line => console.log(line));
     console.log(`    Selected return: ${terminalRecord.returns.availability}`);
     console.log(`    Artifacts observed: ${String(terminalRecord.artifacts.files.length)}`);
     for (const file of terminalRecord.artifacts.files) console.log(`      - ${file.path}`);

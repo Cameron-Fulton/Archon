@@ -1,9 +1,14 @@
+export { resourceStartFixtures } from './resource-start-conformance';
+import { describeSourceReleaseConformance } from './store-conformance/source-release';
+import {
+  describeForeignCheckoutAdmission,
+  resourceStartFixtures,
+} from './resource-start-conformance';
 import {
   ResourceSlotCapacityConflictError,
   SourceReceiptDigestConflictError,
 } from './resource-start-store';
 import type {
-  PreparedWorkflowLaunch,
   ResourceStartBindingIntent,
   ResourceStartIntent,
   SourceReceiptAcceptance,
@@ -11,6 +16,7 @@ import type {
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import {
   FAN_OUT_CANCEL_REASONS,
+  DETACHED_LAUNCH_METADATA_KEY,
   executionClaim,
   WorkflowNotResumableError,
   WorkflowResourceBusyError,
@@ -266,6 +272,12 @@ export function describeWorkflowStoreConformance(
   label: string,
   makeHarness: () => Promise<WorkflowStoreHarness>
 ): void {
+  describeForeignCheckoutAdmission(
+    label,
+    makeHarness,
+    CONFORMANCE_CODEBASE_ID,
+    CONFORMANCE_CONVERSATION_ID
+  );
   describe(`workflow store conformance: ${label}`, () => {
     let harness: WorkflowStoreHarness;
     let store: IWorkflowStore;
@@ -277,38 +289,44 @@ export function describeWorkflowStoreConformance(
       await harness?.close();
     });
 
-    type Lane = PreparedWorkflowLaunch['execution']['isolation'];
-    /** Each launch runs in a checkout of its own unless `checkout` names a shared one. */
-    const launch = (
-      id = crypto.randomUUID(),
-      checkout: { cwd?: string; isolation?: Lane } = {}
-    ): PreparedWorkflowLaunch => ({
-      version: 2,
-      run: {
-        id,
-        workflow_name: 'conformance',
-        codebase_id: CONFORMANCE_CODEBASE_ID,
-        user_message: '',
-        metadata: {},
-      },
-      execution: {
-        cwd: checkout.cwd ?? `/conformance/${id}`,
-        conversationId: CONFORMANCE_CONVERSATION_ID,
-        isolation: checkout.isolation ?? { kind: 'in-place' },
-      },
+    test.each(['paused', 'completed', 'failed', 'cancelled'] as const)(
+      'running metadata write refuses a run that became %s after observation',
+      async status => {
+        const run = await running(store, { metadata: { preserved: true } });
+        expect((await store.getWorkflowRun(run.id))?.status).toBe('running');
+        if (status === 'paused') await store.updateWorkflowRun(run.id, { status });
+        else if (status === 'completed')
+          await store.completeWorkflowRun(run.id, { duration_ms: 1 });
+        else if (status === 'failed') await store.failWorkflowRun(run.id, 'failure');
+        else await store.cancelWorkflowRun(run.id);
+        const before = await store.getWorkflowRun(run.id);
+        expect(
+          await store.updateWorkflowRunMetadataIfRunning(run.id, { end_turn_request: {} })
+        ).toBe(false);
+        expect(await store.getWorkflowRun(run.id)).toEqual(before);
+      }
+    );
+
+    test('running metadata write merges only into a running run', async () => {
+      const pending = await create(store);
+      expect(await store.updateWorkflowRunMetadataIfRunning(pending.id, { request: true })).toBe(
+        false
+      );
+      expect(
+        await store.updateWorkflowRunMetadataIfRunning(crypto.randomUUID(), { request: true })
+      ).toBe(false);
+      const run = await running(store, { metadata: { preserved: true } });
+      expect(await store.updateWorkflowRunMetadataIfRunning(run.id, { request: true })).toBe(true);
+      expect((await store.getWorkflowRun(run.id))?.metadata).toMatchObject({
+        preserved: true,
+        request: true,
+      });
     });
-    const start = (
-      overlap: 'queue' | 'skip' = 'queue',
-      hostId = 'host',
-      capacity = 1,
-      checkout?: { cwd?: string; isolation?: Lane }
-    ): ResourceStartIntent => ({
-      resource: 'resource',
-      capacity,
-      hostId,
-      overlap,
-      launch: launch(undefined, checkout),
-    });
+
+    const { launch, start } = resourceStartFixtures(
+      CONFORMANCE_CODEBASE_ID,
+      CONFORMANCE_CONVERSATION_ID
+    );
     const binding: ResourceStartBindingIntent = {
       bindingId: 'binding',
       bindingRevision: 'v1',
@@ -958,6 +976,15 @@ export function describeWorkflowStoreConformance(
           launch: prepared,
         })
       ).toBeNull();
+      prepared.run.metadata.admission_checkout_guard = 'false';
+      await expect(
+        store.completeStartBindingPreparation({ ...identity, launch: prepared })
+      ).rejects.toThrow('expected a boolean');
+      expect(await store.getResourceStartRequest(prepared.run.id)).toBeNull();
+      expect(await store.getStartReceipt(input.receipt.id)).toMatchObject({
+        bindings: [{ status: 'preparing' }],
+      });
+      prepared.run.metadata.admission_checkout_guard = true;
       const result = await store.completeStartBindingPreparation({ ...identity, launch: prepared });
       expect(result).toEqual({
         status: 'admitted',
@@ -1410,29 +1437,7 @@ export function describeWorkflowStoreConformance(
       );
       expect(await types(store, run.id)).toContain('source_released');
     });
-    test('a source release never overrides another transition', async () => {
-      const release = {
-        claimId: null,
-        nodeId: 'check',
-        error: 'EACCES',
-        retryAt: new Date(Date.now() + 60_000).toISOString(),
-      };
-      const cancelled = await running(store);
-      await store.cancelWorkflowRun(cancelled.id);
-      expect(await store.releaseRunForUnreadableSource(cancelled.id, release)).toEqual({
-        released: false,
-      });
-      expect((await store.getWorkflowRun(cancelled.id))?.status).toBe('cancelled');
-      const gated = await running(store);
-      await store.pauseWorkflowRun(gated.id, approval);
-      expect(await store.releaseRunForUnreadableSource(gated.id, release)).toEqual({
-        released: false,
-      });
-      const row = await store.getWorkflowRun(gated.id);
-      expect(row?.status).toBe('paused');
-      expect(readSourceRelease(row?.metadata)).toBeUndefined();
-      expect(await types(store, gated.id)).not.toContain('source_released');
-    });
+    describeSourceReleaseConformance(() => store);
     test('only stale running runs can resume; completed and cancelled runs refuse', async () => {
       const run = await running(store);
       expect(await rejection(store.resumeWorkflowRun(run.id))).toBeInstanceOf(
@@ -2024,6 +2029,45 @@ export function describeWorkflowStoreConformance(
         timed.id,
         gate.id,
       ]);
+    });
+    test('loop question references survive pause, label, answer and resume writes', async () => {
+      const run = await running(store);
+      const loopQuestionReferences = {
+        '$LOOP_PREV.work.output': '$other.output',
+        $LOOP_USER_INPUT: 'feedback',
+      };
+      const pause: WorkflowWaitContext = {
+        ...attentionWait,
+        owner: 'loop_group',
+        nodeId: 'grp',
+        bodyWaitId: 'ask',
+        iteration: 2,
+        sessionId: null,
+        sessionProvider: null,
+        loopQuestionReferences,
+      };
+      await store.pauseWorkflowRunForWait(run.id, pause, { kind: 'started', stepName: 'grp.ask' });
+      expect((await store.getWorkflowRun(run.id))?.metadata.wait).toEqual(pause);
+      expect(
+        await store.labelAttentionWait(run.id, {
+          pauseId: 'ask-1',
+          set: { state: 'ready' },
+          unset: [],
+          via: 'cli',
+        })
+      ).toMatchObject({ labeled: true });
+      expect(await store.answerAttentionWait(run.id, attentionAnswer('use-main'))).toEqual({
+        answered: true,
+      });
+      expect((await store.getWorkflowRun(run.id))?.metadata.wait).toMatchObject({
+        loopQuestionReferences,
+      });
+      const resumed = await store.resumeWorkflowRun(run.id, {
+        kind: 'answered',
+        nodeId: 'grp',
+        pauseId: 'ask-1',
+      });
+      expect(resumed.metadata.wait).toMatchObject({ loopQuestionReferences });
     });
     test('an attention answer has one winner, is audited, and is due once at its exact occurrence', async () => {
       const due = async (): Promise<string[]> =>
@@ -2642,6 +2686,58 @@ export function describeWorkflowStoreConformance(
         expect(harness.terminalReports()).toEqual(reports);
       }
     );
+    test.each([
+      'pending',
+      'wrong token',
+      'running',
+      'paused',
+      'completed',
+      'failed',
+      'cancelled',
+      'missing',
+    ] as const)('detached startup failure condition preserves ownership: %s', async state => {
+      const run = await store.createWorkflowRun({
+        workflow_name: 'startup',
+        user_message: '',
+        metadata: { [DETACHED_LAUNCH_METADATA_KEY]: 'launch-token' },
+      });
+      if (state !== 'pending' && state !== 'wrong token' && state !== 'missing') {
+        await store.claimPendingWorkflowRun(run.id);
+        if (state === 'paused') await store.pauseWorkflowRun(run.id, approval);
+        if (state === 'completed') await store.completeWorkflowRun(run.id, { duration_ms: 0 });
+        if (state === 'failed') await store.failWorkflowRun(run.id, 'first failure');
+        if (state === 'cancelled') await store.cancelWorkflowRun(run.id);
+      }
+      const before = await store.getWorkflowRun(run.id);
+      const events = await store.listWorkflowEvents(run.id);
+      const reports = harness.terminalReports();
+      expect(
+        await store.failWorkflowRun(
+          state === 'missing' ? crypto.randomUUID() : run.id,
+          'startup failed',
+          {
+            exitReason: 'launch_failed',
+            pendingLaunchToken: state === 'wrong token' ? 'stale-token' : 'launch-token',
+          }
+        )
+      ).toEqual({ failed: state === 'pending' });
+      if (state === 'pending') {
+        expect(await store.getWorkflowRun(run.id)).toMatchObject({
+          status: 'failed',
+          metadata: { error: 'startup failed', stop_reason: { reason: 'launch_failed' } },
+        });
+        expect(
+          (await store.listWorkflowEvents(run.id)).filter(
+            event => event.event_type === 'workflow_failed'
+          )
+        ).toHaveLength(1);
+        expect(harness.terminalReports()).toEqual([...reports, run.id]);
+      } else {
+        expect(await store.getWorkflowRun(run.id)).toEqual(before);
+        expect(await store.listWorkflowEvents(run.id)).toEqual(events);
+        expect(harness.terminalReports()).toEqual(reports);
+      }
+    });
     test('failure rejects a missing run', async () => {
       expect(await rejection(store.failWorkflowRun('missing-run', 'failure'))).toBeInstanceOf(
         Error
