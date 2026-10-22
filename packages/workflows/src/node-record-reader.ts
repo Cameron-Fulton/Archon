@@ -8,6 +8,7 @@ import {
 } from './schemas/node-execution';
 import {
   DEFERRED_NODE_USAGE_EVENT_TYPE,
+  isPersistedExecType,
   serializedDeferredNodeUsageDataSchema,
   serializedNodeDataSchema,
   type SerializedNodeData,
@@ -33,6 +34,12 @@ export interface ReadNodeRecordEvent {
   metadata?: NodeExecutionMetadata;
 }
 
+export function isExecNodeRecord(record: ReadNodeRecordEvent): boolean {
+  return record.metadata
+    ? record.metadata.node.kind === 'exec'
+    : isPersistedExecType(record.data.type);
+}
+
 const eventDataSchema = z.record(z.string(), z.unknown());
 const eventTypes = new Set<string>(NODE_STATE_EVENT_TYPES);
 const metadataKeys = Object.keys(nodeExecutionMetadataPayloadSchema.shape);
@@ -48,10 +55,8 @@ function projectSerializedData(raw: Record<string, unknown>): SerializedNodeData
   const projected: Record<string, unknown> = {};
   for (const [key, schema] of Object.entries(serializedNodeDataSchema.shape)) {
     if (!Object.hasOwn(raw, key)) continue;
-    if (key === 'declared_output_paths') {
-      projected[key] = serializedNodeDataSchema.shape.declared_output_paths
-        .unwrap()
-        .parse(raw[key]);
+    if (key === 'declared_output_paths' || key === 'child_usage') {
+      projected[key] = serializedNodeDataSchema.shape[key].unwrap().parse(raw[key]);
       continue;
     }
     const parsed = schema.safeParse(raw[key]);

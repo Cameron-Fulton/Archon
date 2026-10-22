@@ -1,4 +1,5 @@
-import { pauseGateRespectingExternalTransition } from '../../pause';
+import { reportedChildUsage, unreportedChildUsage } from '../../child-usage';
+import { runOrStagePause, pauseGateRespectingExternalTransition } from '../../pause';
 import { nodeInvocationKey } from '../../../node-record-reader';
 import { finishNodeExecution } from '../../../node-execution';
 import {
@@ -214,25 +215,31 @@ async function suspendOnHeldChildren(
     { status: 'suspended', point: 'fan_out' },
     { output: { text: '' }, diagnostics: { fanOut: true } }
   );
-  const paused = await pauseGateRespectingExternalTransition(
-    ctx.deps,
-    ctx.workflowRun.id,
-    {
-      type: 'fan_out',
-      nodeId: stepName,
-      message,
-      childRunIds: held.map(([, id]) => id),
-      unspawnedItems,
+  return runOrStagePause(
+    ctx,
+    async () => {
+      const paused = await pauseGateRespectingExternalTransition(
+        ctx.deps,
+        ctx.workflowRun.id,
+        {
+          type: 'fan_out',
+          nodeId: stepName,
+          message,
+          childRunIds: held.map(([, id]) => id),
+          unspawnedItems,
+        },
+        { event: serializeNodeStateRecord(suspended), boundary: ctx.containerPause }
+      );
+      if (!paused) return serializeNodeOutput(execution);
+      await recordDerivedExecution({ logDir: ctx.logDir }, suspended);
+      await notify(
+        `⏸ **Waiting on sub-runs** (node \`${node.id}\`): ${message} ` +
+          `See them with \`${spellWorkflowCommand(ctx.platform, 'status')}\`.`
+      );
+      return serializeNodeOutput(suspended);
     },
-    { event: serializeNodeStateRecord(suspended) }
+    () => serializeNodeOutput(execution)
   );
-  if (!paused) return serializeNodeOutput(execution);
-  await recordDerivedExecution({ logDir: ctx.logDir }, suspended);
-  await notify(
-    `⏸ **Waiting on sub-runs** (node \`${node.id}\`): ${message} ` +
-      `See them with \`${spellWorkflowCommand(ctx.platform, 'status')}\`.`
-  );
-  return serializeNodeOutput(suspended);
 }
 
 /**
@@ -275,6 +282,7 @@ export async function executeFanOutWorkflowNode(
   const msgContext = { workflowId: parentRun.id, nodeName: node.id };
   const stepName = ctx.stepNamePrefix + node.id;
   let tokensUnknown = false;
+  let childUsage: ExecutionDiagnostics['childUsage'];
 
   // node_failed writer (mirrors executeWorkflowNode.failResult) — a fan-out failure may
   // still carry accumulated cost/tokens so spend over already-run children is tracked.
@@ -295,7 +303,7 @@ export async function executeFanOutWorkflowNode(
           costUsd,
           tokens,
           tokensUnknown,
-          diagnostics: { fanOut: true, ...diagnostics },
+          diagnostics: { fanOut: true, childUsage, ...diagnostics },
         }
       )
     );
@@ -321,7 +329,11 @@ export async function executeFanOutWorkflowNode(
           costUsd,
           tokens,
           tokensUnknown,
-          diagnostics: { fanOut: true, ...(fanOutOutcome !== undefined ? { fanOutOutcome } : {}) },
+          diagnostics: {
+            fanOut: true,
+            childUsage,
+            ...(fanOutOutcome !== undefined ? { fanOutOutcome } : {}),
+          },
         }
       )
     );
@@ -509,9 +521,18 @@ export async function executeFanOutWorkflowNode(
     return outcome;
   });
 
-  const totalCostUsd = sumReportedCost(outcomes);
-  const totalTokens = sumFanOutTokens(outcomes);
-  tokensUnknown = outcomes.some(outcome => outcome.tokensUnknown === true);
+  childUsage = outcomes.map(reportedChildUsage);
+  const unreported = outcomes.map(outcome =>
+    unreportedChildUsage(outcome, ctx.reportedChildUsage, outcome.childRunId)
+  );
+  const usage = {
+    costUsd: sumReportedCost(unreported),
+    tokens: sumFanOutTokens(unreported),
+    tokensUnknown: unreported.some(outcome => outcome.tokensUnknown === true),
+  };
+  const totalCostUsd = usage.costUsd;
+  const totalTokens = usage.tokens;
+  tokensUnknown = usage.tokensUnknown === true;
 
   return joinSettledChildren(node, ctx, fanOut.join, stepName, outcomes, {
     notify,

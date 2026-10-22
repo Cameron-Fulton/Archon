@@ -29,7 +29,7 @@ import {
 import { readComposedMeta } from '../compiled-command';
 import { type ExecNodeEnvironmentContext, buildExecNodeEnvironment } from '../exec-environment';
 import { substituteWorkflowVariables, type TemplateReferences } from '../workflow-variables';
-import { type AttentionOption, attentionOptionsSchema } from '../schemas/dag-node';
+import { type AttentionOption, attentionOptionsSchema } from '../schemas/wait-node';
 import { getLog } from './log';
 import type { RunLayersContext } from './run-context';
 import { type LoopBodyScope, loopScopeTokens, substituteLoopBodyText } from './loop-scope';
@@ -126,12 +126,13 @@ export function buildNodeShellEnvironment(
   node: DagNode,
   ctx: ShellInputContext,
   envVars: NodeJS.ProcessEnv | undefined,
-  executionContext: ExecNodeEnvironmentContext
+  executionContext: Omit<ExecNodeEnvironmentContext, 'inputEnvKeys'>
 ): NodeJS.ProcessEnv {
+  const inputs = inputEnvVars(node, ctx);
   return {
     ...envVars,
-    ...inputEnvVars(node, ctx),
-    ...buildExecNodeEnvironment(executionContext),
+    ...inputs,
+    ...buildExecNodeEnvironment({ ...executionContext, inputEnvKeys: Object.keys(inputs) }),
   };
 }
 

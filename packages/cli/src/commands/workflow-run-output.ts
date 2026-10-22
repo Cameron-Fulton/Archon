@@ -150,10 +150,11 @@ export async function presentRunResult(
 ): Promise<PendingWaitContinuation | undefined> {
   const { host, workflow, result, adapter, conversationId, destination, detachedProcessOwner } =
     input;
+  if ('handedOff' in result) return presentHandoff(result, detachedProcessOwner);
   const run = await readRunForPresentation(host, workflow, result);
 
   // Check result and exit appropriately
-  if (result.success && 'paused' in result && result.paused) {
+  if ('paused' in result) {
     // A durable wait with a deadline (time, event or usage limit) is this process's own
     // cursor to wake; a gate or `attention` pause has no deadline and stays with whoever resolves it.
     if (result.waitCursor !== undefined) {
@@ -163,7 +164,8 @@ export async function presentRunResult(
       console.log('\nWorkflow paused — waiting for approval.');
     }
   } else if (result.success) {
-    // Surface workflow result to Web UI as a result card (mirrors orchestrator.ts result message).
+    // Surface workflow result to Web UI as a result card (mirrors the background dispatch
+    // result message in core's orchestrator/dispatch/background-run.ts).
     // Paused workflows are handled in the branch above and intentionally do not get a result card.
     if ('summary' in result && result.summary) {
       await sendResultCard(
@@ -184,6 +186,17 @@ export async function presentRunResult(
     printRunUsage(run);
     throw new WorkflowRunFailedError(result.error, detachedProcessOwner);
   }
+  return undefined;
+}
+
+function presentHandoff(
+  result: Extract<WorkflowExecutionResult, { handedOff: true }>,
+  detachedProcessOwner: boolean
+): undefined {
+  console.log(
+    `\nWorkflow execution handed off. Observed status: ${result.observedStatus ?? 'run removed'}.`
+  );
+  if (!result.success) throw new WorkflowRunFailedError(result.error, detachedProcessOwner);
   return undefined;
 }
 

@@ -65,7 +65,7 @@ import { ResourceSlotCapacityConflictError } from '@archon/workflows/resource-st
 import type { Codebase } from '../schemas/codebase';
 import type { WorkflowHost } from './host-store';
 import { registerRepository } from '../handlers/clone';
-import { ensureIsolationConfigured } from '../orchestrator/orchestrator';
+import { ensureIsolationConfigured } from '../orchestrator/dispatch/isolation-resolver';
 import { resolveCodebaseForPath } from '../services/codebase-checkout-resolver';
 import { startRunLiveOwner, type RunLiveOwner } from '../services/run-live-owner';
 import { createCodebaseChildResolver } from './child-isolation-resolver';
@@ -299,7 +299,10 @@ export interface ResourceStartHost extends WorkflowHost {
   startAdmitted: (requestId: string) => Promise<void>;
 }
 
-/** A preparation, dispatch, or resource drain failure. Unknown receipt origins omit `receiptId`. */
+/**
+ * A preparation, dispatch, resource drain, or damaged receipt failure. Unknown or untrusted
+ * receipt origins omit `receiptId`.
+ */
 export interface ResourceStartDrainFailure {
   receiptId?: string;
   error: unknown;
@@ -328,7 +331,7 @@ function receiptIdOfLaunch(launch: PreparedWorkflowLaunch | undefined): string |
 /**
  * One host pass: prepare this host's pending receipt bindings, then admit its queued
  * requests while their slots have capacity. Every admitted request is handed to the
- * host. Safe to run concurrently with other hosts and processes: preparation and
+ * host. A damaged receipt is reported after the pass instead of stopping it. Safe to run concurrently with other hosts and processes: preparation and
  * admission are claimed atomically by the store.
  */
 export async function drainResourceStartHost(host: ResourceStartHost): Promise<void> {
@@ -342,6 +345,10 @@ export async function drainResourceStartHost(host: ResourceStartHost): Promise<v
   };
 
   for (const binding of await host.deps.store.listPendingStartBindings({ hostId: host.hostId })) {
+    if ('document' in binding) {
+      failures.push({ error: binding.error });
+      continue;
+    }
     if (!binding.intent) continue;
     const identity = {
       receiptId: binding.receiptId,
@@ -485,7 +492,11 @@ export interface StartAdmittedResourceStartInput {
    * the owned run on a graceful signal here; the server omits it because one process
    * hosts many runs and must not install process-wide handlers per run.
    */
-  guardOwnedRun?: (owned: { runId: string; liveOwner: RunLiveOwner }) => () => void;
+  guardOwnedRun?: (owned: {
+    runId: string;
+    liveOwner: RunLiveOwner;
+    getExecutionClaim: () => string | null | undefined;
+  }) => () => void;
   /**
    * The PID of a detached process that executes only this run and leads its own process
    * group. Registering it lets `archon workflow cancel` terminate that tree. The server
@@ -529,9 +540,14 @@ export async function startAdmittedResourceStart(
   const liveOwner = await startRunLiveOwner(run.id, {
     detachedProcessPid: input.detachedProcessPid,
   });
+  let ownedExecutionClaim: string | null | undefined;
   let releaseGuard: (() => void) | undefined;
   try {
-    releaseGuard = input.guardOwnedRun?.({ runId: run.id, liveOwner });
+    releaseGuard = input.guardOwnedRun?.({
+      runId: run.id,
+      liveOwner,
+      getExecutionClaim: () => ownedExecutionClaim,
+    });
     const deps = host.deps;
     const preparedAiConfiguration = await prepareRunAiConfiguration(
       deps,
@@ -594,6 +610,9 @@ export async function startAdmittedResourceStart(
       origin: run.origin ?? undefined,
       options: {
         preCreatedRun: run,
+        onExecutionClaimed: claim => {
+          ownedExecutionClaim = claim;
+        },
         preparedAiConfiguration,
         codebaseId: codebase.id,
         baseBranch,
