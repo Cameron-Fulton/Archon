@@ -4,18 +4,20 @@
  * (`engine-contract-tests.ts`) against `InProcessWorkflowEngine`
  * (issue #3334).
  *
- * Mock setup mirrors `executor.test.ts`'s "Mock ... / Import after mocks"
- * convention — `InProcessWorkflowEngine` delegates straight through to the
+ * Mock setup mirrors `executor/test-utils.ts`, the scaffolding of the
+ * `executor.*.test.ts` files — `InProcessWorkflowEngine` delegates straight through to the
  * real `executeWorkflow`/`hydrateResumableRun`, so the same fs/git/dag-executor
  * seams need stubbing here too. This file deliberately does NOT mock
  * `./executor` or `@archon/workflows/executor` itself.
  */
 import { providerRegistry } from '@archon/providers';
 import { afterEach, describe, expect, it, mock } from 'bun:test';
-import { mkdtemp } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { mkdir, mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { trackTempRoots } from '@archon/paths/test-utils';
+import { getRunArtifactsDirForRoot, getRunScratchDir } from '@archon/paths/archon-paths';
 
 // --- Mock logger ---
 const mockLogFn = mock(() => {});
@@ -103,7 +105,7 @@ mock.module('./event-emitter', () => ({
   getWorkflowEventEmitter: mock(() => mockEmitter),
 }));
 
-// --- Bootstrap provider registry (after path mocks), same as executor.test.ts ---
+// --- Bootstrap provider registry (after path mocks), same as executor/test-utils.ts ---
 import { clearRegistry } from '@archon/providers';
 import { registerBuiltinProviders, registerCommunityProviders } from '@archon/providers/in-process';
 clearRegistry();
@@ -124,10 +126,13 @@ runWorkflowEngineContractTests(providerRegistry, deps => new InProcessWorkflowEn
   executedWorkflow: () => executedWorkflow,
 });
 
-describe('InProcessWorkflowEngine.subscribe', () => {
+describe('InProcessWorkflowEngine', () => {
   const roots = trackTempRoots();
+  const originalArchonHome = process.env.ARCHON_HOME;
   afterEach(() => {
     dagBody = undefined;
+    if (originalArchonHome === undefined) delete process.env.ARCHON_HOME;
+    else process.env.ARCHON_HOME = originalArchonHome;
   });
 
   const platform = {
@@ -181,6 +186,49 @@ describe('InProcessWorkflowEngine.subscribe', () => {
     deliveries
       .filter(({ event }) => event.event_type.startsWith('workflow_') || event.step_name)
       .map(({ event }) => `${event.workflow_run_id}:${event.event_type}:${event.step_name ?? ''}`);
+
+  it('resume settles before the host drains scratch cleanup', async () => {
+    const { engine, store } = await makeEngine();
+    const home = roots(await mkdtemp(join(tmpdir(), 'archon-engine-resume-scratch-')));
+    process.env.ARCHON_HOME = home;
+    const root = join(home, 'project');
+    const run = await store.createWorkflowRun({
+      workflow_name: parent.name,
+      user_message: '',
+    });
+    await store.updateWorkflowRun(run.id, { output_root: root });
+    await completeNode(store, run.id, 'first');
+    await store.failWorkflowRun(run.id, 'interrupted');
+    const failed = await store.getWorkflowRun(run.id);
+    if (failed?.status !== 'failed') throw new Error('expected a failed run');
+    const scratch = getRunScratchDir(getRunArtifactsDirForRoot(root, run.id));
+    await mkdir(scratch, { recursive: true });
+    dagBody = async ({ deps, workflowRun }) => {
+      await completeNode(deps.store, workflowRun.id, 'child');
+      await deps.store.completeWorkflowRun(workflowRun.id, { duration_ms: 1 });
+      return undefined;
+    };
+    const cleanups: (() => Promise<void>)[] = [];
+
+    const admission = await engine.resume({
+      platform,
+      conversationId: 'conv-1',
+      cwd: root,
+      userMessage: '',
+      run: failed,
+      legacyWorkflow: parent,
+      options: { deferScratchCleanup: cleanup => cleanups.push(cleanup) },
+    });
+    if (!admission.accepted) throw new Error('expected resume');
+    const result = await admission.settled;
+
+    expect(result).toMatchObject({ success: true, workflowRunId: run.id });
+    expect(await store.getWorkflowRunStatus(run.id)).toBe('completed');
+    expect(cleanups).toHaveLength(1);
+    expect(existsSync(scratch)).toBe(true);
+    await Promise.all(cleanups.map(cleanup => cleanup()));
+    expect(existsSync(scratch)).toBe(false);
+  });
 
   it('delivers the run and its workflow child in commit order', async () => {
     const { engine, store } = await makeEngine();

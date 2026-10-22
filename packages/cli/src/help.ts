@@ -1,22 +1,15 @@
 /**
- * Help rendering — structured data plus a renderer. The data is split into
- * three tables so the global help output stays byte-identical to the
- * pre-refactor template literal (the original Commands block, Options block,
- * and Examples block are each hand-curated and do not follow a natural entry
- * iteration order).
- *
- * `commandHelp` lists one entry per Commands-block line in the order they
- * appear. `orderedFlags` lists every flag in the pre-refactor Options block
- * order, with `owners` naming each flag's (command, subcommand) tuples; an
- * empty `owners` array marks the flag as global (only in `archon --help`).
- * `orderedExamples` lists every example in the pre-refactor Examples block
- * order with the same owner model. `renderHelp(...)` selects entries and
- * filters the flag and example lists by owner for scoped slices.
+ * Help tables preserve an explicit display order. Commands, flags and examples
+ * carry owners so renderHelp can select the matching scoped slice.
+ * An empty flag owners array means global help only; scoped-only flags belong
+ * to their enclosing command entry.
  */
 
+import { CHAT_PROJECT_ID_ARG } from '@archon/paths/workflow-scope';
 import { userRoleSchema } from '@archon/core/schemas/user';
 import type { ForgeRequest } from '@archon/forge/operations';
 import { attachmentCommands } from './attachment-commands';
+import { RUN_PROJECT_CONFLICT_FLAGS } from './dispatch-guards';
 
 interface FlagOwner {
   command: string;
@@ -46,12 +39,7 @@ interface HelpEntry {
   // column 29. The renderer wraps to the next line when the spec itself
   // overflows the description column (spec.length > 35).
   description: string;
-  // Scoped-only flags: shown in the matching `archon <cmd> [<subcmd>] --help`
-  // slice but NOT in the global help. Used for flags the legacy template
-  // literal documented via a Commands-block alias (e.g. `isolation cleanup
-  // --merged`) rather than as a standalone Options entry, so the global
-  // Options block stays byte-identical to the pre-refactor text while
-  // scoped help can still surface every flag the entry actually accepts.
+  // Flags shown only in the matching command or subcommand Options block.
   scopedFlags?: FlagHelp[];
 }
 
@@ -94,14 +82,6 @@ const forgeOperationDescriptions = {
   'comment.upsert': 'Write the one marked comment on a pull request',
 } satisfies Record<ForgeRequest['op'], string>;
 
-// One entry per Commands-block line, in global-help order. `renderHelp()`
-// returns the global index with no selection; `renderHelp(...)`
-// filters this list by the (command, subcommand) tuple for scoped slices.
-// Subcommands listed in `scopedOnlyHelp` below never render in the global
-// Commands block, so global help stays byte-identical to the pre-refactor
-// template literal while scoped slices can still surface every supported
-// subcommand (`--detach` is owned by `workflow approve`/`reject`, which
-// live here so the global Commands block does not grow).
 const commandHelp: HelpEntry[] = [
   {
     command: 'state',
@@ -158,8 +138,15 @@ const commandHelp: HelpEntry[] = [
   { command: 'chat', spec: 'chat <message>', description: 'Send a message to the orchestrator' },
   {
     command: 'setup',
-    spec: 'setup',
+    spec: 'setup [--scope <home|project>]',
     description: 'Interactive setup wizard for credentials and config',
+    scopedFlags: [
+      {
+        spec: '--scope <home|project>',
+        description:
+          'Write ~/.archon/.env (default) or <repo-root>/.archon/.env (requires a git repository)',
+      },
+    ],
   },
   {
     command: 'workflow',
@@ -245,7 +232,7 @@ const commandHelp: HelpEntry[] = [
         description:
           'Stream readable changes until stopped; the open set comes first\n' +
           'A degraded warning means coverage may have gaps. Repair and replay:\n' +
-          'https://archon.diy/guides/attention-queue/#stream-the-queue',
+          'https://archon.diy/getting-started/operate/#stream-the-queue',
       },
       {
         spec: '--after <cursor>',
@@ -318,6 +305,12 @@ const commandHelp: HelpEntry[] = [
   },
   {
     command: 'workflow',
+    subcommand: 'end-turn',
+    spec: 'workflow end-turn <run-id>',
+    description: 'Record a request to end stalled tools or reported work',
+  },
+  {
+    command: 'workflow',
     subcommand: 'respond',
     spec: 'workflow respond <run-id> <decision> [text]',
     description:
@@ -335,6 +328,48 @@ const commandHelp: HelpEntry[] = [
           'A declared option to choose; repeat for a multi_select (omit for a message form)',
       },
       { spec: '--text <text>', description: 'Free text recorded with the answer' },
+    ],
+  },
+  {
+    command: 'workflow',
+    subcommand: 'reset-sessions',
+    spec: 'workflow reset-sessions <workflow-name>',
+    description:
+      'Delete persisted sessions for a workflow (omits --scope only with --yes; [--node <id>] [--json])',
+    scopedFlags: [
+      {
+        spec: '--scope <key>',
+        description: 'Limit the reset to one scope (omit to delete every scope; requires --yes)',
+      },
+      {
+        spec: '--node <id>',
+        description:
+          'Limit the reset to one node in the selected scope, or every scope with --yes when --scope is omitted',
+      },
+      {
+        spec: '--yes',
+        description: 'Confirm cross-scope reset; refused without --scope or --yes',
+      },
+    ],
+  },
+  {
+    command: 'workflow',
+    subcommand: 'event',
+    spec: 'workflow event emit',
+    description: 'Emit a workflow event into a run',
+    scopedFlags: [
+      {
+        spec: '--run-id <id>',
+        description: 'Target run for the event (required)',
+      },
+      {
+        spec: '--type <event-type>',
+        description: 'Event type to emit (required)',
+      },
+      {
+        spec: '--data <json>',
+        description: 'JSON payload for the event (optional)',
+      },
     ],
   },
   {
@@ -361,10 +396,6 @@ const commandHelp: HelpEntry[] = [
     subcommand: 'cleanup',
     spec: 'isolation cleanup --merged',
     description: 'Remove environments with branches merged into the base branch',
-    // `--merged` and `--include-closed` are documented via the Commands-block
-    // alias above in the legacy template literal; they live here so scoped
-    // `isolation cleanup --help` can list them without changing the global
-    // Options block.
     scopedFlags: [
       {
         spec: '--merged',
@@ -379,7 +410,7 @@ const commandHelp: HelpEntry[] = [
   {
     command: 'complete',
     spec: 'complete <branch> [...]',
-    description: 'Complete branch lifecycle (remove worktree + branches)',
+    description: 'Remove worktree and local branch; retain remote branch',
   },
   {
     command: 'serve',
@@ -492,6 +523,12 @@ const commandHelp: HelpEntry[] = [
     description: 'Rotate the anonymous install UUID',
   },
   {
+    command: 'telemetry',
+    subcommand: 'no-match',
+    spec: 'telemetry no-match',
+    description: 'Record an agent decision that no workflow fits',
+  },
+  {
     command: 'validate',
     subcommand: 'workflows',
     spec: 'validate workflows [name]',
@@ -511,14 +548,7 @@ const commandHelp: HelpEntry[] = [
   { command: 'help', spec: 'help', description: 'Show this help message' },
 ];
 
-// Scoped-only entries: subcommands the dispatch handles but whose Commands
-// line never appeared in the pre-refactor monolithic help. They render only
-// in their matching `archon <command> <subcommand> --help` slice; `archon
-// --help` must stay byte-identical, so they are NOT concatenated into the
-// global Commands block. Keeping them in a separate table (rather than
-// appending to `commandHelp`) makes that boundary explicit and keeps the
-// "no flag documentation is lost" invariant honest — nothing here ships in
-// global help that was not in the original.
+// Additional entries shown only in scoped help.
 const scopedOnlyHelp: HelpEntry[] = [
   ...attachmentHelp('plugin', true),
   ...attachmentHelp('skill', true),
@@ -701,59 +731,26 @@ const scopedOnlyHelp: HelpEntry[] = [
     spec: 'workflow cleanup [days]',
     description: 'Delete terminal runs older than N days (default: 7)',
   },
-  {
-    command: 'workflow',
-    subcommand: 'reset-sessions',
-    spec: 'workflow reset-sessions <workflow-name>',
-    description:
-      'Delete persisted sessions for a workflow (omits --scope only with --yes; [--node <id>] [--json])',
-    scopedFlags: [
-      {
-        spec: '--scope <key>',
-        description: 'Limit the reset to one scope (omit to delete every scope; requires --yes)',
-      },
-      {
-        spec: '--node <id>',
-        description: 'Limit the reset to one node within the chosen scope',
-      },
-      {
-        spec: '--yes',
-        description: 'Skip the confirmation prompt (required for cross-scope deletion)',
-      },
-    ],
-  },
-  {
-    command: 'workflow',
-    subcommand: 'event',
-    spec: 'workflow event emit',
-    description: 'Emit a workflow event into a run',
-    scopedFlags: [
-      {
-        spec: '--run-id <id>',
-        description: 'Target run for the event (required)',
-      },
-      {
-        spec: '--type <event-type>',
-        description: 'Event type to emit (required)',
-      },
-      {
-        spec: '--data <json>',
-        description: 'JSON payload for the event (optional)',
-      },
-    ],
-  },
 ];
 
-// Hand-curated flag order matching the pre-refactor Options block. Each flag
-// lists its owning (command, subcommand?) tuples; an empty array means
-// "global" — in `archon --help` only, never in a scoped slice. Multi-owner
-// flags (e.g. `--detach`, `--events`, `--force`) deduplicate by spec within
-// each render.
+// Every command entry in display order: the global entries, then the scoped-only ones.
+export const helpEntries: readonly HelpEntry[] = [...commandHelp, ...scopedOnlyHelp];
+
 const orderedFlags: FlagHelp[] = [
+  {
+    spec: `--${CHAT_PROJECT_ID_ARG} <id>`,
+    description: 'Confine chat workflow commands to a registered project ID',
+    owners: [{ command: 'workflow' }],
+  },
   {
     spec: '--cwd <path>',
     description: 'Override working directory (default: current directory)',
     owners: [],
+  },
+  {
+    spec: '--project <id|name>',
+    description: `Bind to a registered repository (see project list). Source/config come from --cwd;\nisolated execution uses the registered checkout. Use --no-worktree to execute in --cwd.\nCannot combine with ${RUN_PROJECT_CONFLICT_FLAGS.map(flag => `--${flag}`).join(', ')}.`,
+    owners: [{ command: 'workflow', subcommand: 'run' }],
   },
   {
     spec: '--branch, -b <name>',
@@ -1072,7 +1069,7 @@ const orderedExamples: ExampleHelp[] = [
 const HELP_DESC_COLUMN = 29;
 const HELP_SPEC_WRAP_THRESHOLD = 35;
 
-function formatSpecLine(spec: string, description: string): string {
+export function formatSpecLine(spec: string, description: string): string {
   const parts = description.split('\n');
   const first = parts[0] ?? '';
   const rest = parts.slice(1);
@@ -1123,21 +1120,29 @@ function selectExamplesFor(selected: HelpEntry[]): ExampleHelp[] {
 
 function selectEntries(command: string | undefined, subcommand: string | undefined): HelpEntry[] {
   if (command === undefined) return commandHelp;
-  // Scoped renders combine `commandHelp` matches with `scopedOnlyHelp`
-  // matches. `scopedOnlyHelp` entries never render in the global Commands
-  // block (the previous branch), so global help stays byte-identical while
-  // every supported subcommand has a Commands line in its scoped slice.
-  const sameCommand = commandHelp.filter(e => e.command === command);
-  const scopedExtra = scopedOnlyHelp.filter(e => e.command === command);
-  const merged = [...sameCommand, ...scopedExtra];
-  if (subcommand === undefined) return merged;
-  return merged.filter(e => e.subcommand === subcommand);
+  return helpEntries.filter(
+    e => e.command === command && (subcommand === undefined || e.subcommand === subcommand)
+  );
+}
+
+/**
+ * Render help for CLI positionals. A multi-word subcommand such as
+ * `attention label` spans its words; otherwise the second positional is it.
+ */
+export function renderHelpFor(positionals: readonly string[]): string {
+  const [command, ...rest] = positionals;
+  const words = `${rest.join(' ')} `;
+  const spanned = helpEntries.find(
+    e =>
+      e.command === command && e.subcommand?.includes(' ') && words.startsWith(`${e.subcommand} `)
+  );
+  return renderHelp(command, spanned?.subcommand ?? rest[0]);
 }
 
 /**
  * Render the help slice for `command`/`subcommand`. With no arguments the
- * output is the global index, byte-identical to the pre-refactor template
- * literal. With a (command, subcommand) tuple, only that slice is shown.
+ * output is the global index. With a (command, subcommand) tuple, only that
+ * slice is shown.
  */
 export function renderHelp(command?: string, subcommand?: string): string {
   const entries = selectEntries(command, subcommand);

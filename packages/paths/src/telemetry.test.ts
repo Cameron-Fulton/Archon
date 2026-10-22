@@ -10,6 +10,7 @@ import {
   captureArchonStarted,
   captureArchonActive,
   captureChatTurn,
+  captureWorkflowNoMatch,
   captureApprovalResolved,
   captureCodebaseRegistered,
   captureWorkflowTerminal,
@@ -432,6 +433,13 @@ describe('classifyWorkflowForTelemetry', () => {
     });
   });
 
+  test('installed workflow names are redacted and preserve their source', () => {
+    expect(classifyWorkflowForTelemetry('acme/private:deploy', 'installed')).toEqual({
+      workflow_name: 'custom',
+      workflow_source: 'installed',
+    });
+  });
+
   test('undefined source defaults to the privacy-safe custom/project treatment', () => {
     expect(classifyWorkflowForTelemetry('anything', undefined)).toEqual({
       workflow_name: 'custom',
@@ -572,6 +580,35 @@ describe('new capture functions are fire-and-forget no-throw', () => {
     await captureTelemetry(() => {
       expect(() => captureArchonActive({ surface: 'server' })).not.toThrow();
     });
+  });
+
+  test('no-match decisions have a separate anonymous event from ordinary chat', async () => {
+    const events = await captureTelemetry(() => {
+      captureChatTurn({ outcome: 'completed' });
+      captureWorkflowNoMatch('native_tool');
+      captureWorkflowNoMatch('cli');
+    });
+    expect(eventProperties(events, 'chat_turn_handled')).toMatchObject({ outcome: 'completed' });
+    expect(eventProperties(events, 'workflow_no_match')).toMatchObject({
+      $process_person_profile: false,
+      $ip: '',
+      schema_version: TELEMETRY_SCHEMA_VERSION,
+      transport: 'native_tool',
+    });
+    expect(
+      events
+        .filter(event => event.event === 'workflow_no_match')
+        .map(event => event.properties.transport)
+    ).toEqual(['native_tool', 'cli']);
+  });
+
+  test('no-match reporting respects telemetry opt-out on both transports', async () => {
+    const events = await captureTelemetry(() => {
+      process.env.DO_NOT_TRACK = '1';
+      captureWorkflowNoMatch('native_tool');
+      captureWorkflowNoMatch('cli');
+    });
+    expect(events).toEqual([]);
   });
 
   test('captureChatTurn does not throw (disabled)', () => {

@@ -1,4 +1,5 @@
 import { describe, test, expect, mock, beforeEach } from 'bun:test';
+import { TERMINAL_RUN_EVENT_TYPE } from '@archon/workflows/schemas/workflow-run';
 import type { WorkflowEventRow } from '@archon/workflows/schemas/workflow-event';
 import {
   WORKFLOW_EVENT_TYPES,
@@ -93,6 +94,16 @@ const emittedIds = (t: FakeTransport): string[] =>
   t.emitted.map(({ event }) => (JSON.parse(event) as { runId: string }).runId);
 
 describe('mapWorkflowEventRow', () => {
+  test.each(Object.entries(TERMINAL_RUN_EVENT_TYPE))(
+    'polls and projects the terminal status %s',
+    (status, eventType) => {
+      expect(WORKFLOW_EVENT_TYPES).toContain(eventType);
+      expect(DASHBOARD_SOURCE_EVENT_TYPES).toContain(eventType);
+      const mapped = mapWorkflowEventRow(row({ event_type: eventType }));
+      expect(JSON.parse(mapped ?? '{}')).toMatchObject({ type: 'workflow_status', status });
+    }
+  );
+
   test.each([...WORKFLOW_EVENT_TYPES])(
     'source membership matches row mapping for %s',
     eventType => {
@@ -254,6 +265,48 @@ describe('DashboardEventPoller', () => {
     mockLog.error.mockClear();
     mockLog.warn.mockClear();
   });
+
+  test.each(['node_started', 'node_suspended', 'node_completed', 'node_failed', 'node_skipped'])(
+    'a malformed %s row does not block later runs or replay on the next drain',
+    async eventType => {
+      const feed = makeFeed();
+      const t = makeTransport();
+      const poller = new DashboardEventPoller(feed);
+      await poller.start(t, 1e9);
+      const malformed = row({
+        id: 'bad-event',
+        workflow_run_id: 'bad-run',
+        event_type: eventType,
+        data: { node: { id: 'build', kind: 'exec', runtime: 'sh' } },
+      });
+      try {
+        expect(() => mapWorkflowEventRow(malformed)).toThrow('metadata is incomplete');
+        feed.write(
+          malformed,
+          row({ workflow_run_id: 'healthy-run', event_type: 'workflow_completed' })
+        );
+        await poller.drainNow();
+        expect(emittedIds(t)).toEqual(['healthy-run']);
+
+        feed.write(row({ workflow_run_id: 'next-run', event_type: 'workflow_started' }));
+        await poller.drainNow();
+        expect(emittedIds(t)).toEqual(['healthy-run', 'next-run']);
+        expect(mockLog.warn).toHaveBeenCalledTimes(1);
+        expect(mockLog.warn.mock.calls[0]).toEqual([
+          {
+            err: expect.any(Error),
+            eventId: 'bad-event',
+            runId: 'bad-run',
+            eventType,
+          },
+          'dashboard_poller.row_mapping_failed',
+        ]);
+        expect(mockLog.error).not.toHaveBeenCalled();
+      } finally {
+        poller.stop();
+      }
+    }
+  );
 
   test('emits events written after start once, in commit order, and never replays history', async () => {
     const feed = makeFeed();

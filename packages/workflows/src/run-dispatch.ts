@@ -1,3 +1,4 @@
+import { resolveRunExecutionMode, type RunExecutionMode } from './container-context';
 import { getDefaultBranch, getDefaultRemote, toRepoPath } from '@archon/git';
 import { createLogger } from '@archon/paths';
 import { requireProvider } from '@archon/provider-contract';
@@ -36,6 +37,7 @@ function getLog(): ReturnType<typeof createLogger> {
 
 /** What a run executes with, settled before its row is created or claimed. */
 export interface RunDispatch {
+  execution: RunExecutionMode;
   /** The row's owner on a continuation, the invoking user otherwise. */
   executionUserId: string | undefined;
   /** A resume of a run that already started; a pre-created pending row is a fresh dispatch. */
@@ -74,6 +76,11 @@ export async function resolveRunDispatch(
     opts
   );
   if (containerRefusal) return { stopped: true, result: containerRefusal };
+  const execution = resolveRunExecutionMode(
+    opts.execContext,
+    opts.container,
+    isContinuation ? preCreatedRun.metadata : undefined
+  );
 
   const executionUserId = preCreatedRun ? (preCreatedRun.user_id ?? undefined) : origin?.userId;
   const prepared = await prepareDispatchAiConfiguration(
@@ -130,6 +137,7 @@ export async function resolveRunDispatch(
   return {
     stopped: false,
     value: {
+      execution,
       executionUserId,
       isContinuation,
       prepared,
@@ -280,7 +288,7 @@ async function resolveBaseBranch(
   recordedDispatch: RunDispatchMetadata | undefined
 ): Promise<string> {
   // The per-dispatch override takes priority, then what this run
-  // recorded at its start, then repo config, then the caller-provided codebase default,
+  // recorded at its start, then an already resolved checkout base, repo config, the codebase default,
   // then git auto-detection.
   // The override must outrank config so `--base` reports the same branch the
   // worktree was cut from (WorktreeProvider applies the same order); it also outranks the
@@ -290,6 +298,7 @@ async function resolveBaseBranch(
   const overrideBaseBranch = opts.baseOverride?.trim();
   if (overrideBaseBranch) return overrideBaseBranch;
   if (recordedDispatch) return recordedDispatch.base_branch;
+  if (opts.resolvedBaseBranch !== undefined) return opts.resolvedBaseBranch;
   if (config.baseBranch) return config.baseBranch;
   const fallbackBaseBranch = opts.baseBranch?.trim();
   if (fallbackBaseBranch) return fallbackBaseBranch;

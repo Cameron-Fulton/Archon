@@ -1,4 +1,6 @@
+import { holdsWorkflowPath } from '../workflow-path-lock';
 import {
+  TERMINAL_RUN_EVENT_TYPE,
   CANCELLATION_NOOP_WORKFLOW_STATUSES,
   CAPACITY_WAIT_METADATA_KEY,
   SOURCE_RELEASE_METADATA_KEY,
@@ -27,6 +29,7 @@ import {
   sourceReleaseMetadata,
   executionClaim,
   EXECUTION_CLAIM_METADATA_KEY,
+  DETACHED_LAUNCH_METADATA_KEY,
   sourceReleasedEvent,
 } from '../store';
 import {
@@ -74,17 +77,11 @@ export type TransactionView = Omit<
    * otherwise. Lets a store decide slot admission before the resume changes anything.
    */
   resumableRun(id: string, cursor?: WorkflowResumeCursor): WorkflowRun;
-  /** Record a paused run's first capacity refusal; false when there is nothing to record. */
-  recordCapacityWait(id: string): boolean;
+  recordCapacityWait(id: string): void;
   clearCapacityWait(id: string): void;
 };
 
-/** Events that end a run; a commit that adds one reports the run's terminal telemetry. */
-export const TERMINAL_RUN_EVENT_TYPES = [
-  'workflow_completed',
-  'workflow_failed',
-  'workflow_cancelled',
-] as const;
+export { TERMINAL_RUN_EVENT_TYPES } from '../schemas/workflow-run';
 
 export function createTransactionView(
   runs: Map<string, WorkflowRun>,
@@ -333,6 +330,13 @@ export function createTransactionView(
         working_path: run.working_path ?? updates.working_path ?? null,
       });
     },
+    updateWorkflowRunMetadataIfRunning: async (id, metadata) => {
+      validateWorkflowWaitMetadata(metadata);
+      const run = runs.get(id);
+      if (run?.status !== 'running') return false;
+      Object.assign(run.metadata, structuredClone(metadata));
+      return true;
+    },
     updateWorkflowActivity: async (id): ReturnType<IWorkflowStore['updateWorkflowActivity']> => {
       const run = runs.get(id);
       if (run) run.last_activity_at = new Date();
@@ -357,11 +361,19 @@ export function createTransactionView(
       Object.assign(run.metadata, metadata);
       await terminal(run, {
         workflow_run_id: id,
-        event_type: 'workflow_completed',
+        event_type: TERMINAL_RUN_EVENT_TYPE.completed,
         data: completion,
       });
     },
     failWorkflowRun: async (id, error, options): ReturnType<IWorkflowStore['failWorkflowRun']> => {
+      if (options?.pendingLaunchToken !== undefined) {
+        const current = runs.get(id);
+        if (
+          current?.status !== 'pending' ||
+          current.metadata[DETACHED_LAUNCH_METADATA_KEY] !== options.pendingLaunchToken
+        )
+          return { failed: false };
+      }
       const run = structuredClone(row(id));
       if (isTerminalRunStatus(run.status)) return { failed: false };
       if (run.status !== 'running' && run.status !== 'pending')
@@ -378,7 +390,7 @@ export function createTransactionView(
         };
       await terminal(run, {
         workflow_run_id: id,
-        event_type: 'workflow_failed',
+        event_type: TERMINAL_RUN_EVENT_TYPE.failed,
         data: { error, ...(options?.exitReason ? { exit_reason: options.exitReason } : {}) },
       });
       return { failed: true };
@@ -414,9 +426,8 @@ export function createTransactionView(
     resumableRun: (id, cursor) => structuredClone(resumableRun(id, cursor)),
     recordCapacityWait: id => {
       const run = row(id);
-      if (run.status !== 'paused' || readCapacityWait(run.metadata) !== undefined) return false;
+      if (run.status !== 'paused' || readCapacityWait(run.metadata) !== undefined) return;
       run.metadata[CAPACITY_WAIT_METADATA_KEY] = { since: new Date().toISOString() };
-      return true;
     },
     clearCapacityWait: id => {
       Reflect.deleteProperty(row(id).metadata, CAPACITY_WAIT_METADATA_KEY);
@@ -541,9 +552,7 @@ export function createTransactionView(
               run.working_path === path &&
               run.id !== self?.id &&
               !self?.excludeRunIds?.includes(run.id) &&
-              (run.status === 'running' ||
-                run.status === 'paused' ||
-                (run.status === 'pending' && run.started_at.getTime() > Date.now() - 300_000)) &&
+              holdsWorkflowPath(run) &&
               (!self ||
                 run.started_at < self.startedAt ||
                 (run.started_at.getTime() === self.startedAt.getTime() && run.id < self.id))
@@ -677,16 +686,14 @@ export function createTransactionView(
       const run = structuredClone(runs.get(id));
       if (!run || !gateOpen(run, expected)) return { resolved: false };
       run.status = 'cancelled';
+      const { step_name, ...data } = cancellation;
       await terminal(
         run,
         {
           workflow_run_id: id,
-          event_type: 'workflow_cancelled',
-          step_name: cancellation.step_name,
-          data: {
-            cancel_reason: 'approval_rejected',
-            ...(cancellation.reason === undefined ? {} : { reason: cancellation.reason }),
-          },
+          event_type: TERMINAL_RUN_EVENT_TYPE.cancelled,
+          step_name,
+          data: { ...data, cancel_reason: 'approval_rejected' },
         },
         gateEvents.map(event => ({ ...event, workflow_run_id: id }))
       );
@@ -707,7 +714,7 @@ export function createTransactionView(
           run: { ...structuredClone(target), status: 'cancelled' },
           event: {
             workflow_run_id: target.id,
-            event_type: 'workflow_cancelled',
+            event_type: TERMINAL_RUN_EVENT_TYPE.cancelled,
             data: { cancel_reason: 'conversation_reset' },
           },
         }))
@@ -719,14 +726,12 @@ export function createTransactionView(
       if (!run || CANCELLATION_NOOP_WORKFLOW_STATUSES.includes(run.status))
         return { cancelled: false };
       run.status = 'cancelled';
+      const { step_name, ...data } = details ?? {};
       await terminal(run, {
         workflow_run_id: id,
-        event_type: 'workflow_cancelled',
-        step_name: details?.step_name,
-        data: {
-          ...(details?.reason === undefined ? {} : { reason: details.reason }),
-          ...(details?.cancel_reason === undefined ? {} : { cancel_reason: details.cancel_reason }),
-        },
+        event_type: TERMINAL_RUN_EVENT_TYPE.cancelled,
+        step_name,
+        data,
       });
       return { cancelled: true };
     },
@@ -738,7 +743,7 @@ export function createTransactionView(
       run.metadata.cancelled_reason = reason;
       await terminal(run, {
         workflow_run_id: id,
-        event_type: 'workflow_cancelled',
+        event_type: TERMINAL_RUN_EVENT_TYPE.cancelled,
         data: { reason, cancel_reason: 'fan_out' },
       });
       return { cancelled: true };
@@ -761,7 +766,7 @@ export function createTransactionView(
         const event = events[index];
         if (
           event?.workflow_run_id === id &&
-          event.event_type === 'workflow_cancelled' &&
+          event.event_type === TERMINAL_RUN_EVENT_TYPE.cancelled &&
           FAN_OUT_CANCEL_REASONS.some(reason => reason === event.data.reason)
         )
           events.splice(index, 1);
@@ -769,10 +774,11 @@ export function createTransactionView(
       record({ workflow_run_id: id, event_type: 'workflow_resumed' });
       return structuredClone(run);
     },
-    releaseRunForUnreadableSource: async (id, release) => {
+    releaseRunForUnreadableSource: async (id, release, beforePublish) => {
       const run = row(id);
       if (run.status !== 'running' || executionClaim(run.metadata) !== release.claimId)
         return { released: false };
+      await beforePublish?.();
       run.status = 'paused';
       run.last_activity_at = new Date();
       Object.assign(run.metadata, sourceReleaseMetadata(release, new Date().toISOString()));

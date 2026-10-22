@@ -1,5 +1,6 @@
 import { declaredOutputPathsSchema } from '../output-ref';
 import { z } from 'zod';
+import { fanOutOutcomeSchema } from './fan-out-outcome';
 import {
   providerFailureSchema,
   SESSION_PREVIEW_LENGTH,
@@ -205,6 +206,8 @@ export const executionDiagnosticsSchema = z.object({
    */
   blockedOnChildRunId: z.string().optional(),
   fanOut: z.boolean().optional(),
+  /** A settled `workflow:` fan-out's per-slot record and tally. */
+  fanOutOutcome: fanOutOutcomeSchema.optional(),
   identity: z.string().optional(),
   ordinal: z.number().optional(),
   approvalDecision: z.string().optional(),
@@ -212,6 +215,7 @@ export const executionDiagnosticsSchema = z.object({
   /** The node's optional MCP servers were not loaded, and why. */
   mcpUnavailable: mcpUnavailableSchema.optional(),
 });
+export type ExecutionDiagnostics = z.infer<typeof executionDiagnosticsSchema>;
 
 export const nodeExecutionMetadataSchema = z.object({
   runId: z.string(),
@@ -234,6 +238,13 @@ export const nodeExecutionMetadataSchema = z.object({
   lifecycle: executionLifecycleSchema,
 });
 export type NodeExecutionMetadata = z.infer<typeof nodeExecutionMetadataSchema>;
+
+/** Run identity comes from the event envelope; lifecycle is reconstructed from its type. */
+export const nodeExecutionMetadataPayloadSchema = nodeExecutionMetadataSchema.omit({
+  runId: true,
+  path: true,
+  lifecycle: true,
+});
 
 /** What a node row's `cost_usd` measures: the node's own spend, or a total restating spend other rows carry. */
 export const nodeCostScopeSchema = z.enum(['own', 'total']);
