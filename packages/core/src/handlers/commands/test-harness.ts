@@ -12,6 +12,11 @@
  */
 import type { RunActor } from '../../operations/run-authorization';
 import { expect, mock, spyOn } from 'bun:test';
+import {
+  ISOLATION_PROVIDER_TYPES,
+  ISOLATION_WORKFLOW_TYPES,
+  ENVIRONMENT_STATUSES,
+} from '@archon/isolation/types';
 import { createMockLogger } from '../../test/mocks/logger';
 import type { Codebase, Conversation, Session, WorkflowRequest } from '../../types';
 import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
@@ -415,6 +420,9 @@ export const mockIsolationDestroy = mock(
 );
 
 mock.module('@archon/isolation', () => ({
+  ISOLATION_PROVIDER_TYPES,
+  ISOLATION_WORKFLOW_TYPES,
+  ENVIRONMENT_STATUSES,
   WorktreeUncommittedChangesError,
   worktreeRegistrationMetadata,
   readWorktreeCreationId,
@@ -460,11 +468,23 @@ export const mockReclaimContainerEnv = mock(async () => undefined);
 export const mockGetLiveRunBlocker = mock<typeof CleanupRunLock.getLiveRunBlocker>(() =>
   Promise.resolve(null)
 );
+export const mockGetWorktreeStatusBreakdown = mock<
+  typeof import('../../services/cleanup-service').getWorktreeStatusBreakdown
+>(() =>
+  Promise.resolve({
+    total: 0,
+    active: 0,
+    merged: 0,
+    stale: 0,
+    activeEnvs: [],
+    mergedEnvs: [],
+    staleEnvs: [],
+    inspectionFailedEnvs: [],
+  })
+);
 mock.module('../../services/cleanup-service', () => ({
   cleanupStaleWorktrees: mockCleanupStaleWorktrees,
-  getWorktreeStatusBreakdown: mock(() =>
-    Promise.resolve({ total: 0, active: 0, merged: 0, stale: 0, activeEnvs: [] })
-  ),
+  getWorktreeStatusBreakdown: mockGetWorktreeStatusBreakdown,
 }));
 mock.module('../../services/cleanup/run-lock', () => ({
   getLiveRunBlocker: mockGetLiveRunBlocker,
@@ -518,6 +538,7 @@ mock.module('@archon/paths', () => ({
 
 // Helper to clear all mocks
 export function clearAllMocks(): void {
+  mockGetWorktreeStatusBreakdown.mockClear();
   mockUpdateConversation.mockClear();
   mockGetCodebase.mockClear();
   mockFindCodebaseByDefaultCwd.mockClear();

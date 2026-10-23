@@ -347,8 +347,12 @@ describe('manage_run — reads', () => {
     ]);
     const tool = buildManageRunTool({ actor: operator, operations, codebaseId: CODEBASE_ID });
     const out = await tool.handler({ action: 'get', runId: 'r1abcdef' });
-    expect(out).toContain('status: completed');
-    expect(out).toContain('finished:');
+    expect(out).toBe(
+      'Run r1abcdef · archon-investigate\n' +
+        'status: completed\n' +
+        'started: 2026-06-01T00:00:00.000Z\n' +
+        'finished: 2026-06-01T01:00:00.000Z'
+    );
   });
 
   test('get renders a succeeded authored outcome beside paused status', async () => {
@@ -405,8 +409,18 @@ describe('manage_run — reads', () => {
     const tool = buildManageRunTool({ actor: operator, operations, codebaseId: CODEBASE_ID });
     const out = await tool.handler({ action: 'get', runId: 'r1abcdef' });
 
-    expect(out).toContain('occurrence: pause-1');
-    expect(out).toContain('form: select');
+    expect(out).toBe(
+      'Run r1abcdef · archon-investigate\n' +
+        'status: paused\n' +
+        'started: 2026-06-01T00:00:00.000Z\n' +
+        'occurrence: pause-1\n' +
+        'needs attention: Which base?\n' +
+        'form: select\n' +
+        'options: use-main, use-dev\n' +
+        'labels: ci=other\n' +
+        'revision: 3\n' +
+        '-> answer with action=respond, decision=<one of the options>, optionally with message=<text>.'
+    );
     expect(out).toContain('options: use-main, use-dev');
     expect(out).toContain('labels: ci=other');
     expect(out).toContain('revision: 3');
@@ -798,6 +812,15 @@ describe('manage_run — destructive confirmation gate', () => {
     });
     expect(out).toContain('Rejected and cancelled');
     expect(mockReject).toHaveBeenCalledWith('r1abcdef-1234', 'no', operator, { via: 'manage_run' });
+  });
+
+  test('reject that cancels reports cleanup warnings', async () => {
+    mockFindByPrefix.mockResolvedValue([makeRun({ status: 'paused' })]);
+    mockReject.mockResolvedValue(rejectionResult({ cleanupWarnings: ['container env-a remains'] }));
+    const tool = buildManageRunTool({ actor: operator, operations, codebaseId: CODEBASE_ID });
+    const out = await tool.handler({ action: 'reject', runId: 'r1abcdef', confirm: true });
+    expect(out).toContain('Rejected and cancelled');
+    expect(out).toContain('Warning: container env-a remains');
   });
 
   test('reject with no message leaves the default reason to rejectWorkflow', async () => {
