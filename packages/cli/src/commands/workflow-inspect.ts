@@ -1,6 +1,7 @@
 import { existsSync, readdirSync, type Dirent } from 'node:fs';
 import * as archonPaths from '@archon/paths';
 import type { WorkflowHost } from '@archon/core/workflows/host-store';
+import type { DashboardWorkflowRun } from '@archon/workflows/schemas/workflow-run-listing';
 import type { WorkflowEventRow } from '@archon/workflows/schemas/workflow-event';
 import { join } from 'node:path';
 import type {
@@ -28,7 +29,44 @@ import { CLI_WORKFLOW_SURFACE } from '../utils/workflow-surface';
 import { writeStderr } from '../utils/stdout';
 import { formatAge, getLog } from './workflow-shared';
 import { formatRunUsage } from './workflow-usage';
-import { formatFanOutOutcome, printVerboseNodes } from './workflow-node-summaries';
+import {
+  formatFanOutOutcome,
+  fetchVerboseEvents,
+  printVerboseNodes,
+} from './workflow-node-summaries';
+
+export async function printStatusRun(
+  host: WorkflowHost,
+  run: DashboardWorkflowRun,
+  verbose: boolean | undefined
+): Promise<void> {
+  const age = formatAge(run.started_at);
+  console.log(`  ID:     ${run.id}`);
+  console.log(`  Name:   ${run.workflow_name}`);
+  console.log(`  Path:   ${run.working_path ?? '(none)'}`);
+  console.log(`  Status: ${run.status}`);
+  const attention = runAttention(run);
+  if (attention?.kind === 'stalled_tool_calls') console.log(formatToolAttention(attention));
+  if (attention?.kind === 'usage_limit')
+    console.log(usageLimitWaitLine(attention.nodeId, attention.resumeAt));
+  if (run.outcome) console.log(`  Authored outcome: ${run.outcome}`);
+  console.log(`  Age:    ${age}`);
+  if (run.active_nodes.length > 0) {
+    console.log(
+      `  Active node${run.active_nodes.length === 1 ? '' : 's'}: ${run.active_nodes.join(', ')}`
+    );
+  }
+
+  if (verbose) {
+    const { events, failed } = await fetchVerboseEvents(host, run.id, false);
+    if (failed) {
+      console.log('  (node events unavailable — see logs)');
+    }
+    printVerboseNodes(events);
+  }
+
+  console.log('');
+}
 
 export function usageLimitWaitLine(nodeId: string, resumeAt: string): string {
   return `  Wait:   provider usage or rate limit at '${nodeId}' — tries again at ${resumeAt}`;
@@ -492,6 +530,26 @@ function terminalFanOutLines(nodes: NonNullable<TerminalRecord>['nodes']): strin
   });
 }
 
+const ARTIFACT_PREVIEW_LIMIT = 20;
+
+function printTerminalArtifacts(artifacts: NonNullable<TerminalRecord>['artifacts']): void {
+  const files = artifacts.files.filter(
+    file => !archonPaths.isRunArtifactsEngineEntry('', file.path.split('/')[0])
+  );
+  const internalFiles = artifacts.files.length - files.length;
+  console.log(`    Artifacts observed: ${String(artifacts.files.length)}`);
+  for (const file of files.slice(0, ARTIFACT_PREVIEW_LIMIT)) console.log(`      - ${file.path}`);
+  if (internalFiles > 0) {
+    console.log(`    Engine-internal artifact files (not listed): ${String(internalFiles)}`);
+  }
+  if (files.length > ARTIFACT_PREVIEW_LIMIT) {
+    console.log('    Artifact list truncated at the display cap');
+  }
+  for (const limitation of artifacts.limitations) {
+    console.log(`    Inventory limitation: ${limitation.kind} (${limitation.path})`);
+  }
+}
+
 function printTerminalRecord(terminalRecord: TerminalRecord): void {
   if (terminalRecord) {
     console.log('  Terminal record:');
@@ -500,11 +558,7 @@ function printTerminalRecord(terminalRecord: TerminalRecord): void {
     }
     terminalFanOutLines(terminalRecord.nodes).forEach(line => console.log(line));
     console.log(`    Selected return: ${terminalRecord.returns.availability}`);
-    console.log(`    Artifacts observed: ${String(terminalRecord.artifacts.files.length)}`);
-    for (const file of terminalRecord.artifacts.files) console.log(`      - ${file.path}`);
-    for (const limitation of terminalRecord.artifacts.limitations) {
-      console.log(`    Inventory limitation: ${limitation.kind} (${limitation.path})`);
-    }
+    printTerminalArtifacts(terminalRecord.artifacts);
   } else {
     console.log('  Terminal record: (unavailable)');
   }
@@ -528,8 +582,9 @@ function printLeaveBehindArtifacts(leaveBehind: LeaveBehind): void {
     console.log(
       `    Artifacts (${String(leaveBehind.artifactFiles.length)} files under $ARTIFACTS_DIR):`
     );
-    for (const f of leaveBehind.artifactFiles.slice(0, 20)) console.log(`      - ${f}`);
-    if (leaveBehind.artifactFiles.length > 20) console.log('      …');
+    for (const f of leaveBehind.artifactFiles.slice(0, ARTIFACT_PREVIEW_LIMIT))
+      console.log(`      - ${f}`);
+    if (leaveBehind.artifactFiles.length > ARTIFACT_PREVIEW_LIMIT) console.log('      …');
   }
   const omitted = leaveBehind.artifactFilesOmitted;
   if (omitted.internalFiles > 0) {

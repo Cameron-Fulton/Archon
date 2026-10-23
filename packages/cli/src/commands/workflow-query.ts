@@ -25,7 +25,6 @@ import {
   buildNodeSummaries,
   fetchVerboseEvents,
   listRunEvents,
-  printVerboseNodes,
   withRunDetail,
 } from './workflow-node-summaries';
 import { writeJsonLine, writeStderr, writeStdout } from '../utils/stdout';
@@ -46,8 +45,7 @@ import {
   transcriptUnavailableMessage,
 } from './workflow-transcript';
 import {
-  usageLimitWaitLine,
-  formatToolAttention,
+  printStatusRun,
   formatWaitOutcome,
   announceWaitAttached,
   type LeaveBehind,
@@ -111,27 +109,7 @@ export async function workflowTestCommand(
     });
   } catch (error) {
     if (errors.length === 0) throw error;
-    const message = error instanceof Error ? error.message : String(error);
-    if (options.json) {
-      await writeJsonLine({
-        ok: false,
-        error: message,
-        errors: errors.map(e => ({
-          filename: e.filename,
-          error: e.error,
-          errorType: e.errorType,
-        })),
-      });
-    } else {
-      let output = `Error: ${message}\n`;
-      if (errors.length > 0) {
-        output += `\n${errors.length} workflow(s) failed to load:\n\n`;
-        for (const loadError of errors) {
-          output += `  ${loadError.filename}: ${loadError.error}\n`;
-        }
-      }
-      await writeStdout(output);
-    }
+    await writeFixtureFailure(error, errors, options.json);
     return 1;
   }
 
@@ -145,21 +123,10 @@ export async function workflowTestCommand(
       })),
       passed: report.passed,
       failed: report.failed,
-      errors: errors.map(e => ({
-        filename: e.filename,
-        error: e.error,
-        errorType: e.errorType,
-      })),
+      errors: workflowLoadErrorsJson(errors),
     });
   } else {
-    let output = `${formatFixtureReport(report)}\n`;
-    if (errors.length > 0) {
-      output += `\n${errors.length} workflow(s) failed to load:\n\n`;
-      for (const error of errors) {
-        output += `  ${error.filename}: ${error.error}\n`;
-      }
-    }
-    await writeStdout(output);
+    await writeStdout(`${formatFixtureReport(report)}\n${formatFixtureLoadErrors(errors)}`);
   }
 
   if (
@@ -172,20 +139,40 @@ export async function workflowTestCommand(
   return 0;
 }
 
-/**
- * List available workflows in the current directory
- */
-export async function workflowListCommand(
-  cwd: string,
-  options: WorkflowListOptions = {}
+function workflowLoadErrorsJson(errors: readonly WorkflowLoadError[]) {
+  return errors.map(e => ({ filename: e.filename, error: e.error, errorType: e.errorType }));
+}
+
+function formatFixtureLoadErrors(errors: readonly WorkflowLoadError[]): string {
+  if (errors.length === 0) return '';
+  return `\n${errors.length} workflow(s) failed to load:\n\n${errors
+    .map(error => `  ${error.filename}: ${error.error}\n`)
+    .join('')}`;
+}
+
+async function writeFixtureFailure(
+  error: unknown,
+  errors: readonly WorkflowLoadError[],
+  json: boolean | undefined
 ): Promise<void> {
-  const { workflows: workflowEntries, errors } = await loadWorkflows(cwd);
-  let listedEntries = workflowEntries;
-  if (options.name !== undefined) {
+  const message = error instanceof Error ? error.message : String(error);
+  if (json) {
+    await writeJsonLine({ ok: false, error: message, errors: workflowLoadErrorsJson(errors) });
+  } else {
+    await writeStdout(`Error: ${message}\n${formatFixtureLoadErrors(errors)}`);
+  }
+}
+
+function selectWorkflowEntries(
+  workflowEntries: readonly WorkflowWithSource[],
+  errors: readonly WorkflowLoadError[],
+  name: string | undefined
+): readonly WorkflowWithSource[] {
+  if (name !== undefined) {
     let workflow: WorkflowWithSource['workflow'] | undefined;
     try {
       workflow = resolveWorkflowName(
-        options.name,
+        name,
         workflowEntries.map(entry => entry.workflow)
       );
     } catch (error) {
@@ -197,12 +184,61 @@ export async function workflowListCommand(
         .map(entry => `  - ${entry.workflow.name}`)
         .join('\n');
       throw new WorkflowListLookupError(
-        `Workflow '${options.name}' not found.\n\nAvailable workflows:\n${availableWorkflows || '  (none)'}`,
+        `Workflow '${name}' not found.\n\nAvailable workflows:\n${availableWorkflows || '  (none)'}`,
         errors
       );
     }
-    listedEntries = workflowEntries.filter(entry => entry.workflow.name === workflow.name);
+    return workflowEntries.filter(entry => entry.workflow.name === workflow.name);
   }
+
+  return workflowEntries;
+}
+
+function workflowJsonEntry(
+  { workflow: w, parseWarnings, declared }: WorkflowWithSource,
+  full: boolean
+): WorkflowJsonEntry {
+  const description = projectWorkflowDescription(w.description, full);
+  const entry: WorkflowJsonEntry = {
+    name: w.name,
+    description: description.description,
+    descriptionTruncated: description.truncated,
+  };
+  if (declared?.provider !== undefined) entry.provider = declared.provider;
+  if (declared?.model !== undefined) entry.model = declared.model;
+  if (declared?.effort !== undefined) entry.effort = declared.effort;
+  if (w.webSearchMode !== undefined) entry.webSearchMode = w.webSearchMode;
+  if (parseWarnings && parseWarnings.length > 0) entry.parseWarnings = [...parseWarnings];
+  return entry;
+}
+
+function printWorkflowEntry(
+  { workflow, parseWarnings, declared }: WorkflowWithSource,
+  full: boolean
+): void {
+  const description = projectWorkflowDescription(workflow.description, full);
+  console.log(`  ${workflow.name}`);
+  console.log(
+    `    ${description.description}${description.truncated ? WORKFLOW_DESCRIPTION_TRUNCATION_MARKER : ''}`
+  );
+  if (declared?.provider) {
+    console.log(`    Provider: ${declared.provider}`);
+  }
+  for (const warning of parseWarnings ?? []) {
+    console.log(`    Warning: ${warning}`);
+  }
+  console.log('');
+}
+
+/**
+ * List available workflows in the current directory
+ */
+export async function workflowListCommand(
+  cwd: string,
+  options: WorkflowListOptions = {}
+): Promise<void> {
+  const { workflows: workflowEntries, errors } = await loadWorkflows(cwd);
+  const listedEntries = selectWorkflowEntries(workflowEntries, errors, options.name);
 
   if (options.json) {
     const output = {
@@ -210,27 +246,8 @@ export async function workflowListCommand(
       // onto the nodes and removes them (#1764), so the listing reports what the author
       // wrote. `webSearchMode` is the one that stays on the definition — it has no
       // per-node form to collapse onto.
-      workflows: listedEntries.map(
-        ({ workflow: w, parseWarnings, declared }): WorkflowJsonEntry => {
-          const description = projectWorkflowDescription(w.description, options.full === true);
-          const entry: WorkflowJsonEntry = {
-            name: w.name,
-            description: description.description,
-            descriptionTruncated: description.truncated,
-          };
-          if (declared?.provider !== undefined) entry.provider = declared.provider;
-          if (declared?.model !== undefined) entry.model = declared.model;
-          if (declared?.effort !== undefined) entry.effort = declared.effort;
-          if (w.webSearchMode !== undefined) entry.webSearchMode = w.webSearchMode;
-          if (parseWarnings && parseWarnings.length > 0) entry.parseWarnings = [...parseWarnings];
-          return entry;
-        }
-      ),
-      errors: errors.map(e => ({
-        filename: e.filename,
-        error: e.error,
-        errorType: e.errorType,
-      })),
+      workflows: listedEntries.map(entry => workflowJsonEntry(entry, options.full === true)),
+      errors: workflowLoadErrorsJson(errors),
     };
     await writeJsonLine(output);
     return;
@@ -247,20 +264,7 @@ export async function workflowListCommand(
   if (listedEntries.length > 0) {
     console.log(`\nFound ${listedEntries.length} workflow(s):\n`);
 
-    for (const { workflow, parseWarnings, declared } of listedEntries) {
-      const description = projectWorkflowDescription(workflow.description, options.full === true);
-      console.log(`  ${workflow.name}`);
-      console.log(
-        `    ${description.description}${description.truncated ? WORKFLOW_DESCRIPTION_TRUNCATION_MARKER : ''}`
-      );
-      if (declared?.provider) {
-        console.log(`    Provider: ${declared.provider}`);
-      }
-      for (const warning of parseWarnings ?? []) {
-        console.log(`    Warning: ${warning}`);
-      }
-      console.log('');
-    }
+    for (const entry of listedEntries) printWorkflowEntry(entry, options.full === true);
   }
 
   if (errors.length > 0) {
@@ -291,29 +295,32 @@ async function verboseStatusRuns(
   });
 }
 
+async function resolveStatusCodebase(host: WorkflowHost, cwd: string, all: boolean | undefined) {
+  try {
+    const codebase = await inheritedWorkflowCodebase(host, all);
+    if (codebase === undefined && !all) {
+      return await findCodebaseForCheckoutPath(cwd, host.records.codebases);
+    }
+    return codebase;
+  } catch (error) {
+    const err = error as Error;
+    getLog().error({ err, cwd }, 'cli.workflow_status_codebase_lookup_failed');
+    throw new Error(`Failed to resolve workflow status project: ${err.message}`, { cause: err });
+  }
+}
+
 /** Show active workflow runs for the current project, or every project with `--all`. */
 export async function workflowStatusCommand(
   host: WorkflowHost,
   cwd: string,
   opts: { json?: boolean; verbose?: boolean; rawEvents?: boolean; all?: boolean } = {}
 ): Promise<void> {
-  const { getWorkflowStatus } = host.operations;
-
-  let codebase = null;
-  try {
-    codebase = await inheritedWorkflowCodebase(host, opts.all);
-    if (codebase === undefined && !opts.all) {
-      codebase = await findCodebaseForCheckoutPath(cwd, host.records.codebases);
-    }
-  } catch (error) {
-    const err = error as Error;
-    getLog().error({ err, cwd }, 'cli.workflow_status_codebase_lookup_failed');
-    throw new Error(`Failed to resolve workflow status project: ${err.message}`, { cause: err });
-  }
-
+  const codebase = await resolveStatusCodebase(host, cwd, opts.all);
   let runs: DashboardWorkflowRun[];
   try {
-    const result = await getWorkflowStatus(codebase ? { codebaseId: codebase.id } : undefined);
+    const result = await host.operations.getWorkflowStatus(
+      codebase ? { codebaseId: codebase.id } : undefined
+    );
     runs = result.runs;
   } catch (error) {
     const err = error as Error;
@@ -348,32 +355,7 @@ export async function workflowStatusCommand(
 
   console.log(`\nActive workflows (${runs.length}):\n`);
   for (const run of runs) {
-    const age = formatAge(run.started_at);
-    console.log(`  ID:     ${run.id}`);
-    console.log(`  Name:   ${run.workflow_name}`);
-    console.log(`  Path:   ${run.working_path ?? '(none)'}`);
-    console.log(`  Status: ${run.status}`);
-    const attention = runAttention(run);
-    if (attention?.kind === 'stalled_tool_calls') console.log(formatToolAttention(attention));
-    if (attention?.kind === 'usage_limit')
-      console.log(usageLimitWaitLine(attention.nodeId, attention.resumeAt));
-    if (run.outcome) console.log(`  Authored outcome: ${run.outcome}`);
-    console.log(`  Age:    ${age}`);
-    if (run.active_nodes.length > 0) {
-      console.log(
-        `  Active node${run.active_nodes.length === 1 ? '' : 's'}: ${run.active_nodes.join(', ')}`
-      );
-    }
-
-    if (opts.verbose) {
-      const { events, failed } = await fetchVerboseEvents(host, run.id, false);
-      if (failed) {
-        console.log('  (node events unavailable — see logs)');
-      }
-      printVerboseNodes(events);
-    }
-
-    console.log('');
+    await printStatusRun(host, run, opts.verbose);
   }
 }
 

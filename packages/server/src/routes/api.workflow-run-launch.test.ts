@@ -23,6 +23,118 @@ import {
   workflowRunLaunchMultipartSchema,
 } from './schemas/workflow-run-launch.schemas';
 
+describe('POST /api/conversations/:id/message multipart files', () => {
+  beforeEach(() => {
+    mockFindConversationByPlatformId.mockReset();
+    mockFindConversationByPlatformId.mockResolvedValue(MOCK_CONV);
+    mockHandleMessage.mockReset();
+    mockAddMessage.mockReset();
+  });
+
+  test.each(['text only', 'file then text', 'text then file', 'empty text'] as const)(
+    'refuses %s before any attachment or message write or dispatch',
+    async kind => {
+      const originalHome = mockArchonHome;
+      const home = await mkdtemp(join(tmpdir(), 'archon-invalid-message-files-'));
+      setMockArchonHome(home);
+      const write = spyOn(fsPromises, 'writeFile');
+      try {
+        const form = new FormData();
+        form.set('message', 'Read attachments');
+        const file = new File(['details'], 'request.txt', { type: 'text/plain' });
+        if (kind === 'file then text') form.append('files', file);
+        form.append('files', kind === 'empty text' ? '' : 'request.txt');
+        if (kind === 'text then file') form.append('files', file);
+        const { app, mockWebAdapter } = makeApp();
+        const response = await app.request('/api/conversations/web-test-abc/message', {
+          method: 'POST',
+          body: form,
+        });
+        expect(response.status).toBe(400);
+        expect(await response.json()).toEqual({ error: 'files must contain only file parts' });
+        expect(write).not.toHaveBeenCalled();
+        expect(await fsPromises.readdir(home)).toEqual([]);
+        expect(mockAddMessage).not.toHaveBeenCalled();
+        expect(mockWebAdapter.setConversationDbId).not.toHaveBeenCalled();
+        expect(mockHandleMessage).not.toHaveBeenCalled();
+      } finally {
+        write.mockRestore();
+        setMockArchonHome(originalHome);
+        await removeTempTree(home);
+      }
+    }
+  );
+
+  test('refuses six file parts before any attachment or message write or dispatch', async () => {
+    const originalHome = mockArchonHome;
+    const home = await mkdtemp(join(tmpdir(), 'archon-over-limit-message-files-'));
+    setMockArchonHome(home);
+    const write = spyOn(fsPromises, 'writeFile');
+    try {
+      const form = new FormData();
+      form.set('message', 'Read attachments');
+      for (let index = 0; index < 6; index++) {
+        form.append(
+          'files',
+          new File([`details ${index}`], `request-${index}.txt`, { type: 'text/plain' })
+        );
+      }
+      const { app, mockWebAdapter } = makeApp();
+      const response = await app.request('/api/conversations/web-test-abc/message', {
+        method: 'POST',
+        body: form,
+      });
+      expect(response.status).toBe(400);
+      expect(await response.json()).toEqual({ error: 'Maximum 5 files per message' });
+      expect(write).not.toHaveBeenCalled();
+      expect(await fsPromises.readdir(home)).toEqual([]);
+      expect(mockAddMessage).not.toHaveBeenCalled();
+      expect(mockWebAdapter.setConversationDbId).not.toHaveBeenCalled();
+      expect(mockHandleMessage).not.toHaveBeenCalled();
+    } finally {
+      write.mockRestore();
+      setMockArchonHome(originalHome);
+      await removeTempTree(home);
+    }
+  });
+
+  test.each([0, 1, 2, 5])('accepts %i file parts and delivers every attachment', async count => {
+    const originalHome = mockArchonHome;
+    const home = await mkdtemp(join(tmpdir(), 'archon-valid-message-files-'));
+    setMockArchonHome(home);
+    const received: { name: string; content: string }[] = [];
+    mockHandleMessage.mockImplementation(async (_adapter, _id, _message, context) => {
+      for (const file of context.attachedFiles ?? []) {
+        received.push({ name: file.name, content: await fsPromises.readFile(file.path, 'utf8') });
+      }
+    });
+    try {
+      const form = new FormData();
+      form.set('message', 'Read attachments');
+      const expected = Array.from({ length: count }, (_, index) => ({
+        name: `request-${index}.txt`,
+        content: `details ${index}`,
+      }));
+      for (const file of expected) {
+        form.append('files', new File([file.content], file.name, { type: 'text/plain' }));
+      }
+      const { app } = makeApp();
+      const response = await app.request('/api/conversations/web-test-abc/message', {
+        method: 'POST',
+        body: form,
+      });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({ accepted: true, status: 'started' });
+      expect(mockAddMessage).toHaveBeenCalledTimes(1);
+      expect(mockHandleMessage).toHaveBeenCalledTimes(1);
+      expect(received).toEqual(expected);
+    } finally {
+      setMockArchonHome(originalHome);
+      await removeTempTree(home);
+    }
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Tests: POST /api/workflows/:name/run
 // ---------------------------------------------------------------------------
@@ -343,6 +455,43 @@ describe('POST /api/workflows/:name/run', () => {
     }
   );
 
+  test('message dispatch receives every multipart attachment with its contents', async () => {
+    const originalHome = mockArchonHome;
+    const home = await mkdtemp(join(tmpdir(), 'archon-message-files-'));
+    setMockArchonHome(home);
+    const received: { name: string; content: string }[] = [];
+    mockFindConversationByPlatformId.mockResolvedValue(null);
+    mockHandleMessage.mockImplementationOnce(async (_adapter, _id, _message, context) => {
+      for (const file of context.attachedFiles ?? []) {
+        received.push({ name: file.name, content: await fsPromises.readFile(file.path, 'utf8') });
+      }
+    });
+    try {
+      const form = new FormData();
+      form.set('message', 'Read both attachments');
+      form.append('files', new File(['first contents'], 'first.txt', { type: 'text/plain' }));
+      form.append('files', new File(['second contents'], 'second.txt', { type: 'text/plain' }));
+      const { app } = makeApp();
+      const response = await app.request('/api/conversations/web-test-abc/message', {
+        method: 'POST',
+        body: form,
+      });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({ accepted: true, status: 'started' });
+      expect(mockHandleMessage).toHaveBeenCalledTimes(1);
+      expect(received).toEqual([
+        { name: 'first.txt', content: 'first contents' },
+        { name: 'second.txt', content: 'second contents' },
+      ]);
+      expect(await fsPromises.readdir(join(home, 'artifacts', 'uploads', 'web-test-abc'))).toEqual(
+        []
+      );
+    } finally {
+      setMockArchonHome(originalHome);
+      await removeTempTree(home);
+    }
+  });
+
   test('refuses launch when the chat request cannot be persisted', async () => {
     mockFindConversationByPlatformId.mockResolvedValueOnce(MOCK_CONV);
     mockAddMessage.mockRejectedValueOnce(new Error('history database unavailable'));
@@ -559,6 +708,35 @@ describe('POST /api/workflows/:name/run', () => {
 
     const body = (await response.json()) as { error: string };
     expect(body.error).toContain('Invalid workflow name');
+  });
+
+  test.each([
+    'null',
+    '[]',
+    '[{"conversationId":"web-test-abc","message":"Go"}]',
+    '"Go"',
+    '42',
+    'true',
+    'false',
+  ])('returns 400 for non-object JSON body %s before writes or dispatch', async body => {
+    const write = spyOn(fsPromises, 'writeFile');
+    try {
+      const { app } = makeApp();
+      const response = await app.request('/api/workflows/deploy/run', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body,
+      });
+      expect(response.status).toBe(400);
+      expect(response.headers.get('Content-Type')).toContain('application/json');
+      expect(await response.json()).toEqual({ error: 'Request body must be a JSON object' });
+      expect(mockFindConversationByPlatformId).not.toHaveBeenCalled();
+      expect(mockHandleMessage).not.toHaveBeenCalled();
+      expect(mockAddMessage).not.toHaveBeenCalled();
+      expect(write).not.toHaveBeenCalled();
+    } finally {
+      write.mockRestore();
+    }
   });
 
   test('returns 400 for malformed JSON body', async () => {

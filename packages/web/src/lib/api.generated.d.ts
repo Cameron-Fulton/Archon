@@ -1188,7 +1188,12 @@ export interface paths {
         };
         cookie?: never;
       };
-      requestBody?: never;
+      requestBody: {
+        content: {
+          'application/json': components['schemas']['SendMessageBody'];
+          'multipart/form-data': components['schemas']['SendMessageMultipartBody'];
+        };
+      };
       responses: {
         /** @description Accepted */
         200: {
@@ -4888,6 +4893,14 @@ export interface components {
       accepted: boolean;
       status: string;
     };
+    SendMessageBody: {
+      message: string;
+    };
+    SendMessageMultipartBody: {
+      message: string;
+      /** @description Repeated files parts, each at most 10485760 bytes. Upload MIME type restrictions apply. */
+      files?: string[];
+    };
     CodebaseListResponse: components['schemas']['Codebase'][];
     Codebase: {
       id: string;
@@ -6310,6 +6323,7 @@ export interface components {
             codebaseId: string | null;
             name: string;
           } | null;
+          parentRunId: string | null;
           fanOut: {
             parentRunId: string;
             nodeId: string;
@@ -6347,6 +6361,7 @@ export interface components {
             codebaseId: string | null;
             name: string;
           } | null;
+          parentRunId: string | null;
           fanOut: {
             parentRunId: string;
             nodeId: string;
@@ -6378,6 +6393,7 @@ export interface components {
             codebaseId: string | null;
             name: string;
           } | null;
+          parentRunId: string | null;
           fanOut: {
             parentRunId: string;
             nodeId: string;
@@ -6409,6 +6425,7 @@ export interface components {
             codebaseId: string | null;
             name: string;
           } | null;
+          parentRunId: string | null;
           fanOut: {
             parentRunId: string;
             nodeId: string;
@@ -6474,6 +6491,7 @@ export interface components {
               codebaseId: string | null;
               name: string;
             } | null;
+            parentRunId: string | null;
             fanOut: {
               parentRunId: string;
               nodeId: string;
@@ -6511,6 +6529,7 @@ export interface components {
               codebaseId: string | null;
               name: string;
             } | null;
+            parentRunId: string | null;
             fanOut: {
               parentRunId: string;
               nodeId: string;
@@ -6542,6 +6561,7 @@ export interface components {
               codebaseId: string | null;
               name: string;
             } | null;
+            parentRunId: string | null;
             fanOut: {
               parentRunId: string;
               nodeId: string;
@@ -6573,6 +6593,7 @@ export interface components {
               codebaseId: string | null;
               name: string;
             } | null;
+            parentRunId: string | null;
             fanOut: {
               parentRunId: string;
               nodeId: string;
@@ -7404,6 +7425,8 @@ export interface components {
       is_docker: boolean;
       is_wsl: boolean;
       wsl_distro?: string;
+      /** @description Opaque id of the Archon home this server serves. Compare it with that home's `store-id` file to confirm the server serves the home you mean. Omitted when the home has no readable store id. */
+      storeId?: string;
       activePlatforms?: string[];
       attentionDestinations?: {
         id: string;
