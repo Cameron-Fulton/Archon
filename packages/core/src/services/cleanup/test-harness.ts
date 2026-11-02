@@ -207,7 +207,17 @@ export class MockContainerBackend {
   }
   destroy = mockContainerDestroy;
 }
+export const mockReleaseVerificationImages = mock<typeof Isolation.releaseRunVerificationImages>(
+  async () => undefined
+);
+const { VerificationImageInventoryError, VERIFICATION_IMAGE_RUN_LABEL } = await import(
+  '@archon/isolation'
+);
 mock.module('@archon/isolation', () => ({
+  VerificationImageInventoryError,
+  VERIFICATION_IMAGE_RUN_LABEL,
+  dockerCli: mock(async () => ({ stdout: '', stderr: '' })),
+  releaseRunVerificationImages: mockReleaseVerificationImages,
   ISOLATION_PROVIDER_TYPES,
   ISOLATION_WORKFLOW_TYPES,
   ENVIRONMENT_STATUSES,
@@ -249,11 +259,15 @@ mock.module('../../db/isolation-environments', () => ({
   createIsolationStore: () => ({}),
 }));
 
+export const mockGetWorkflowRun = mock<typeof WorkflowDb.getWorkflowRun>(async () => null);
+export const mockGetRunIdsByIsolationEnvId = mock<typeof WorkflowDb.getRunIdsByIsolationEnvId>();
 export const mockGetRunByIsolationEnvId = mock<typeof WorkflowDb.getRunByIsolationEnvId>();
 mock.module('../../db/workflows', () => ({
+  getWorkflowRun: mockGetWorkflowRun,
   getWorkflowRunsByIds: mock(async () => []),
   getWorkflowRunForAttention: mock(async () => null),
   getRunByIsolationEnvId: mockGetRunByIsolationEnvId,
+  getRunIdsByIsolationEnvId: mockGetRunIdsByIsolationEnvId,
 }));
 
 export const mockGetConversationByPlatformId =
@@ -324,6 +338,9 @@ export function resetCleanupMocks(): void {
   mockListByCodebase.mockReset().mockResolvedValue([]);
   mockListByCodebaseWithAge.mockReset().mockResolvedValue([]);
   mockListActiveContainerEnvironments.mockReset().mockResolvedValue([]);
+  mockReleaseVerificationImages.mockClear();
+  mockGetWorkflowRun.mockReset().mockResolvedValue(null);
+  mockGetRunIdsByIsolationEnvId.mockReset().mockResolvedValue([]);
   mockGetRunByIsolationEnvId.mockReset().mockResolvedValue(null);
   mockGetConversationByPlatformId.mockReset().mockResolvedValue(null);
   mockUpdateConversation.mockReset().mockResolvedValue(undefined);
