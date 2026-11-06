@@ -93,6 +93,8 @@ export async function runState({
       ...(values.install === true ? { install: true } : {}),
       ...(values.raw === true ? { raw: true } : {}),
       ...(values.values === true ? { values: true } : {}),
+      ...(values.lease === true ? { lease: true } : {}),
+      ...(values['release-lease'] === true ? { releaseLease: true } : {}),
     },
     { storeKind }
   );
@@ -145,7 +147,7 @@ export async function runTrigger({
       limit: typeof values.limit === 'string' ? values.limit : undefined,
       yes: values.yes === true,
     },
-    (requestId, hostId) => spawnAdmitted(host, requestId, hostId)
+    { dispatch: (requestId, hostId) => spawnAdmitted(host, requestId, hostId) }
   );
   return 0;
 }
