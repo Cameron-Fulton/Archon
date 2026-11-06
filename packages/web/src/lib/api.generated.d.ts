@@ -4794,7 +4794,15 @@ export interface components {
           options: {
             id: string;
             label?: string;
+            does?: string;
+            value?: unknown;
           }[];
+          recommendation?: {
+            option: string;
+            why: string;
+            /** @enum {string} */
+            confidence?: 'low' | 'medium' | 'high';
+          };
         }
       | {
           /** @enum {string} */
@@ -5452,6 +5460,8 @@ export interface components {
       loop?: {
         until?: string;
         max_iterations: number;
+        /** @enum {string} */
+        on_exhausted?: 'fail' | 'complete';
         /** @default false */
         fresh_context: boolean;
         until_bash?: string;
@@ -5465,6 +5475,8 @@ export interface components {
       loop_group?: {
         until?: string;
         max_iterations: number;
+        /** @enum {string} */
+        on_exhausted?: 'fail' | 'complete';
         /** @default false */
         fresh_context: boolean;
         until_bash?: string;
@@ -5504,7 +5516,17 @@ export interface components {
               | {
                   id: string;
                   label?: string;
+                  does?: string;
+                  value?: unknown;
                 }[]
+              | string;
+            recommendation?:
+              | {
+                  option: string;
+                  why: string;
+                  /** @enum {string} */
+                  confidence?: 'low' | 'medium' | 'high';
+                }
               | string;
             labels?: {
               [key: string]: string;
@@ -6281,7 +6303,15 @@ export interface components {
           options?: {
             id: string;
             label?: string;
+            does?: string;
+            value?: unknown;
           }[];
+          recommendation?: {
+            option: string;
+            why: string;
+            /** @enum {string} */
+            confidence?: 'low' | 'medium' | 'high';
+          };
           answer?:
             | {
                 text: string;
@@ -6415,7 +6445,15 @@ export interface components {
           options?: {
             id: string;
             label?: string;
+            does?: string;
+            value?: unknown;
           }[];
+          recommendation?: {
+            option: string;
+            why: string;
+            /** @enum {string} */
+            confidence?: 'low' | 'medium' | 'high';
+          };
           answer?:
             | {
                 text: string;
@@ -6493,7 +6531,15 @@ export interface components {
           options: {
             id: string;
             label?: string;
+            does?: string;
+            value?: unknown;
           }[];
+          recommendation?: {
+            option: string;
+            why: string;
+            /** @enum {string} */
+            confidence?: 'low' | 'medium' | 'high';
+          };
         }
       | {
           /** @enum {string} */
@@ -6668,7 +6714,15 @@ export interface components {
             options: {
               id: string;
               label?: string;
+              does?: string;
+              value?: unknown;
             }[];
+            recommendation?: {
+              option: string;
+              why: string;
+              /** @enum {string} */
+              confidence?: 'low' | 'medium' | 'high';
+            };
           }
         | {
             /** @enum {string} */
