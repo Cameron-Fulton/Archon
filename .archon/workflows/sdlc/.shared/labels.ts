@@ -9,6 +9,7 @@
 
 import { forgeSource, invokeForge, readRepositoryLabels, type QualifiedPr } from './forge.ts';
 import { viewIssue } from './issue.ts';
+import { assertIssueTrackerAllowed } from './work-order.ts';
 
 interface LabelSpec {
   readonly color: string;
@@ -175,6 +176,7 @@ export function writeLabels(
   add: readonly string[],
   remove: readonly OwnedLabel[]
 ): string[] {
+  assertIssueTrackerAllowed('issue label write');
   return forgeSource() === 'forge' ? forgeWrite(item, add, remove) : ghWrite(item, add, remove);
 }
 

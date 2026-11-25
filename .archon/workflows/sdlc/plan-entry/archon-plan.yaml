@@ -24,6 +24,12 @@ inputs:
     description: >-
       Optional path to a prior investigation report to build on — its claims are
       verified, not trusted. Empty means no prior report.
+  work_order_mode:
+    default: "false"
+    description: >-
+      When true, plan strictly from the pinned work order and code and never
+      read the issue tracker, issue comments, or review threads. Also enabled by
+      ARCHON_WORK_ORDER_MODE=1.
 
 returns: result
 outcome_field: ready
@@ -46,6 +52,7 @@ nodes:
           depends_on: [go]
           with:
             report: "$INPUTS.report"
+            work_order_mode: "$INPUTS.work_order_mode"
             work: |-
               $INPUTS.work
               $LOOP_PREV.attend__settle.output.brief

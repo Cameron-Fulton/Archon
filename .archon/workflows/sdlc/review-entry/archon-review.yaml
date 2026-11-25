@@ -51,6 +51,12 @@ inputs:
   errors:
     default: "auto"
     description: Silent-failure lens — auto, true, or false.
+  work_order_mode:
+    default: "false"
+    description: >-
+      "true" runs in work-order mode: judge strictly against the pinned
+      work_order input and never follow it or the PR body to a tracker issue or
+      issue comments. Also enabled by ARCHON_WORK_ORDER_MODE=1 or true.
 
 returns: result
 outcome_field: ready
@@ -77,6 +83,7 @@ nodes:
             light: "$INPUTS.light"
             part: "$INPUTS.part"
             errors: "$INPUTS.errors"
+            work_order_mode: "$INPUTS.work_order_mode"
             work_order: |-
               $INPUTS.work_order
               $LOOP_PREV.attend__settle.output.brief

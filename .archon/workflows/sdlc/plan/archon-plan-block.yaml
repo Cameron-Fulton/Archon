@@ -29,6 +29,12 @@ inputs:
       Related work triage found, as a JSON list of { url, relation }: overlapping
       open issues, closed earlier attempts, recent merged changes on the same
       surface. Defaults to an empty list.
+  work_order_mode:
+    default: "false"
+    description: >-
+      When true, plan strictly from the pinned work order and code and never
+      read the issue tracker, issue comments, or review threads. Also enabled by
+      ARCHON_WORK_ORDER_MODE=1.
 
 # ready:false is a valid completion (see the plan node): the run succeeds with
 # an authored outcome of false — lifecycle status and work outcome are separate facts.

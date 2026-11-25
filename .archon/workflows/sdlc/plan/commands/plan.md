@@ -24,6 +24,8 @@ Prose is a claim; the code is the fact. An issue body, a comment, a linked discu
 
 ## Read before planning
 
+Work-order mode: **$INPUTS.work_order_mode** (also active whenever `ARCHON_WORK_ORDER_MODE` is `1` or `true`). When work-order mode is active, work ONLY from the pinned work order in `$INPUTS.work` (and `$ARGUMENTS`), this run's artifacts, and the repository checkout: do NOT read the issue tracker, issue comments, or pull request review threads.
+
 Ground the plan in the code as it is, not as the request describes it. Read the files the change will touch, their direct callers and consumers, the existing tests, and any precedent for the pattern you are about to choose. Every file, function, and behavior the plan names must exist and have been verified this session — or be explicitly marked as new. Trust the source over the request's assumptions; when they conflict, the plan says so.
 
 When a prior report is provided, treat its claims like any inherited analysis: verify the load-bearing ones against current code before building on them, and note where you confirm or refute. Implementers will follow your plan literally — a plan that repeats an inherited wrong claim ships that wrong claim.

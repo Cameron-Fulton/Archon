@@ -698,3 +698,42 @@ test('issue comments and closes pass conformance for applied and verification fa
         )
       ).toEqual([]);
 });
+
+test('refuses issue reads with authorization when builders token lacks issues:read (HTTP 403)', async () => {
+  const calls: string[] = [];
+  const fetchNoIssuesRead: Fetch = async (input, init) => {
+    const url = new URL(String(input));
+    calls.push(`${init?.method ?? 'GET'} ${url.pathname}`);
+    if (url.pathname.includes('/issues')) {
+      return Response.json(
+        {
+          message: 'Resource not accessible by integration',
+          documentation_url: 'https://docs.github.com/rest/issues/issues#get-an-issue',
+        },
+        { status: 403 }
+      );
+    }
+    throw new Error(`unexpected ${url.pathname}`);
+  };
+
+  const viewResult = await handleGithubOperation(
+    { operationId: 'no-issues-read-view', op: 'workitem.view', ref },
+    { token: 'builders-token-without-issues-read', fetch: fetchNoIssuesRead }
+  );
+  expect(viewResult).toMatchObject({
+    operationId: 'no-issues-read-view',
+    ok: false,
+    error: { kind: 'authorization', status: 403 },
+  });
+
+  const listResult = await handleGithubOperation(
+    { operationId: 'no-issues-read-list', op: 'workitem.list', repo, label: 'archon-triage' },
+    { token: 'builders-token-without-issues-read', fetch: fetchNoIssuesRead }
+  );
+  expect(listResult).toMatchObject({
+    operationId: 'no-issues-read-list',
+    ok: false,
+    error: { kind: 'authorization', status: 403 },
+  });
+  expect(calls).toEqual(['GET /repos/owner/repo/issues/1', 'GET /repos/owner/repo/issues']);
+});

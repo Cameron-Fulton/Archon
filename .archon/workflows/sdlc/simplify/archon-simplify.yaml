@@ -17,6 +17,12 @@ inputs:
     default: ""
     description: >-
       The accepted outcome and scope boundaries the structure is judged against.
+  work_order_mode:
+    default: "false"
+    description: >-
+      When true, judge structure strictly against the pinned work order and
+      never read the issue tracker, issue comments, or review threads. Also
+      enabled by ARCHON_WORK_ORDER_MODE=1.
 
 returns: simplify
 

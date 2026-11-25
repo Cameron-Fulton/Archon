@@ -48,6 +48,7 @@ round:
   prior_report: "review/report.md"
   light_review: false
   contract_left: []
+  work_order_mode: false
   summary: "stub: four rounds ended on a conflict with dev each time"
 attend__decide:
   decision: ask

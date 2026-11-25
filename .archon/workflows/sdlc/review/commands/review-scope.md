@@ -28,6 +28,11 @@ The run's trigger message, which may narrow or override the above:
 
 $ARGUMENTS
 
+**Work-order mode**: **$INPUTS.work_order_mode** (also active whenever `ARCHON_WORK_ORDER_MODE` is `1` or `true`). When active:
+- `$INPUTS.work_order` is the sole accepted contract. Do NOT follow the work order, PR body, or any artifact to any source issue, issue comment, or review thread.
+- Do NOT read the issue tracker (`gh issue ...` or forge workitem operations) or PR review threads.
+- Extract the required outcome, **Acceptance**, **Invariants**, and **Steering** strictly from `$INPUTS.work_order` (and explicit boundaries in `$ARGUMENTS` or `$INPUTS.part`), without treating any issue reference as a source to fetch.
+
 ## Resolve the target
 
 - When the requested scope is a recorded pull request — delivery passes its verified record as JSON, carrying `repo`, `number`, `head` and `base` — review exactly that pull request. The record names the pull request and its base, so read nothing from a forge to establish them. It does not name the commit: its `head_revision` was captured when the pull request opened and is stale after any later push, so ignore it. The review object is the diff of the commit under review against that base. Fetch the base first, from the remote whose URL is the record's `repo` (`git remote -v`; it need not be named `origin`), and diff against the fetched ref (`git diff <that remote>/<base>...<commit under review>`): a local `<base>` branch can lag the forge's base during a long run, and a stale base reviews a diff the pull request does not have. Do not resolve a PR from the current branch, and do not accept a different target.

@@ -32,6 +32,7 @@ import {
 } from '../../.shared/forge.ts';
 import { artifactsDir, emit, nullableJson, refuse, text } from '../../.shared/io.ts';
 import { ghGraphql, setPrDraft, viewPr } from '../../.shared/pr.ts';
+import { isWorkOrderMode } from '../../.shared/work-order.ts';
 
 interface ThreadComment {
   readonly author: string | null;
@@ -231,27 +232,44 @@ function draftAfterFailure(pr: QualifiedPr, source: ForgeSource): string {
 let pr: PrRecord | undefined;
 const source = forgeSource();
 try {
-  pr = parsePrRecord(nullableJson(process.env.INPUTS_PR));
+  const workOrder = isWorkOrderMode(process.env.INPUTS_WORK_ORDER_MODE);
   const answers = parseAnswers(nullableJson(text(process.env.INPUTS_ANSWERS)));
-  let read = readThreads(pr, source);
-  if (answers.length > 0) {
-    postAnswers(pr, read.threads, answers, source);
-    read = readThreads(pr, source);
-    const unsettled = answers.filter(answer => read.threads.find(thread => thread.id === answer.thread)?.resolved !== true);
-    if (unsettled.length > 0) {
-      throw new Error(`threads ${unsettled.map(a => a.thread).join(', ')} were answered but do not read back resolved`);
-    }
+  if (workOrder && answers.length > 0) {
+    throw new Error(
+      'work-order mode forbids posting review thread replies; PR replies belong to the loop'
+    );
   }
-  const open = read.threads.filter(thread => !thread.resolved);
-  writeFileSync(join(artifactsDir(), 'threads.md'), threadsReport(pr.url, open));
-  if (open.length > 0 && read.open && !read.draft) setPrDraft(pr, true, source);
-  emit({
-    open: open.length,
-    summary:
-      open.length === 0
-        ? `No review thread is unresolved on ${pr.url}.`
-        : `${String(open.length)} review threads are unresolved on ${pr.url}; the pull request is a draft until they are judged.`,
-  });
+  pr = parsePrRecord(nullableJson(process.env.INPUTS_PR));
+  if (workOrder) {
+    writeFileSync(
+      join(artifactsDir(), 'threads.md'),
+      `# Unresolved review threads\n\nSkipped in work-order mode on ${pr.url}: agents read no review threads and post no replies.\n`
+    );
+    emit({
+      open: 0,
+      summary: `Work-order mode: review threads are skipped on ${pr.url}; no thread text was read and no replies were posted.`,
+    });
+  } else {
+    let read = readThreads(pr, source);
+    if (answers.length > 0) {
+      postAnswers(pr, read.threads, answers, source);
+      read = readThreads(pr, source);
+      const unsettled = answers.filter(answer => read.threads.find(thread => thread.id === answer.thread)?.resolved !== true);
+      if (unsettled.length > 0) {
+        throw new Error(`threads ${unsettled.map(a => a.thread).join(', ')} were answered but do not read back resolved`);
+      }
+    }
+    const open = read.threads.filter(thread => !thread.resolved);
+    writeFileSync(join(artifactsDir(), 'threads.md'), threadsReport(pr.url, open));
+    if (open.length > 0 && read.open && !read.draft) setPrDraft(pr, true, source);
+    emit({
+      open: open.length,
+      summary:
+        open.length === 0
+          ? `No review thread is unresolved on ${pr.url}.`
+          : `${String(open.length)} review threads are unresolved on ${pr.url}; the pull request is a draft until they are judged.`,
+    });
+  }
 } catch (error) {
   const reason = error instanceof Error ? error.message : String(error);
   refuse(`threads: ${reason}${pr === undefined ? '' : draftAfterFailure(pr, source)}`);

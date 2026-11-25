@@ -26,6 +26,7 @@
  */
 
 import { artifactsDir, emit, nullableJson, text } from '../../.shared/io.ts';
+import { isWorkOrderMode } from '../../.shared/work-order.ts';
 
 /** Why a round ended. */
 type Ended =
@@ -78,6 +79,7 @@ function decide(): { reason: Ended; again: boolean; summary: string | undefined 
   return { reason: 'delivered', again: false, summary: ciSummary };
 }
 
+const workOrder = isWorkOrderMode(process.env.INPUTS_WORK_ORDER_MODE);
 const { reason, again, summary } = decide();
 
 emit({
@@ -95,5 +97,6 @@ emit({
     reviewReady === 'null' ? text(process.env.INPUTS_PRIOR_REPORT) : `${artifactsDir()}/review/report.md`,
   // The latest review's open contract items; null until a review has judged coverage.
   contract_left: contractLeft ?? nullableJson(process.env.INPUTS_PREVIOUS_CONTRACT_LEFT),
+  work_order_mode: workOrder,
   summary: `Round ${round}: ${reason}. ${text(summary)}`,
 });

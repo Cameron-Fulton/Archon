@@ -36,6 +36,12 @@ inputs:
       The maintainer login a merged item's re-triage is requested as. Set, an issue
       still open after its pull request merged gets archon-triage and an intake run
       with that label event. Empty re-triages nothing.
+  work_order_mode:
+    default: "false"
+    description: >-
+      When true, the merge queue resolves no issues, skips review thread reads,
+      never re-triages issues, and never writes issue bodies. Also enabled by
+      ARCHON_WORK_ORDER_MODE=1.
 
 returns: record
 
@@ -72,6 +78,7 @@ nodes:
       base: { from: "$facts.output.base" }
       items: { from: "$facts.output.items" }
       gate: "$facts.output.gate"
+      work_order_mode: "$INPUTS.work_order_mode"
     output_format:
       type: object
       properties:

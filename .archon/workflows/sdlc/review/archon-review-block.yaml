@@ -66,6 +66,12 @@ inputs:
   errors:
     default: "auto"
     description: Silent-failure lens — auto, true, or false.
+  work_order_mode:
+    default: "false"
+    description: >-
+      "true" runs in work-order mode: judge strictly against the pinned
+      work_order input and never follow it or the PR body to a tracker issue or
+      issue comments. Also enabled by ARCHON_WORK_ORDER_MODE=1 or true.
 
 returns: result
 outcome_field: ready
@@ -90,6 +96,8 @@ nodes:
       prior_report: "$INPUTS.prior_report"
       light: "$INPUTS.light"
       part: "$INPUTS.part"
+      work_order: "$INPUTS.work_order"
+      work_order_mode: "$INPUTS.work_order_mode"
     output_format:
       type: object
       properties:
@@ -134,11 +142,19 @@ nodes:
   - id: review-dir
     bash: mkdir -p "$ARTIFACTS_DIR/review"
 
+  # Refuses an empty work_order before the scope LLM runs when work-order mode is active.
+  - id: work-order-check
+    script: work-order-check
+    runtime: bun
+    with:
+      work_order: "$INPUTS.work_order"
+      work_order_mode: "$INPUTS.work_order_mode"
+
   - id: scope
     command: review-scope
     context: fresh
     mutates_checkout: false
-    depends_on: [review-dir]
+    depends_on: [review-dir, work-order-check]
     output_format:
       type: object
       properties:
@@ -348,6 +364,7 @@ nodes:
       report_pointer: "$synthesize.output.report"
       discoveries: { from: "$synthesize.output.discoveries" }
       contract_left: { from: "$synthesize.output.contract_left" }
+      work_order_mode: "$INPUTS.work_order_mode"
     output_type: review-report
     output_format: *review_verdict
 

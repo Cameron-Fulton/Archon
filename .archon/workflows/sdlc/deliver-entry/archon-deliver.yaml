@@ -41,6 +41,12 @@ inputs:
   errors:
     default: "auto"
     description: Silent-failure lens — auto, true, or false.
+  work_order_mode:
+    default: "false"
+    description: >-
+      When true, delivery runs strictly from the pinned work order and never
+      reads or writes the issue tracker, review threads, or loop-owned PR
+      descriptions. Also enabled by ARCHON_WORK_ORDER_MODE=1.
 
 returns: result
 outcome_field: ready
@@ -66,6 +72,7 @@ nodes:
             branch: "$INPUTS.branch"
             part: "$INPUTS.part"
             errors: "$INPUTS.errors"
+            work_order_mode: "$INPUTS.work_order_mode"
             work: |-
               $INPUTS.work
               $LOOP_PREV.attend__settle.output.brief

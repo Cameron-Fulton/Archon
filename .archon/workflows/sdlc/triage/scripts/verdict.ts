@@ -27,6 +27,7 @@ import {
   wantedLabels,
   writeLabels,
 } from '../../.shared/labels.ts';
+import { isIssueTrackerUrl, isWorkOrderMode } from '../../.shared/work-order.ts';
 
 type Item = QualifiedPr;
 /** One of triage's judged fields: a value and the one-line reason for it. */
@@ -74,7 +75,45 @@ function unqualifiedLink(
   return null;
 }
 
+/** Fail-closed checks when work-order mode forbids any tracker access or reference. */
+function workOrderViolation(
+  workOrder: boolean,
+  publish: boolean,
+  item: Item | undefined,
+  closure: Closure | null,
+  blockedBy: readonly string[],
+  related: readonly { url: string }[]
+): string | null {
+  if (!workOrder) return null;
+  if (publish) return 'work-order mode forbids publishing labels to the issue tracker';
+  if (item !== undefined) {
+    return 'work-order mode forbids attaching a tracker issue item; declare the non-tracker sentinel';
+  }
+  if (closure?.kind === 'duplicate') {
+    return 'work-order mode forbids duplicate-issue closures';
+  }
+  if (closure !== null && isIssueTrackerUrl(closure.url)) {
+    return 'work-order mode forbids issue tracker URLs in closure.url';
+  }
+  if (blockedBy.some(isIssueTrackerUrl) || related.some(entry => isIssueTrackerUrl(entry.url))) {
+    return 'work-order mode forbids issue tracker URLs in blocked_by or related';
+  }
+  return null;
+}
+
+function validateVerdict(
+  workOrder: boolean,
+  publish: boolean,
+  item: Item | undefined,
+  closure: Closure | null,
+  blockedBy: readonly string[],
+  related: readonly { url: string }[]
+): string | null {
+  return unqualifiedLink(blockedBy, related, closure) ?? workOrderViolation(workOrder, publish, item, closure, blockedBy, related);
+}
+
 function main(): void {
+  const workOrder = isWorkOrderMode(process.env.INPUTS_WORK_ORDER_MODE);
   const decision = bound(process.env.INPUTS_DECISION) as Decision;
   const contract: Contract = decision.contract;
   const route = 'route' in decision ? decision.route : 'no_action';
@@ -120,7 +159,7 @@ function main(): void {
     refuse(`invalid triage verdict: ${message}`);
   };
 
-  const badLink = unqualifiedLink(blockedBy, related, closure);
+  const badLink = validateVerdict(workOrder, publish, item, closure, blockedBy, related);
   if (badLink !== null) {
     invalid(badLink);
     return;
