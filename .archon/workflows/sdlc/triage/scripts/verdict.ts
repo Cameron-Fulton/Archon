@@ -92,6 +92,9 @@ function workOrderViolation(
   if (closure?.kind === 'duplicate') {
     return 'work-order mode forbids duplicate-issue closures';
   }
+  if (closure !== null && isIssueTrackerUrl(closure.url)) {
+    return 'work-order mode forbids issue tracker URLs in closure.url';
+  }
   if (blockedBy.some(isIssueTrackerUrl) || related.some(entry => isIssueTrackerUrl(entry.url))) {
     return 'work-order mode forbids issue tracker URLs in blocked_by or related';
   }

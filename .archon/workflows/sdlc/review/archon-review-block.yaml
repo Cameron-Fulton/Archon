@@ -142,11 +142,19 @@ nodes:
   - id: review-dir
     bash: mkdir -p "$ARTIFACTS_DIR/review"
 
+  # Refuses an empty work_order before the scope LLM runs when work-order mode is active.
+  - id: work-order-check
+    script: work-order-check
+    runtime: bun
+    with:
+      work_order: "$INPUTS.work_order"
+      work_order_mode: "$INPUTS.work_order_mode"
+
   - id: scope
     command: review-scope
     context: fresh
     mutates_checkout: false
-    depends_on: [review-dir]
+    depends_on: [review-dir, work-order-check]
     output_format:
       type: object
       properties:

@@ -45,6 +45,9 @@ function continueNow(
   workOrder: boolean
 ): string {
   if (effect !== 'merge' && effect !== 'return') return '';
+  if (workOrder && effect === 'return') {
+    return '; work-order mode skips archon-build-queue launch so the external loop handles the return';
+  }
   const repo = { repo_host: item.repo.host, repo_path: item.repo.path };
   try {
     const next =

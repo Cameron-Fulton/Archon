@@ -30,7 +30,11 @@ import {
   resolveInputValue,
 } from '../output-ref';
 import { readComposedMeta } from '../compiled-command';
-import { type ExecNodeEnvironmentContext, buildExecNodeEnvironment } from '../exec-environment';
+import {
+  type ExecNodeEnvironmentContext,
+  buildExecNodeEnvironment,
+  hostWorkOrderMode,
+} from '../exec-environment';
 import { substituteWorkflowVariables, type TemplateReferences } from '../workflow-variables';
 import {
   type AttentionOption,
@@ -57,7 +61,11 @@ import { shellQuoteOrFile } from './shell-quote';
 export function resolveRunInputs(
   workflowRun: Pick<WorkflowRun, 'metadata'>
 ): Record<string, JsonValue> | undefined {
-  return readSubrunMetadata(workflowRun.metadata as Record<string, unknown> | undefined).inputs;
+  const inputs = readSubrunMetadata(
+    workflowRun.metadata as Record<string, unknown> | undefined
+  ).inputs;
+  if (!hostWorkOrderMode()) return inputs;
+  return { ...(inputs ?? {}), work_order_mode: 'true' };
 }
 
 /**
@@ -128,6 +136,9 @@ export function inputEnvVars(
     )) {
       env[inputEnvKey(name)] = canonicalValueText(value);
     }
+  }
+  if (hostWorkOrderMode()) {
+    env.INPUTS_WORK_ORDER_MODE = 'true';
   }
   return env;
 }
@@ -311,6 +322,9 @@ export function resolveNodeBindings(
       checkoutProducer !== undefined
         ? resolveExecutionCheckoutStart(ctx.nodeOutputs.get(checkoutProducer), checkoutProducer)
         : resolveWorkflowValue(rawValue, ctx, runInputs, true);
+  }
+  if (hostWorkOrderMode() && Object.hasOwn(resolved, 'work_order_mode')) {
+    resolved.work_order_mode = 'true';
   }
   return resolved;
 }

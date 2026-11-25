@@ -22,6 +22,7 @@ import { stateGet, statePut } from '../../workflows/sdlc/.shared/state';
 import {
   assertIssueTrackerAllowed,
   assertNoIssueReferences,
+  assertPrBodyEditAllowed,
   findIssueReference,
   isIssueTrackerUrl,
   isWorkOrderMode,
@@ -96,9 +97,17 @@ describe('work-order mode primitives and token fail-closed behavior', () => {
     expect(isWorkOrderMode('1', {})).toBe(true);
     expect(isWorkOrderMode('false', { ARCHON_WORK_ORDER_MODE: '1' })).toBe(true);
     expect(isWorkOrderMode('0', { ARCHON_WORK_ORDER_MODE: 'true' })).toBe(true);
+    expect(isWorkOrderMode(undefined, { INPUTS_WORK_ORDER_MODE: 'true' })).toBe(true);
     expect(() => isWorkOrderMode('maybe', {})).toThrow('work_order_mode must be');
     expect(() => isWorkOrderMode('false', { ARCHON_WORK_ORDER_MODE: 'yes' })).toThrow('ARCHON_WORK_ORDER_MODE must be');
     expect(() => assertIssueTrackerAllowed('issue read', 'true', {})).toThrow(WorkOrderModeError);
+    expect(() =>
+      assertIssueTrackerAllowed('issue read', undefined, { INPUTS_WORK_ORDER_MODE: 'true' })
+    ).toThrow(WorkOrderModeError);
+    expect(() =>
+      assertPrBodyEditAllowed(undefined, { INPUTS_WORK_ORDER_MODE: 'true' })
+    ).toThrow(WorkOrderModeError);
+    expect(WORK_ORDER_FORGE_OPERATIONS).not.toContain('pr.edit-body');
   });
 
   it('detects issue references while allowing clean prose, headings, hex colors, and PR URLs', () => {
@@ -110,6 +119,11 @@ describe('work-order mode primitives and token fail-closed behavior', () => {
       'See #7 for details',
       'Follows GH-7',
       'https://github.com/owner/repo/issues/7',
+      '|#7|',
+      '>#7',
+      '<#7>',
+      '{#7}',
+      'issue=#7',
     ]) {
       expect(findIssueReference(bad)).not.toBeNull();
       expect(() => assertNoIssueReferences('PR body', bad)).toThrow(WorkOrderModeError);
@@ -123,6 +137,7 @@ describe('work-order mode primitives and token fail-closed behavior', () => {
       expect(() => assertNoIssueReferences('PR body', clean)).not.toThrow();
     }
     expect(isIssueTrackerUrl('https://github.com/owner/repo/issues/7')).toBe(true);
+    expect(isIssueTrackerUrl('https://github.com/owner/repo/ISSUES/7')).toBe(true);
     expect(isIssueTrackerUrl('https://github.com/owner/repo/pull/42')).toBe(false);
   });
 
@@ -154,6 +169,28 @@ console.log(JSON.stringify(issue));
     });
     expect(refusedInWo.status).not.toBe(0);
     expect(refusedInWo.stderr).toContain('WorkOrderModeError');
+
+    // 1b. Input-only work_order_mode=true also trips assertIssueTrackerAllowed & editPrBody.
+    const refusedInputOnly = spawnSync(process.execPath, ['--no-env-file', probeScript], {
+      env: { ...process.env, ARCHON_SDLC_FORGE: 'gh', ARCHON_WORK_ORDER_MODE: '0', INPUTS_WORK_ORDER_MODE: 'true' },
+      encoding: 'utf8',
+    });
+    expect(refusedInputOnly.status).not.toBe(0);
+    expect(refusedInputOnly.stderr).toContain('WorkOrderModeError');
+
+    const editProbeScript = join(probeRoot, 'probe-edit-pr-body.ts');
+    writeFileSync(
+      editProbeScript,
+      `import { editPrBody } from ${JSON.stringify(join(PACK, '.shared/pr.ts'))};
+editPrBody({ repo: { host: 'ghe.example.com', path: 'example/repo' }, number: 42 }, 'body', 'gh');
+`
+    );
+    const refusedEditPrBody = spawnSync(process.execPath, ['--no-env-file', editProbeScript], {
+      env: { ...process.env, ARCHON_SDLC_FORGE: 'gh', ARCHON_WORK_ORDER_MODE: '0', INPUTS_WORK_ORDER_MODE: 'true' },
+      encoding: 'utf8',
+    });
+    expect(refusedEditPrBody.status).not.toBe(0);
+    expect(refusedEditPrBody.stderr).toContain('WorkOrderModeError');
 
     // 2. Outside work-order mode with a token lacking issues:read: HTTP 403 fails closed.
     const preloadPath = join(probeRoot, 'no-issues-preload.ts');
@@ -225,6 +262,16 @@ describe('triage workflow in work-order mode', () => {
         'duplicate-issue closures',
       ],
       [
+        'delivered closure pointing at issue URL',
+        {
+          INPUTS_DECISION: JSON.stringify({
+            contract: 'NO_ACTION',
+            closure: { kind: 'delivered', url: 'https://ghe.example.com/example/repo/ISSUES/7' },
+          }),
+        },
+        'closure.url',
+      ],
+      [
         'issue URL in related',
         {
           INPUTS_RELATED: JSON.stringify([
@@ -260,6 +307,24 @@ describe('triage workflow in work-order mode', () => {
 });
 
 describe('review workflow in work-order mode', () => {
+  it('preflight work-order-check refuses empty work_order before scope LLM runs', () => {
+    const missing = runPackScript('review/scripts/work-order-check', {
+      preload: NO_ISSUES_READ_PRELOAD,
+      inputs: { INPUTS_WORK_ORDER_MODE: 'true', INPUTS_WORK_ORDER: '   ' },
+    });
+    expect(missing.code).not.toBe(0);
+    expect(missing.stderr).toContain('requires a non-empty work_order');
+
+    const ok = runPackScript('review/scripts/work-order-check', {
+      preload: NO_ISSUES_READ_PRELOAD,
+      inputs: { INPUTS_WORK_ORDER_MODE: 'true', INPUTS_WORK_ORDER: 'Pinned work order.' },
+    });
+    expect({ code: ok.code, stderr: ok.stderr }).toEqual({ code: 0, stderr: '' });
+
+    const reviewYaml = readFileSync(join(PACK, 'review/archon-review-block.yaml'), 'utf8');
+    expect(reviewYaml).toContain('depends_on: [review-dir, work-order-check]');
+  });
+
   it('requires a pinned work_order in review-round and makes zero tracker calls', () => {
     const cwd = gitCheckout({}, track);
     const head = git(cwd, 'rev-parse', 'HEAD');
@@ -326,7 +391,7 @@ describe('deliver, pr creation, and update-pr-body in work-order mode', () => {
     const head = git(cwd, 'rev-parse', 'HEAD');
     const bodyPointer = { type: 'archon_artifact', run_id: 'run', path: 'pr-body.md' };
     const descPointer = { type: 'archon_artifact', run_id: 'run', path: 'pr-description.md' };
-    return runPackScript('pr/scripts/publish-pr', {
+    const run = runPackScript('pr/scripts/publish-pr', {
       source: 'gh',
       preload: NO_ISSUES_READ_PRELOAD,
       ...options,
@@ -355,6 +420,7 @@ describe('deliver, pr creation, and update-pr-body in work-order mode', () => {
         ...options.artifacts,
       },
     });
+    return { ...run, cwd };
   }
 
   it.each(['gh', 'forge'] as const)('opens a clean PR with no issue links or issue calls through %s', source => {
@@ -411,6 +477,11 @@ describe('deliver, pr creation, and update-pr-body in work-order mode', () => {
     expect(result.stderr).toContain('forbids issue references');
     expect(result.gh.some(call => call.startsWith('pr create'))).toBe(false);
     expect(result.forge).toEqual([]);
+    const pushed = spawnSync('git', ['ls-remote', 'upstream', 'refs/heads/feature'], {
+      cwd: result.cwd,
+      encoding: 'utf8',
+    }).stdout.trim();
+    expect(pushed).toBe('');
   });
 
   it('refuses prepared PR description edits in work-order mode', () => {
@@ -794,6 +865,70 @@ Object.defineProperty(Bun, 'spawnSync', { value: (argv, settings) => {
     expect(ruling.bodies).toEqual([]);
     expect(readLines(join(ruling.artifacts, 'forbidden-issue-calls.log'))).toEqual([]);
   }, 20_000);
+
+  it('ruling with effect=return writes no issue body and skips launching archon-build-queue in work-order mode', () => {
+    const { checkout, env } = setupMergeEnv();
+    const saved = { ...process.env };
+    Object.assign(process.env, env, {
+      ARCHON_CLI_COMMAND: JSON.stringify([process.execPath, FAKE_ARCHON]),
+      WORKFLOW_ID: 'merge-run-3',
+    });
+    try {
+      const name = `work/${String(SUBJECT.number)}`;
+      const current = stateGet(name);
+      const parsed = current.value as WorkItem;
+      expect(
+        statePut(
+          name,
+          { ...parsed, claim: { run_id: 'merge-run-3', at: AT, requests: [] } },
+          current.revision,
+          'take'
+        )
+      ).toBe('ok');
+    } finally {
+      for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
+      Object.assign(process.env, saved);
+    }
+
+    const launchSpyPreload = `
+const origSpawn = Bun.spawnSync.bind(Bun);
+Object.defineProperty(Bun, 'spawnSync', { value: (argv, settings) => {
+  if (Array.isArray(argv) && argv.includes('archon-build-queue')) {
+    appendFileSync('{ARTIFACTS}/build-queue-launches.log', argv.join(' ') + '\\n');
+  }
+  return origSpawn(argv, settings);
+} });
+`;
+    const ruling = runPackScript('merge-queue/scripts/ruling', {
+      source: 'gh',
+      cwd: checkout,
+      forge: { kind: 'command', argv: [process.execPath, FAKE_ARCHON] },
+      preload: NO_ISSUES_READ_PRELOAD + launchSpyPreload,
+      inputs: {
+        ...env,
+        WORKFLOW_ID: 'merge-run-3',
+        INPUTS_LIMIT: '10',
+        INPUTS_MERGE_METHOD: 'squash',
+        INPUTS_RETRIAGE_AS: '',
+        INPUTS_WORK_ORDER_MODE: 'true',
+        INPUTS_ASKED: JSON.stringify({
+          by: 'pr',
+          item: SUBJECT,
+          pr: PR,
+          head: HEAD,
+          brief: 'Return brief',
+          attention: { what: 'Return?', why: 'Needs fix', recommendation: { choice: 'return', why: 'fix', evidence: 'ci', confidence: 'high', would_change: 'green' }, choices: [{ id: 'return', label: 'Return', does: 'Returns PR', effect: 'return', ruling: 'Fix failing test' }], if_unanswered: 'waits', links: [PR_URL] },
+        }),
+        INPUTS_CHOICE: JSON.stringify({ id: 'return', label: 'Return', does: 'Returns PR', effect: 'return', ruling: 'Fix failing test' }),
+        INPUTS_TEXT: 'Fix test before merge',
+      },
+    });
+    expect({ code: ruling.code, stderr: ruling.stderr }).toEqual({ code: 0, stderr: '' });
+    expect(JSON.parse(ruling.stdout)).toMatchObject({ decision: 'return', section: '' });
+    expect(ruling.bodies).toEqual([]);
+    expect(readLines(join(ruling.artifacts, 'forbidden-issue-calls.log'))).toEqual([]);
+    expect(readLines(join(ruling.artifacts, 'build-queue-launches.log'))).toEqual([]);
+  }, 20_000);
 });
 
 describe('ship and SDLC workflow definitions wire work_order_mode end-to-end', () => {
@@ -832,5 +967,13 @@ describe('ship and SDLC workflow definitions wire work_order_mode end-to-end', (
 
   it('review comment marker stays PR-scoped with no issue references', () => {
     expect(findIssueReference(`${REVIEW_MARKER}\nReviewed commit: \`${HEAD}\``)).toBeNull();
+  });
+
+  it('settle-threads scopes the non-push-access rule to work-order mode so default mode stays intact', () => {
+    const prompt = readFileSync(join(PACK, 'deliver/commands/settle-threads.md'), 'utf8');
+    const woIndex = prompt.indexOf('## Work-order mode');
+    const pushAccessIndex = prompt.indexOf('without push access');
+    expect(woIndex).toBeGreaterThan(-1);
+    expect(pushAccessIndex).toBeGreaterThan(woIndex);
   });
 });

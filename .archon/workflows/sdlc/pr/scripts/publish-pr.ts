@@ -188,6 +188,22 @@ function checkPrText(workOrder: boolean, surface: string, content: string): void
   if (workOrder) assertNoIssueReferences(surface, content);
 }
 
+/** Validate any declared pr-body.md before pushing so a forbidden issue reference never pushes commits. */
+function validateDeclaredBodyBeforePush(workOrder: boolean, artifacts: string): void {
+  if (!workOrder) return;
+  const body = record(nullableJson(process.env.INPUTS_BODY));
+  if (body === undefined) return;
+  if (
+    body.type !== 'archon_artifact' ||
+    body.run_id !== process.env.WORKFLOW_ID ||
+    body.path !== 'pr-body.md'
+  ) {
+    throw new Error('prepare must declare the pr-body.md artifact from this run');
+  }
+  const bodyText = readFileSync(join(artifacts, body.path), 'utf8');
+  assertNoIssueReferences('pull request body', bodyText);
+}
+
 function publish(hasDescription: boolean, workOrder: boolean): PrRecord {
   const source = forgeSource();
   const repo = JSON.parse(text(process.env.INPUTS_REPO)) as Repo;
@@ -196,6 +212,7 @@ function publish(hasDescription: boolean, workOrder: boolean): PrRecord {
   const artifacts = artifactsDir();
   const title = text(process.env.INPUTS_TITLE);
   checkPrText(workOrder, 'pull request title', title);
+  validateDeclaredBodyBeforePush(workOrder, artifacts);
 
   const named = nullableJson(process.env.INPUTS_PULL_REQUEST) as number | null;
   if (named !== null && existing !== named) {

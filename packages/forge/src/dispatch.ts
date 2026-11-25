@@ -190,7 +190,7 @@ function workOrderModeFlag(env: NodeJS.ProcessEnv | undefined): boolean {
   );
 }
 
-/** Issue-tracker operations forbidden in work-order mode (PR-targeted subjects remain allowed). */
+/** Operations forbidden in work-order mode (PR-targeted `workitem.comments` stays allowed for review verdicts). */
 export function isIssueTrackerOperation(request: ForgeRequest): boolean {
   switch (request.op) {
     case 'workitem.view':
@@ -199,12 +199,19 @@ export function isIssueTrackerOperation(request: ForgeRequest): boolean {
     case 'workitem.close':
     case 'workitem.edit-body':
     case 'workitem.labels.set':
-      return true;
-    case 'workitem.comments':
     case 'workitem.comment.upsert':
     case 'workitem.label.add':
     case 'workitem.label.remove':
-      return request.subject.kind === 'issue';
+    case 'pr.threads':
+    case 'pr.thread.reply':
+    case 'pr.thread.resolve':
+    case 'pr.reviews':
+    case 'pr.edit-body':
+    case 'repo.labels.list':
+    case 'repo.label.ensure':
+      return true;
+    case 'workitem.comments':
+      return request.subject.kind !== 'pr';
     default:
       return false;
   }

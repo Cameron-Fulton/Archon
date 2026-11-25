@@ -34,7 +34,7 @@ export function isWorkOrderMode(
   env: NodeJS.ProcessEnv = process.env
 ): boolean {
   const fromEnv = parseBooleanFlag('ARCHON_WORK_ORDER_MODE', env.ARCHON_WORK_ORDER_MODE);
-  const fromInput = parseBooleanFlag('work_order_mode', input);
+  const fromInput = parseBooleanFlag('work_order_mode', input ?? env.INPUTS_WORK_ORDER_MODE);
   return fromEnv || fromInput;
 }
 
@@ -59,10 +59,22 @@ export function assertIssueTrackerAllowed(
   }
 }
 
+/** Refuse any pull request body mutation when work-order mode is active. */
+export function assertPrBodyEditAllowed(
+  input?: string,
+  env: NodeJS.ProcessEnv = process.env
+): void {
+  if (isWorkOrderMode(input, env)) {
+    throw new WorkOrderModeError(
+      'work-order mode forbids editing the pull request description; PR text belongs to the loop'
+    );
+  }
+}
+
 const ISSUE_LINK_PATTERNS: readonly RegExp[] = [
   /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?|refs?)\s+(?:[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)?#\d+\b/i,
   /https?:\/\/[^\s/]+\/[^\s/]+\/[^\s/]+\/issues\/\d+\b/i,
-  /(?:^|[\s([,;:/*_~`'"-])(?:[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)?#\d+\b/,
+  /(?:^|[^\w])(?:[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)?#\d+\b/,
   /\bGH-\d+\b/i,
 ];
 
@@ -79,7 +91,7 @@ export function findIssueReference(content: string): string | null {
 export function isIssueTrackerUrl(url: string): boolean {
   try {
     const parsed = new URL(url);
-    return /\/issues\/\d+(?:\/|$)/.test(parsed.pathname);
+    return /\/issues\/\d+(?:\/|$)/i.test(parsed.pathname);
   } catch {
     return false;
   }

@@ -40,7 +40,27 @@ export interface ExecNodeEnvironmentContext {
   inputEnvKeys: readonly string[];
 }
 
-export function buildExecNodeEnvironment(context: ExecNodeEnvironmentContext): NodeJS.ProcessEnv {
+const WORK_ORDER_TRUTHY = new Set(['1', 'true']);
+const WORK_ORDER_FALSY = new Set(['', '0', 'false']);
+
+/**
+ * Whether the host process enabled work-order mode via `ARCHON_WORK_ORDER_MODE`.
+ * Fails closed on invalid values so a typo cannot silently disable isolation.
+ */
+export function hostWorkOrderMode(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = (env.ARCHON_WORK_ORDER_MODE ?? '').trim().toLowerCase();
+  if (WORK_ORDER_FALSY.has(raw)) return false;
+  if (WORK_ORDER_TRUTHY.has(raw)) return true;
+  throw new Error(
+    `ARCHON_WORK_ORDER_MODE must be "true", "false", "1", or "0", not "${(env.ARCHON_WORK_ORDER_MODE ?? '').trim()}"`
+  );
+}
+
+export function buildExecNodeEnvironment(
+  context: ExecNodeEnvironmentContext,
+  hostEnv: NodeJS.ProcessEnv = process.env
+): NodeJS.ProcessEnv {
+  const workOrder = hostWorkOrderMode(hostEnv);
   const userVariables: Record<string, string> = {};
   for (const group of USER_CONTROLLED_VARIABLES) {
     for (const name of group.names) userVariables[name] = context[group.source] ?? '';
@@ -67,6 +87,9 @@ export function buildExecNodeEnvironment(context: ExecNodeEnvironmentContext): N
     ARCHON_RUN_ENV_KEYS: '',
     ARCHON_NODE_EXECUTION:
       context.nodeExecution === null ? '' : nodeExecutionEnvValue(context.nodeExecution),
+    // Emitted LAST so repo `.archon/config.yaml` envVars cannot weaken it and container
+    // runs always receive it via ARCHON_RUN_ENV_KEYS.
+    ...(workOrder ? { ARCHON_WORK_ORDER_MODE: '1' } : {}),
   };
   env.ARCHON_RUN_ENV_KEYS = JSON.stringify([...Object.keys(env), ...context.inputEnvKeys]);
   return env;
@@ -90,12 +113,17 @@ function nodeExecutionEnvValue(execution: NodeExecutionIdentity): string {
  */
 export function buildAiNodeEnvironment(
   execution: NodeExecutionIdentity,
-  cliCommand: string | undefined
+  cliCommand: string | undefined,
+  hostEnv: NodeJS.ProcessEnv = process.env
 ): Record<string, string> {
+  const workOrder = hostWorkOrderMode(hostEnv);
   return {
     WORKFLOW_ID: execution.runId,
     ARCHON_NODE_EXECUTION: nodeExecutionEnvValue(execution),
     ARCHON_CLI_COMMAND: cliCommand ?? '',
+    // Emitted LAST so repo `.archon/config.yaml` envVars cannot clear it and container
+    // AI runs always receive it.
+    ...(workOrder ? { ARCHON_WORK_ORDER_MODE: '1' } : {}),
   };
 }
 

@@ -357,6 +357,49 @@ describe('ARCHON_WORK_ORDER_MODE dispatch guard', () => {
         name: 'x',
       },
     ],
+    [
+      'workitem.comment.upsert (pr)',
+      {
+        operationId: 'wo-11',
+        op: 'workitem.comment.upsert',
+        subject: { kind: 'pr', ref },
+        marker: '<!-- m -->',
+        body: '<!-- m -->\nhi',
+      },
+    ],
+    [
+      'workitem.label.add (pr)',
+      { operationId: 'wo-12', op: 'workitem.label.add', subject: { kind: 'pr', ref }, name: 'x' },
+    ],
+    [
+      'workitem.label.remove (pr)',
+      {
+        operationId: 'wo-13',
+        op: 'workitem.label.remove',
+        subject: { kind: 'pr', ref },
+        name: 'x',
+      },
+    ],
+    ['pr.threads', { operationId: 'wo-14', op: 'pr.threads', ref }],
+    [
+      'pr.thread.reply',
+      { operationId: 'wo-15', op: 'pr.thread.reply', ref, thread: 'T1', body: 'hi' },
+    ],
+    ['pr.thread.resolve', { operationId: 'wo-16', op: 'pr.thread.resolve', ref, thread: 'T1' }],
+    ['pr.reviews', { operationId: 'wo-17', op: 'pr.reviews', ref }],
+    ['pr.edit-body', { operationId: 'wo-18', op: 'pr.edit-body', ref, body: 'updated' }],
+    ['repo.labels.list', { operationId: 'wo-19', op: 'repo.labels.list', repo }],
+    [
+      'repo.label.ensure',
+      {
+        operationId: 'wo-20',
+        op: 'repo.label.ensure',
+        repo,
+        name: 'bug',
+        color: 'ff0000',
+        description: 'Bug',
+      },
+    ],
   ];
 
   test.each(blockedRequests)(

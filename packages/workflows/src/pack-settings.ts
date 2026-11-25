@@ -31,6 +31,7 @@ import {
   type WorkflowPack,
 } from './schemas/pack-settings';
 import { defaultRunInputs } from './workflow-inputs';
+import { hostWorkOrderMode } from './exec-environment';
 
 /** The declaration's path inside a pack directory. */
 export const PACK_DECLARATION_PATH = join('.pack', 'pack.yaml');
@@ -267,6 +268,13 @@ export async function resolveRunStartInputs(
     ...projectValues,
     ...supplied,
   };
+  if (
+    hostWorkOrderMode() &&
+    (Object.hasOwn(inputs, 'work_order_mode') ||
+      (workflow.inputs !== undefined && Object.hasOwn(workflow.inputs, 'work_order_mode')))
+  ) {
+    inputs.work_order_mode = 'true';
+  }
   if (pack !== undefined) assertRequiredSettings(cwd, pack, inputs);
   return { inputs: Object.keys(inputs).length > 0 ? inputs : undefined };
 }

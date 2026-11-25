@@ -24,11 +24,10 @@ export function forgeAccessRead(repo: QualifiedPr['repo']) {
   } as const;
 }
 
-/** Operations required in work-order mode: pull requests, review comments and checks only (no issues or threads). */
+/** Operations required in work-order mode: pull requests, review comments and checks only (no issues, PR body edits, or threads). */
 export const WORK_ORDER_FORGE_OPERATIONS = [
   'pr.view',
   'pr.create',
-  'pr.edit-body',
   'pr.ready',
   'pr.draft',
   'comment.upsert',
@@ -38,6 +37,7 @@ export const WORK_ORDER_FORGE_OPERATIONS = [
 
 export const REQUIRED_FORGE_OPERATIONS = [
   ...WORK_ORDER_FORGE_OPERATIONS,
+  'pr.edit-body',
   'workitem.view',
   'repo.labels.list',
   'repo.label.ensure',
