@@ -7,7 +7,7 @@
  * inside the target repository checkout, `.git`, or any builder worktree.
  */
 
-import { existsSync, readFileSync, realpathSync } from 'node:fs';
+import { type Stats, existsSync, lstatSync, readFileSync, readlinkSync, realpathSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { git } from '../../.shared/git.ts';
 import { isObject } from '../../.shared/typed.ts';
@@ -137,25 +137,59 @@ export function resolvePastTaskDir(
   return DEFAULT_PAST_TASK_DIR;
 }
 
+const MAX_SYMLINK_DEPTH = 20;
+
+function lstatSafe(pathValue: string): Stats | undefined {
+  try {
+    return lstatSync(pathValue);
+  } catch {
+    return undefined;
+  }
+}
+
+function nativeRealpath(pathValue: string): string {
+  return typeof realpathSync.native === 'function'
+    ? realpathSync.native(pathValue)
+    : realpathSync(pathValue);
+}
+
+function resolveExistingNode(
+  current: string,
+  stat: Stats,
+  tail: readonly string[],
+  depth: number
+): string {
+  if (stat.isSymbolicLink()) {
+    const deref = resolve(dirname(current), readlinkSync(current));
+    const nextTarget = tail.length === 0 ? deref : join(deref, ...tail);
+    return resolveCanonicalPath(nextTarget, depth + 1);
+  }
+  const realBase = nativeRealpath(current);
+  return tail.length === 0 ? realBase : join(realBase, ...tail);
+}
+
 /**
  * Resolve `targetPath` through `realpathSync.native` (falling back to `realpathSync`),
- * walking up to the nearest existing ancestor when the leaf does not exist yet so
- * symlinks and Windows 8.3 short paths are always resolved to one canonical form.
+ * walking up via `lstatSync` so dangling symlinks are dereferenced before walking
+ * further, and Windows 8.3 short paths are normalized to one canonical form.
  */
-export function resolveCanonicalPath(targetPath: string): string {
+export function resolveCanonicalPath(targetPath: string, depth = 0): string {
+  if (depth > MAX_SYMLINK_DEPTH) {
+    throw new IsolationBoundaryError(
+      `past-task path ${targetPath} exceeds maximum symlink resolution depth (${MAX_SYMLINK_DEPTH})`
+    );
+  }
   const absolute = resolve(targetPath);
   const tail: string[] = [];
   let current = absolute;
-  while (!existsSync(current)) {
+  while (true) {
+    const stat = lstatSafe(current);
+    if (stat !== undefined) return resolveExistingNode(current, stat, tail, depth);
     const parent = dirname(current);
     if (parent === current) return absolute;
     tail.unshift(relative(parent, current));
     current = parent;
   }
-  const realBase = typeof realpathSync.native === 'function'
-    ? realpathSync.native(current)
-    : realpathSync(current);
-  return tail.length === 0 ? realBase : join(realBase, ...tail);
 }
 
 function normalizeForCompare(pathValue: string): string {
@@ -167,7 +201,7 @@ export function isPathInside(candidate: string, root: string): boolean {
   const normCandidate = normalizeForCompare(resolveCanonicalPath(candidate));
   const normRoot = normalizeForCompare(resolveCanonicalPath(root));
   const rel = relative(normRoot, normCandidate);
-  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+  return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
 }
 
 function hasGitSegment(pathValue: string): boolean {
@@ -472,4 +506,11 @@ export function reflectorView(dataset: PastTaskSet): PastTaskSet {
 /** Normalize any OS path to forward slashes for deterministic matching. */
 export function toPosixPath(pathValue: string): string {
   return pathValue.split(sep).join('/').replaceAll('\\', '/');
+}
+
+/** Whether `patchSpec` is inline unified diff text rather than an external patch file path. */
+export function isInlinePatch(patchSpec: string): boolean {
+  return (
+    patchSpec.includes('\n') && (patchSpec.includes('--- ') || patchSpec.includes('diff --git'))
+  );
 }

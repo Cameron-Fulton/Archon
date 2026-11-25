@@ -8,14 +8,25 @@
  * look up the real merged answer or infer anything from commit history.
  *
  * The replay environment always forces `ARCHON_WORK_ORDER_MODE=1`, strips forge and
- * cloud tokens, and enforces the `no_network_except_model_api` allowlist policy.
+ * cloud tokens, strips inherited proxies, and enforces the `no_network_except_model_api`
+ * allowlist policy.
  */
 
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  readlinkSync,
+  rmSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { git, gitOrThrow } from '../../.shared/git.ts';
-import { isCommitSha } from './schema.ts';
+import { assertOutsideAgentTrees, isCommitSha, toPosixPath } from './schema.ts';
 
 export const NETWORK_POLICY_MODE = 'no_network_except_model_api' as const;
 
@@ -52,6 +63,7 @@ const STRIPPED_EXACT_ENV_KEYS = new Set([
   'GITHUB_TOKEN',
   'GH_ENTERPRISE_TOKEN',
   'GITHUB_ENTERPRISE_TOKEN',
+  'COPILOT_GITHUB_TOKEN',
   'GITLAB_TOKEN',
   'GL_TOKEN',
   'GITEA_TOKEN',
@@ -62,9 +74,16 @@ const STRIPPED_EXACT_ENV_KEYS = new Set([
   'AWS_ACCESS_KEY_ID',
   'AWS_SECRET_ACCESS_KEY',
   'AWS_SESSION_TOKEN',
+  'GOOGLE_APPLICATION_CREDENTIALS',
+  'CLOUDSDK_AUTH_ACCESS_TOKEN',
+  'AZURE_CLIENT_SECRET',
+  'CLOUDFLARE_API_TOKEN',
 ]);
 
 const STRIPPED_PREFIXES = ['GH_TOKEN_', 'GITHUB_TOKEN_', 'GITLAB_TOKEN_', 'GITEA_TOKEN_'];
+const PROXY_ENV_KEYS = new Set(['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'FTP_PROXY', 'NO_PROXY']);
+const WORK_ORDER_ENV_KEYS = new Set(['ARCHON_WORK_ORDER_MODE', 'INPUTS_WORK_ORDER_MODE']);
+const TRUTHY_WORK_ORDER = new Set(['1', 'true']);
 
 /** Raised when a replay environment violates the network isolation policy. */
 export class NetworkPolicyError extends Error {
@@ -109,6 +128,8 @@ export interface ReplaySandbox {
   readonly parentCommit: string;
   readonly hasSnapshotGit: boolean;
   readonly snapshotCommit: string | null;
+  /** Pre-builder snapshot of every file/symlink in `dir` (excluding top-level `.git`). */
+  readonly initialFiles: ReadonlyMap<string, string>;
 }
 
 export interface ReplayEnvOptions {
@@ -117,24 +138,23 @@ export interface ReplayEnvOptions {
 }
 
 function normalizeHost(hostOrUrl: string): string {
-  const trimmed = hostOrUrl.trim().toLowerCase();
-  if (trimmed === '') return '';
-  if (trimmed.includes('://')) {
-    try {
-      return new URL(trimmed).hostname.toLowerCase();
-    } catch {
-      return '';
-    }
+  const trimmed = hostOrUrl.trim();
+  if (trimmed === '' || trimmed.includes('@') || trimmed.includes('\\') || /\s/.test(trimmed)) {
+    return '';
   }
-  // Strip IPv6 brackets or trailing `:port` on bare `host:port`.
-  if (trimmed.startsWith('[')) {
-    const end = trimmed.indexOf(']');
-    return end === -1 ? '' : trimmed.slice(1, end);
+  const hasScheme = trimmed.includes('://');
+  let parsed: URL;
+  try {
+    parsed = new URL(hasScheme ? trimmed : `http://${trimmed}`);
+  } catch {
+    return '';
   }
-  const slash = trimmed.indexOf('/');
-  const hostPort = slash === -1 ? trimmed : trimmed.slice(0, slash);
-  const colon = hostPort.indexOf(':');
-  return colon === -1 ? hostPort : hostPort.slice(0, colon);
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return '';
+  if (parsed.username !== '' || parsed.password !== '') return '';
+  if (!hasScheme && (parsed.search !== '' || parsed.hash !== '' || (parsed.pathname !== '' && parsed.pathname !== '/'))) {
+    return '';
+  }
+  return parsed.hostname.toLowerCase();
 }
 
 /**
@@ -193,14 +213,49 @@ export function assertHostAllowed(hostOrUrl: string, config: NetworkIsolationCon
 
 function shouldStripEnvKey(key: string): boolean {
   const upper = key.toUpperCase();
-  if (STRIPPED_EXACT_ENV_KEYS.has(upper)) return true;
+  if (STRIPPED_EXACT_ENV_KEYS.has(upper) || PROXY_ENV_KEYS.has(upper)) return true;
   return STRIPPED_PREFIXES.some(prefix => upper.startsWith(prefix));
+}
+
+function assertWorkOrderNotLowered(key: string, value: string): void {
+  const upper = key.toUpperCase();
+  if (!WORK_ORDER_ENV_KEYS.has(upper)) return;
+  const normalized = value.trim().toLowerCase();
+  if (!TRUTHY_WORK_ORDER.has(normalized)) {
+    throw new Error(`replay environment forbids lowering ${upper} to "${value}"`);
+  }
+}
+
+function copySanitizedEnv(
+  source: Readonly<Record<string, string | undefined>>,
+  target: Record<string, string>
+): void {
+  for (const [key, value] of Object.entries(source)) {
+    if (value === undefined) continue;
+    assertWorkOrderNotLowered(key, value);
+    if (shouldStripEnvKey(key) || WORK_ORDER_ENV_KEYS.has(key.toUpperCase())) continue;
+    target[key] = value;
+  }
+}
+
+function applyProxyEnv(env: Record<string, string>, network: NetworkIsolationConfig): void {
+  if (network.proxyUrl === undefined) return;
+  env.HTTP_PROXY = network.proxyUrl;
+  env.http_proxy = network.proxyUrl;
+  env.HTTPS_PROXY = network.proxyUrl;
+  env.https_proxy = network.proxyUrl;
+  const loopback = network.allowedHosts.filter(host => host === '127.0.0.1' || host === 'localhost');
+  if (loopback.length > 0) {
+    const joined = loopback.join(',');
+    env.NO_PROXY = joined;
+    env.no_proxy = joined;
+  }
 }
 
 /**
  * Build a sanitized environment for a replay run:
- * - Forces `ARCHON_WORK_ORDER_MODE=1` (ignores any attempt to disable it).
- * - Strips forge/GitHub/cloud tokens.
+ * - Forces `ARCHON_WORK_ORDER_MODE=1` (rejects lowering on any case variant).
+ * - Strips forge/GitHub/cloud tokens and all inherited proxy vars unconditionally.
  * - Enforces `no_network_except_model_api` env markers and proxy hygiene.
  */
 export function buildReplayEnv(
@@ -211,22 +266,8 @@ export function buildReplayEnv(
     options.network ?? { mode: NETWORK_POLICY_MODE, allowedHosts: DEFAULT_MODEL_API_ALLOWLIST }
   );
   const env: Record<string, string> = {};
-  for (const [key, value] of Object.entries(baseEnv)) {
-    if (value === undefined || shouldStripEnvKey(key)) continue;
-    env[key] = value;
-  }
-  if (options.extraEnv !== undefined) {
-    for (const [key, value] of Object.entries(options.extraEnv)) {
-      if (shouldStripEnvKey(key)) continue;
-      env[key] = value;
-    }
-  }
-  if (env.ARCHON_WORK_ORDER_MODE !== undefined && env.ARCHON_WORK_ORDER_MODE !== '1' && env.ARCHON_WORK_ORDER_MODE !== 'true') {
-    throw new Error(
-      `replay environment forbids lowering ARCHON_WORK_ORDER_MODE to "${env.ARCHON_WORK_ORDER_MODE}"`
-    );
-  }
-  // Always pin work-order mode on and declare the sealed network policy.
+  copySanitizedEnv(baseEnv, env);
+  if (options.extraEnv !== undefined) copySanitizedEnv(options.extraEnv, env);
   env.ARCHON_WORK_ORDER_MODE = '1';
   env.INPUTS_WORK_ORDER_MODE = 'true';
   env.ARCHON_NETWORK_POLICY = network.mode;
@@ -237,20 +278,30 @@ export function buildReplayEnv(
   return env;
 }
 
-function applyProxyEnv(env: Record<string, string>, network: NetworkIsolationConfig): void {
-  const proxyKeys = ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy'];
-  if (network.proxyUrl !== undefined) {
-    env.HTTP_PROXY = network.proxyUrl;
-    env.HTTPS_PROXY = network.proxyUrl;
-    env.NO_PROXY = network.allowedHosts.join(',');
-    return;
-  }
-  for (const key of proxyKeys) {
-    const existing = env[key];
-    if (existing !== undefined && !isHostAllowed(existing, network)) {
-      delete env[key];
+/**
+ * Snapshot every file and symlink beneath `rootDir` (excluding only top-level `.git`)
+ * into a map of relative POSIX path -> content fingerprint (`file:<sha256>` or `symlink:<target>`).
+ */
+export function snapshotSandboxFiles(rootDir: string): Map<string, string> {
+  const snapshot = new Map<string, string>();
+  const walk = (dir: string, prefix: string): void => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const rel = prefix === '' ? entry.name : `${prefix}/${entry.name}`;
+      if (rel === '.git') continue;
+      const fullPath = join(dir, entry.name);
+      const stat = lstatSync(fullPath);
+      if (stat.isSymbolicLink()) {
+        snapshot.set(toPosixPath(rel), `symlink:${readlinkSync(fullPath)}`);
+      } else if (stat.isDirectory()) {
+        walk(fullPath, rel);
+      } else if (stat.isFile()) {
+        const digest = createHash('sha256').update(readFileSync(fullPath)).digest('hex');
+        snapshot.set(toPosixPath(rel), `file:${digest}`);
+      }
     }
-  }
+  };
+  walk(rootDir, '');
+  return snapshot;
 }
 
 function createSandboxDirectory(outDir?: string): string {
@@ -265,9 +316,7 @@ function extractParentArchive(repoRoot: string, parentCommit: string, sandboxDir
     { stdout: 'pipe', stderr: 'pipe' }
   );
   if (archive.exitCode !== 0) {
-    throw new Error(
-      `git archive ${parentCommit} failed: ${archive.stderr.toString().trim()}`
-    );
+    throw new Error(`git archive ${parentCommit} failed: ${archive.stderr.toString().trim()}`);
   }
   const extract = Bun.spawnSync(['tar', '-x', '-C', sandboxDir], {
     stdin: archive.stdout,
@@ -311,15 +360,22 @@ function initSingleSnapshotCommit(sandboxDir: string, branch: string, fixedDate:
 
 /**
  * Verify that `sandboxDir` is properly sealed:
- * - When `expectSnapshotGit === false`: `.git` MUST NOT exist.
+ * - When `expectSnapshotGit === false`: `.git` MUST NOT exist AND `git rev-parse --is-inside-work-tree`
+ *   MUST fail so no enclosing parent `.git` can be inherited.
  * - When `expectSnapshotGit === true`: exactly 1 parentless commit, ZERO remotes,
- *   ZERO tags, and ZERO extra branches.
+ *   and ZERO tags.
  */
 export function verifyReplaySandbox(sandboxDir: string, expectSnapshotGit: boolean): void {
   const gitPath = join(sandboxDir, '.git');
   if (!expectSnapshotGit) {
     if (existsSync(gitPath)) {
       throw new ReplaySealError(`replay sandbox ${sandboxDir} must not contain .git`);
+    }
+    const inherited = git('-C', sandboxDir, 'rev-parse', '--is-inside-work-tree');
+    if (inherited.code === 0) {
+      throw new ReplaySealError(
+        `replay sandbox ${sandboxDir} inherits an enclosing git repository`
+      );
     }
     return;
   }
@@ -356,6 +412,9 @@ export function prepareReplaySandbox(options: PrepareReplayOptions): ReplaySandb
   if (!isCommitSha(parentCommit)) {
     throw new Error(`parent_commit "${parentCommit}" must be a 40-hex commit SHA`);
   }
+  if (options.outDir !== undefined) {
+    assertOutsideAgentTrees(options.outDir, { repoRoot });
+  }
   const verified = git('-C', repoRoot, 'rev-parse', '--verify', '--quiet', `${parentCommit}^{commit}`);
   if (verified.code !== 0) {
     throw new Error(`parent_commit ${parentCommit} does not exist in ${repoRoot}`);
@@ -363,6 +422,7 @@ export function prepareReplaySandbox(options: PrepareReplayOptions): ReplaySandb
   const initSnapshotGit = options.initSnapshotGit ?? true;
   const sandboxDir = createSandboxDirectory(options.outDir);
   try {
+    assertOutsideAgentTrees(sandboxDir, { repoRoot });
     extractParentArchive(repoRoot, parentCommit, sandboxDir);
     const snapshotCommit = initSnapshotGit
       ? initSingleSnapshotCommit(
@@ -372,11 +432,13 @@ export function prepareReplaySandbox(options: PrepareReplayOptions): ReplaySandb
         )
       : null;
     verifyReplaySandbox(sandboxDir, initSnapshotGit);
+    const initialFiles = snapshotSandboxFiles(sandboxDir);
     return {
       dir: sandboxDir,
       parentCommit,
       hasSnapshotGit: initSnapshotGit,
       snapshotCommit,
+      initialFiles,
     };
   } catch (error) {
     rmSync(sandboxDir, { recursive: true, force: true });

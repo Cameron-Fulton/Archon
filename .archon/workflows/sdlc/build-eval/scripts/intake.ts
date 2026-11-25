@@ -3,16 +3,16 @@
  *
  * Fail-closed rules:
  * 1. The dataset path (and any external test patch path) MUST sit outside every repo checkout,
- *    `.git`, and builder worktree (`assertOutsideAgentTrees`).
- * 2. The task MUST be trusted (`origin_trusted === true`) OR carry a verified
- *    `approved_scope_sha256` matching SHA-256 of its approved `work_order`.
+ *    `.git`, and builder worktree (`assertOutsideAgentTrees`), and external patch files MUST exist.
+ * 2. The task MUST be trusted (`origin_trusted === true`) OR match an externally supplied
+ *    `options.expectedScopeSha256` (self-attested `approved_scope_sha256` is NEVER accepted).
  * 3. Its 48-hour post-release watch MUST have passed (`release_watch_passed === true`).
- * 4. Candidate text, grader commands, and inline patches MUST contain zero secret patterns.
- * 5. Existing task IDs are NEVER overwritten.
+ * 4. Candidate text, grader commands, and patches MUST contain zero secret patterns.
+ * 5. Existing task IDs are NEVER overwritten, and writes use exclusive 0600 temp files.
  */
 
-import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import { existsSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { findSecretMatches } from './bench.ts';
 import {
@@ -21,6 +21,7 @@ import {
   type PastTaskSet,
   type SolveTask,
   assertOutsideAgentTrees,
+  isInlinePatch,
   isSha256Hex,
   loadPastTaskSet,
   resolveCanonicalPath,
@@ -37,7 +38,11 @@ export class IntakeRejectedError extends Error {
 }
 
 export interface IntakeOptions extends LoadSetOptions {
-  /** When set, `approved_scope_sha256` must also match this approved scope digest. */
+  /**
+   * Required when `candidate.origin_trusted !== true`: the externally approved
+   * 64-hex SHA-256 scope digest that `candidate.approved_scope_sha256` and
+   * `sha256(candidate.work_order)` must both match.
+   */
   readonly expectedScopeSha256?: string;
   /** Create a new dataset file if `setPath` does not exist yet (default `false`). */
   readonly createIfMissing?: boolean;
@@ -57,21 +62,26 @@ export function computeScopeSha256(workOrder: string): string {
 
 function assertTrustGate(candidate: SolveTask, expectedScopeSha256?: string): void {
   if (candidate.origin_trusted) return;
+  if (expectedScopeSha256 === undefined || !isSha256Hex(expectedScopeSha256)) {
+    throw new IntakeRejectedError(
+      `candidate ${candidate.id} rejected: untrusted task requires an externally verified expectedScopeSha256 (self-attested approved_scope_sha256 is refused)`
+    );
+  }
   const declared = candidate.approved_scope_sha256;
   if (declared === undefined || !isSha256Hex(declared)) {
     throw new IntakeRejectedError(
-      `candidate ${candidate.id} rejected: untrusted task requires origin_trusted=true or a verified approved_scope_sha256`
+      `candidate ${candidate.id} rejected: untrusted task is missing a valid 64-hex approved_scope_sha256`
     );
   }
-  const actual = computeScopeSha256(candidate.work_order);
-  if (declared.toLowerCase() !== actual) {
-    throw new IntakeRejectedError(
-      `candidate ${candidate.id} rejected: approved_scope_sha256 does not match work_order content`
-    );
-  }
-  if (expectedScopeSha256 !== undefined && declared.toLowerCase() !== expectedScopeSha256.toLowerCase()) {
+  const expected = expectedScopeSha256.toLowerCase();
+  if (declared.toLowerCase() !== expected) {
     throw new IntakeRejectedError(
       `candidate ${candidate.id} rejected: approved_scope_sha256 does not match expected approved scope`
+    );
+  }
+  if (computeScopeSha256(candidate.work_order) !== expected) {
+    throw new IntakeRejectedError(
+      `candidate ${candidate.id} rejected: work_order digest does not match expected approved scope`
     );
   }
 }
@@ -80,6 +90,18 @@ function assertReleaseWatchPassed(candidate: SolveTask): void {
   if (!candidate.release_watch_passed) {
     throw new IntakeRejectedError(
       `candidate ${candidate.id} rejected: 48-hour release watch has not passed (release_watch_passed=false)`
+    );
+  }
+}
+
+function assertExternalPatchValid(candidate: SolveTask, options: LoadSetOptions): void {
+  const patch = candidate.grader.merged_change_tests?.patch;
+  if (patch === undefined || isInlinePatch(patch)) return;
+  assertOutsideAgentTrees(patch, options);
+  const canonicalPatch = resolveCanonicalPath(patch);
+  if (!existsSync(canonicalPatch) || !lstatSync(canonicalPatch).isFile()) {
+    throw new IntakeRejectedError(
+      `candidate ${candidate.id} rejected: external merged_change_tests patch does not exist or is not a regular file (${patch})`
     );
   }
 }
@@ -94,8 +116,11 @@ function collectCandidateText(candidate: SolveTask): string {
   if (merged !== undefined) {
     for (const cmd of merged.commands) parts.push(flattenCommand(cmd));
     if (merged.patch !== undefined) {
-      const isInline = merged.patch.includes('\n');
-      parts.push(isInline ? merged.patch : existsSync(merged.patch) ? readFileSync(merged.patch, 'utf8') : merged.patch);
+      parts.push(
+        isInlinePatch(merged.patch)
+          ? merged.patch
+          : readFileSync(resolveCanonicalPath(merged.patch), 'utf8')
+      );
     }
   }
   return parts.join('\n');
@@ -108,12 +133,6 @@ function assertNoSecretsInCandidate(candidate: SolveTask): void {
       `candidate ${candidate.id} rejected: contains potential secret (${matches[0]})`
     );
   }
-}
-
-function assertPatchOutsideAgentTrees(candidate: SolveTask, options: LoadSetOptions): void {
-  const patch = candidate.grader.merged_change_tests?.patch;
-  if (patch === undefined || patch.includes('\n')) return;
-  assertOutsideAgentTrees(patch, options);
 }
 
 function validateCandidateSchema(candidate: SolveTask): SolveTask {
@@ -147,6 +166,22 @@ function loadOrInitializeSet(
   };
 }
 
+function writeAtomically(canonicalPath: string, nextSet: PastTaskSet): void {
+  mkdirSync(dirname(canonicalPath), { recursive: true });
+  const tempPath = `${canonicalPath}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    writeFileSync(tempPath, `${JSON.stringify(nextSet, null, 2)}\n`, {
+      encoding: 'utf8',
+      flag: 'wx',
+      mode: 0o600,
+    });
+    renameSync(tempPath, canonicalPath);
+  } catch (error) {
+    if (existsSync(tempPath)) rmSync(tempPath, { force: true });
+    throw error;
+  }
+}
+
 /**
  * Append a newly fixed real failure to `setPath` atomically after enforcing all
  * isolation, trust, 48-hour watch, secret-scan, and no-overwrite gates.
@@ -157,8 +192,8 @@ export function addFixedFailureToSet(
   options: IntakeOptions
 ): IntakeResult {
   assertOutsideAgentTrees(setPath, options);
-  assertPatchOutsideAgentTrees(candidate, options);
   const validated = validateCandidateSchema(candidate);
+  assertExternalPatchValid(validated, options);
   assertTrustGate(validated, options.expectedScopeSha256);
   assertReleaseWatchPassed(validated);
   assertNoSecretsInCandidate(validated);
@@ -184,12 +219,8 @@ export function addFixedFailureToSet(
     },
     setPath
   );
-
   const canonicalPath = resolveCanonicalPath(setPath);
-  mkdirSync(dirname(canonicalPath), { recursive: true });
-  const tempPath = `${canonicalPath}.${process.pid}.tmp`;
-  writeFileSync(tempPath, `${JSON.stringify(nextSet, null, 2)}\n`, 'utf8');
-  renameSync(tempPath, canonicalPath);
+  writeAtomically(canonicalPath, nextSet);
 
   return {
     added: true,
