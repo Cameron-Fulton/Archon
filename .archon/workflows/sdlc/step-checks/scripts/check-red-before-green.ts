@@ -43,8 +43,11 @@ const TEST_FILE_PATTERNS: readonly RegExp[] = [
   /(?:^|\/)test_[^/]+$/i,
 ];
 
-const SHELL_METACHARS = /[|&;<>()$`\\"\n]/;
+const SHELL_METACHARS = /[|&;<>()$`\\'"\r\n]/;
 const CLEANUP_ATTEMPTS = 8;
+const COMMIT_SHA_PATTERN = /^[0-9a-f]{40,64}$/i;
+
+type TestRunOutcome = 'pass' | 'fail' | 'runner_error';
 
 export function isTestFile(path: string): boolean {
   const normalized = path.replaceAll('\\', '/');
@@ -70,8 +73,17 @@ function runGit(
   };
 }
 
-function changedTestFiles(repo: string, base: string, head: string): string[] {
-  const listed = runGit(repo, ['diff', '--name-only', '--diff-filter=AMCR', '-z', base, head]);
+function resolveCommitRef(repo: string, rawRef: string): string | null {
+  const ref = rawRef.trim();
+  if (ref === '' || ref.startsWith('-')) return null;
+  const resolved = runGit(repo, ['rev-parse', '--verify', '--end-of-options', `${ref}^{commit}`]);
+  if (resolved.code !== 0) return null;
+  const sha = resolved.stdout.trim();
+  return COMMIT_SHA_PATTERN.test(sha) ? sha : null;
+}
+
+function changedTestFiles(repo: string, baseSha: string, headSha: string): string[] {
+  const listed = runGit(repo, ['diff', '--name-only', '--diff-filter=AMCR', '-z', baseSha, headSha]);
   if (listed.code !== 0) {
     throw new Error(`git diff failed: ${listed.stderr}`);
   }
@@ -81,7 +93,7 @@ function changedTestFiles(repo: string, base: string, head: string): string[] {
     .sort();
 }
 
-function buildTestCommandArgv(command: string | readonly string[]): string[] {
+export function buildTestCommandArgv(command: string | readonly string[]): string[] {
   if (Array.isArray(command)) {
     const argv = command.map(part => part.trim()).filter(part => part.length > 0);
     if (argv.length === 0) throw new Error('test command is empty');
@@ -95,13 +107,27 @@ function buildTestCommandArgv(command: string | readonly string[]): string[] {
   return raw.split(/\s+/);
 }
 
-function runTestCommand(cwd: string, argv: readonly string[]): boolean {
-  const result = Bun.spawnSync([...argv], {
-    cwd,
-    stdout: 'pipe',
-    stderr: 'pipe',
-  });
-  return result.exitCode === 0;
+function runTestCommand(cwd: string, argv: readonly string[]): TestRunOutcome {
+  let result: ReturnType<typeof Bun.spawnSync>;
+  try {
+    result = Bun.spawnSync([...argv], {
+      cwd,
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+  } catch {
+    return 'runner_error';
+  }
+  if (
+    (result.signalCode !== undefined && result.signalCode !== null) ||
+    result.exitCode === undefined ||
+    result.exitCode === null ||
+    result.exitCode === 126 ||
+    result.exitCode === 127
+  ) {
+    return 'runner_error';
+  }
+  return result.exitCode === 0 ? 'pass' : 'fail';
 }
 
 function cleanupTree(path: string): void {
@@ -122,15 +148,6 @@ function removeWorktree(repo: string, worktreePath: string): void {
   cleanupTree(worktreePath);
 }
 
-function canRunHeadInPlace(repo: string, head: string): boolean {
-  const headSha = runGit(repo, ['rev-parse', head]);
-  const currentSha = runGit(repo, ['rev-parse', 'HEAD']);
-  if (headSha.code !== 0 || currentSha.code !== 0) return false;
-  if (headSha.stdout.trim() !== currentSha.stdout.trim()) return false;
-  const status = runGit(repo, ['status', '--porcelain']);
-  return status.code === 0 && status.stdout.trim() === '';
-}
-
 function verdictReason(redOnBase: boolean, greenOnHead: boolean): string {
   if (redOnBase && greenOnHead) return 'ok';
   if (!redOnBase && greenOnHead) return 'tests_passed_on_base_without_implementation';
@@ -138,88 +155,46 @@ function verdictReason(redOnBase: boolean, greenOnHead: boolean): string {
   return 'tests_passed_on_base_and_failed_on_head';
 }
 
-function verifyHead(repo: string, head: string, scratchRoot: string, argv: readonly string[]): boolean {
-  if (canRunHeadInPlace(repo, head)) {
-    return runTestCommand(repo, argv);
-  }
-  const headWorktree = join(scratchRoot, 'head');
-  const added = runGit(repo, ['worktree', 'add', '--detach', headWorktree, head]);
-  if (added.code !== 0) {
-    throw new Error(`git worktree add (head) failed: ${added.stderr}`);
-  }
-  try {
-    return runTestCommand(headWorktree, argv);
-  } finally {
-    removeWorktree(repo, headWorktree);
-  }
+function failResult(testFiles: readonly string[], reason: string): RedBeforeGreenResult {
+  return {
+    passed: false,
+    red_on_base: false,
+    green_on_head: false,
+    test_files: testFiles,
+    reason,
+  };
 }
 
-export function checkRedBeforeGreen(options: RedBeforeGreenOptions): RedBeforeGreenResult {
-  const argv = buildTestCommandArgv(options.testCommand);
-  let testFiles: string[];
-  try {
-    testFiles = changedTestFiles(options.repo, options.base, options.head);
-  } catch {
-    return {
-      passed: false,
-      red_on_base: false,
-      green_on_head: false,
-      test_files: [],
-      reason: 'git_error',
-    };
-  }
-
-  if (testFiles.length === 0) {
-    return {
-      passed: false,
-      red_on_base: false,
-      green_on_head: false,
-      test_files: [],
-      reason: 'no_test_files_changed',
-    };
-  }
-
-  const diff = runGit(options.repo, ['diff', '--binary', options.base, options.head, '--', ...testFiles]);
-  if (diff.code !== 0) {
-    return {
-      passed: false,
-      red_on_base: false,
-      green_on_head: false,
-      test_files: testFiles,
-      reason: 'git_error',
-    };
-  }
-
+function runInSymmetricWorktrees(
+  repo: string,
+  baseSha: string,
+  headSha: string,
+  testFiles: readonly string[],
+  diffBytes: Uint8Array,
+  argv: readonly string[]
+): RedBeforeGreenResult {
   const scratchRoot = mkdtempSync(join(tmpdir(), 'archon-red-before-green-'));
   const baseWorktree = join(scratchRoot, 'base');
+  const headWorktree = join(scratchRoot, 'head');
 
   try {
-    const added = runGit(options.repo, ['worktree', 'add', '--detach', baseWorktree, options.base]);
-    if (added.code !== 0) {
-      return {
-        passed: false,
-        red_on_base: false,
-        green_on_head: false,
-        test_files: testFiles,
-        reason: 'git_error',
-      };
-    }
+    const addedBase = runGit(repo, ['worktree', 'add', '--detach', baseWorktree, baseSha]);
+    if (addedBase.code !== 0) return failResult(testFiles, 'git_error');
 
-    const applied = runGit(baseWorktree, ['apply', '--whitespace=nowarn'], diff.bytes);
-    if (applied.code !== 0) {
-      return {
-        passed: false,
-        red_on_base: false,
-        green_on_head: false,
-        test_files: testFiles,
-        reason: 'test_diff_apply_failed',
-      };
-    }
+    const applied = runGit(baseWorktree, ['apply', '--whitespace=nowarn'], diffBytes);
+    if (applied.code !== 0) return failResult(testFiles, 'test_diff_apply_failed');
 
-    const basePassed = runTestCommand(baseWorktree, argv);
-    const redOnBase = !basePassed;
-    const greenOnHead = verifyHead(options.repo, options.head, scratchRoot, argv);
+    const addedHead = runGit(repo, ['worktree', 'add', '--detach', headWorktree, headSha]);
+    if (addedHead.code !== 0) return failResult(testFiles, 'git_error');
 
+    const baseOutcome = runTestCommand(baseWorktree, argv);
+    if (baseOutcome === 'runner_error') return failResult(testFiles, 'test_runner_error');
+
+    const headOutcome = runTestCommand(headWorktree, argv);
+    if (headOutcome === 'runner_error') return failResult(testFiles, 'test_runner_error');
+
+    const redOnBase = baseOutcome === 'fail';
+    const greenOnHead = headOutcome === 'pass';
     return {
       passed: redOnBase && greenOnHead,
       red_on_base: redOnBase,
@@ -228,9 +203,37 @@ export function checkRedBeforeGreen(options: RedBeforeGreenOptions): RedBeforeGr
       reason: verdictReason(redOnBase, greenOnHead),
     };
   } finally {
-    removeWorktree(options.repo, baseWorktree);
+    removeWorktree(repo, baseWorktree);
+    removeWorktree(repo, headWorktree);
     cleanupTree(scratchRoot);
   }
+}
+
+export function checkRedBeforeGreen(options: RedBeforeGreenOptions): RedBeforeGreenResult {
+  const argv = buildTestCommandArgv(options.testCommand);
+  const baseSha = resolveCommitRef(options.repo, options.base);
+  const headSha = resolveCommitRef(options.repo, options.head);
+  if (baseSha === null || headSha === null) {
+    return failResult([], 'git_error');
+  }
+
+  let testFiles: string[];
+  try {
+    testFiles = changedTestFiles(options.repo, baseSha, headSha);
+  } catch {
+    return failResult([], 'git_error');
+  }
+
+  if (testFiles.length === 0) {
+    return failResult([], 'no_test_files_changed');
+  }
+
+  const diff = runGit(options.repo, ['diff', '--binary', baseSha, headSha, '--', ...testFiles]);
+  if (diff.code !== 0) {
+    return failResult(testFiles, 'git_error');
+  }
+
+  return runInSymmetricWorktrees(options.repo, baseSha, headSha, testFiles, diff.bytes, argv);
 }
 
 function runCli(): void {

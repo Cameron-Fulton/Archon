@@ -11,7 +11,10 @@ import { join } from 'node:path';
 import { trackTempRoots } from './temp-roots';
 import { checkDescription } from '../../workflows/sdlc/step-checks/scripts/check-description.ts';
 import { checkPlan } from '../../workflows/sdlc/step-checks/scripts/check-plan.ts';
-import { checkRedBeforeGreen } from '../../workflows/sdlc/step-checks/scripts/check-red-before-green.ts';
+import {
+  buildTestCommandArgv,
+  checkRedBeforeGreen,
+} from '../../workflows/sdlc/step-checks/scripts/check-red-before-green.ts';
 import {
   CHECKER_IDS,
   type CheckerId,
@@ -112,6 +115,48 @@ describe('step check 1: check-description', () => {
     expect(result.scope_drift).toEqual(['Rewriting OAuth token refresh flow']);
   });
 
+  it('preserves negation on Must not: prefixed requirements and rejects affirmative violations', () => {
+    const mustNotRequest = 'Must not: modify existing session cookie signing format';
+    const violation = checkDescription(
+      mustNotRequest,
+      'Modify existing session cookie signing format to use SHA-512.'
+    );
+    expect(violation.passed).toBe(false);
+    expect(violation.missing).toEqual(['Must not modify existing session cookie signing format']);
+
+    const preserved = checkDescription(
+      mustNotRequest,
+      'Must not modify existing session cookie signing format.'
+    );
+    expect(preserved.passed).toBe(true);
+    expect(preserved.missing).toEqual([]);
+  });
+
+  it('splits bulleted markdown on newlines so negation on one bullet cannot mask scope drift on the next', () => {
+    const bulletRequest = [
+      '- [ ] Must not touch billing ledger',
+      '## Out of scope',
+      '- Rewriting OAuth token refresh flow',
+    ].join('\n');
+    const bulletDescription = [
+      '- Must not touch billing ledger',
+      '- Rewrite OAuth token refresh flow',
+    ].join('\n');
+
+    const result = checkDescription(bulletRequest, bulletDescription);
+    expect(result.passed).toBe(false);
+    expect(result.scope_drift).toEqual(['Rewriting OAuth token refresh flow']);
+  });
+
+  it('does not allow short 2-3 char candidate tokens to prefix-match longer requirement words', () => {
+    const shortBypass = checkDescription(
+      '- [ ] Validate notification delivery pipeline',
+      'no de pi'
+    );
+    expect(shortBypass.passed).toBe(false);
+    expect(shortBypass.matched_requirements).toBe(0);
+  });
+
   it('runs cleanly as a standalone CLI emitting JSON', () => {
     const proc = spawnSync(
       process.execPath,
@@ -203,6 +248,36 @@ describe('step check 2: check-plan', () => {
     expect(result.uncovered).toEqual([
       'AC2: Emit structured JSON error when port is already bound',
     ]);
+  });
+
+  it('rejects cross-prefix ID collisions, lowercase prose "check N", and 2-3 char prefix matches', () => {
+    const crossPrefix = checkPlan(
+      '- [ ] AC1: Implement exponential backoff retry',
+      '## Step 1: REQ1 unrelated logging tweak\nVerify with unit test.'
+    );
+    expect(crossPrefix.passed).toBe(false);
+    expect(crossPrefix.covered).toBe(0);
+
+    const proseCheck = checkPlan(
+      '- [ ] Confirm check 1 returns valid OAuth signature',
+      '## Step 1: Run check 1 on unrelated billing table\nVerify with unit test.'
+    );
+    expect(proseCheck.passed).toBe(false);
+    expect(proseCheck.covered).toBe(0);
+
+    const explicitCheckId = checkPlan(
+      '- [ ] CHECK-1: Implement exponential backoff retry',
+      '## Step 1: Deliver CHECK-1\nVerify with unit test.'
+    );
+    expect(explicitCheckId.passed).toBe(true);
+    expect(explicitCheckId.covered).toBe(1);
+
+    const shortTokenBypass = checkPlan(
+      '- [ ] Validate notification delivery pipeline',
+      '## Step 1: Handle no de pi\nVerify with unit test.'
+    );
+    expect(shortTokenBypass.passed).toBe(false);
+    expect(shortTokenBypass.covered).toBe(0);
   });
 
   it('runs cleanly as a standalone CLI emitting JSON', () => {
@@ -333,6 +408,136 @@ describe('step check 3: check-red-before-green (real temp git repo)', () => {
       test_files: [],
       reason: 'no_test_files_changed',
     });
+  });
+
+  it('rejects dash-prefixed refs to prevent git option injection', () => {
+    const { repo, base } = initSampleRepo();
+    const injectedBase = checkRedBeforeGreen({
+      repo,
+      base: '--output=/tmp/injected',
+      head: base,
+      testCommand: [process.execPath, 'test'],
+    });
+    expect(injectedBase).toEqual({
+      passed: false,
+      red_on_base: false,
+      green_on_head: false,
+      test_files: [],
+      reason: 'git_error',
+    });
+
+    const injectedHead = checkRedBeforeGreen({
+      repo,
+      base,
+      head: '--help',
+      testCommand: [process.execPath, 'test'],
+    });
+    expect(injectedHead).toEqual({
+      passed: false,
+      red_on_base: false,
+      green_on_head: false,
+      test_files: [],
+      reason: 'git_error',
+    });
+  });
+
+  it('reports test_runner_error instead of red_on_base when the test runner fails to spawn or exits 127', () => {
+    const { repo, base } = initSampleRepo();
+    writeRepoFile(
+      repo,
+      'src/calc.ts',
+      'export function add(a: number, b: number): number {\n  return a + b;\n}\n'
+    );
+    writeRepoFile(
+      repo,
+      'src/calc.test.ts',
+      "import { expect, test } from 'bun:test';\ntest('ok', () => expect(true).toBe(true));\n"
+    );
+    const head = commitAll(repo, 'test: add test');
+
+    const missingBin = checkRedBeforeGreen({
+      repo,
+      base,
+      head,
+      testCommand: ['nonexistent-test-runner-binary-xyz'],
+    });
+    expect(missingBin).toEqual({
+      passed: false,
+      red_on_base: false,
+      green_on_head: false,
+      test_files: ['src/calc.test.ts'],
+      reason: 'test_runner_error',
+    });
+
+    const exit127 = checkRedBeforeGreen({
+      repo,
+      base,
+      head,
+      testCommand: [process.execPath, '-e', 'process.exit(127)'],
+    });
+    expect(exit127).toEqual({
+      passed: false,
+      red_on_base: false,
+      green_on_head: false,
+      test_files: ['src/calc.test.ts'],
+      reason: 'test_runner_error',
+    });
+  });
+
+  it('runs both base and head in symmetric clean worktrees so untracked local files cannot cause false passes', () => {
+    const { repo, base } = initSampleRepo();
+    writeRepoFile(
+      repo,
+      'src/calc.ts',
+      'export function add(a: number, b: number): number {\n  return a + b;\n}\n'
+    );
+    writeRepoFile(
+      repo,
+      'src/env.test.ts',
+      [
+        "import { expect, test } from 'bun:test';",
+        "import { existsSync } from 'node:fs';",
+        "test('depends on untracked local file', () => {",
+        "  expect(existsSync('local_untracked.marker')).toBe(true);",
+        '});',
+      ].join('\n')
+    );
+    const head = commitAll(repo, 'test: relies on untracked file');
+    // Plant an untracked marker in the caller checkout ONLY.
+    writeRepoFile(repo, 'local_untracked.marker', 'present\n');
+
+    const result = checkRedBeforeGreen({
+      repo,
+      base,
+      head,
+      testCommand: [process.execPath, 'test', 'src/env.test.ts'],
+    });
+
+    expect(result.passed).toBe(false);
+    expect(result.green_on_head).toBe(false);
+    expect(result.reason).toBe('tests_failed_on_head');
+  });
+
+  it('routes single-quoted and CR-containing string commands through a shell instead of naive whitespace split', () => {
+    const singleQuoted = buildTestCommandArgv("bun test 'src/my test.ts'");
+    const expectedShell = process.platform === 'win32' ? ['cmd', '/d', '/s', '/c'] : ['sh', '-c'];
+    expect(singleQuoted).toEqual([...expectedShell, "bun test 'src/my test.ts'"]);
+
+    const withCarriageReturn = buildTestCommandArgv('bun test\r');
+    expect(withCarriageReturn).toEqual(['bun', 'test']);
+    const embeddedCr = buildTestCommandArgv('bun\rtest');
+    expect(embeddedCr).toEqual([...expectedShell, 'bun\rtest']);
+  });
+
+  it('gates each archon-step-checks.yaml node on its required input for pre-implementation runs', () => {
+    const yamlPath = join(STEP_CHECKS_DIR, '../archon-step-checks.yaml');
+    const parsed = Bun.YAML.parse(readFileSync(yamlPath, 'utf8')) as {
+      nodes: { id: string; when?: string }[];
+    };
+    const byId = new Map(parsed.nodes.map(node => [node.id, node.when]));
+    expect(byId.get('check-description')).toBe("$INPUTS.request != ''");
+    expect(byId.get('check-plan')).toBe("$INPUTS.work_order != ''");
+    expect(byId.get('check-red-before-green')).toBe("$INPUTS.test_cmd != ''");
   });
 });
 

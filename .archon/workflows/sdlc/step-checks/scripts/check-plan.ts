@@ -77,7 +77,7 @@ const STEP_START = /^(?:#{2,6}\s+|\d+[.)]\s+|[-*+]\s+(?:\*\*)?(?:step\s+\d+|task
 const VERIFICATION_SIGNAL =
   /\b(?:verify|verified|verification|test|tests|tested|assert|asserts|assertion|check|checks|validate|validation|lint|type-check|typecheck|spec|integration|unit|e2e|curl|pytest|vitest|jest|bun\s+test|npm\s+test|expect|exit\s+code|status\s+code)\b/i;
 
-const CHECK_ID_PATTERN = /\b(?:AC|CHECK|REQ|CRIT)[-_ ]?(\d+)\b/i;
+const CHECK_ID_PATTERN = /\b(AC|CHECK|REQ|CRIT)([-_ ]?)(\d+)\b/gi;
 const MATCH_THRESHOLD = 0.55;
 
 function stripMarkdown(raw: string): string {
@@ -238,20 +238,50 @@ function parsePlanSections(plan: string): {
   return { steps, verificationBlocks };
 }
 
+function extractExplicitCheckId(
+  raw: string
+): { readonly prefix: string; readonly num: string } | null {
+  CHECK_ID_PATTERN.lastIndex = 0;
+  for (let match = CHECK_ID_PATTERN.exec(raw); match !== null; match = CHECK_ID_PATTERN.exec(raw)) {
+    const rawPrefix = match[1];
+    const separator = match[2];
+    const num = match[3];
+    const upperPrefix = rawPrefix.toUpperCase();
+    // Disallow bare lowercase prose like "check 1"; require uppercase CHECK or an explicit -/_ separator.
+    if (upperPrefix === 'CHECK' && rawPrefix !== 'CHECK' && separator !== '-' && separator !== '_') {
+      continue;
+    }
+    return { prefix: upperPrefix, num };
+  }
+  return null;
+}
+
+function explicitIdMatchesBlock(
+  id: { readonly prefix: string; readonly num: string },
+  blockText: string
+): boolean {
+  if (id.prefix === 'CHECK') {
+    const exactCheck = new RegExp(`\\b(?:CHECK[-_ ]?|check[-_])${id.num}\\b`);
+    return exactCheck.test(blockText);
+  }
+  const exactPrefix = new RegExp(`\\b${id.prefix}[-_ ]?${id.num}\\b`, 'i');
+  return exactPrefix.test(blockText);
+}
+
 function tokenMatches(token: string, pool: ReadonlySet<string>): boolean {
   if (pool.has(token)) return true;
   if (token.length < 4) return false;
   for (const candidate of pool) {
+    if (candidate.length < 4) continue;
     if (candidate.startsWith(token) || token.startsWith(candidate)) return true;
   }
   return false;
 }
 
 function checkMatchesBlock(check: string, block: PlanStep): boolean {
-  const checkId = CHECK_ID_PATTERN.exec(check);
-  if (checkId !== null) {
-    const explicitRef = new RegExp(`\\b(?:AC|CHECK|REQ|CRIT)[-_ ]?${checkId[1]}\\b`, 'i');
-    if (explicitRef.test(block.text)) return true;
+  const checkId = extractExplicitCheckId(check);
+  if (checkId !== null && explicitIdMatchesBlock(checkId, block.text)) {
+    return true;
   }
 
   const entities = extractBacktickEntities(check);

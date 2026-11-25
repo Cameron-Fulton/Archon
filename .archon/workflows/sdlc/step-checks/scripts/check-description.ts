@@ -109,6 +109,8 @@ function extractBacktickEntities(raw: string): string[] {
   return entities;
 }
 
+const MUST_NOT_PREFIX = /^must\s+not\s*:/i;
+
 function extractStructuredRequirements(request: string): {
   requirements: string[];
   exclusions: string[];
@@ -130,6 +132,8 @@ function extractStructuredRequirements(request: string): {
     if (body === '') continue;
     if (inExclusionSection || /^(?:out\s+of\s+scope|non-goals?)\s*:/i.test(line)) {
       exclusions.push(body);
+    } else if (MUST_NOT_PREFIX.test(line)) {
+      requirements.push(`Must not ${body}`);
     } else {
       requirements.push(body);
     }
@@ -158,10 +162,19 @@ export function extractRequirements(request: string): {
   return { requirements: extractFallbackSentences(request), exclusions: [] };
 }
 
+function splitSentences(raw: string): string[] {
+  return raw
+    .split(/\r?\n/)
+    .flatMap(line => line.split(/(?<=[.!?])\s+/))
+    .map(sentence => sentence.trim())
+    .filter(sentence => sentence !== '');
+}
+
 function tokenPresent(token: string, descriptionTokens: ReadonlySet<string>): boolean {
   if (descriptionTokens.has(token)) return true;
   if (token.length < 4) return false;
   for (const candidate of descriptionTokens) {
+    if (candidate.length < 4) continue;
     if (candidate.startsWith(token) || token.startsWith(candidate)) return true;
   }
   return false;
@@ -196,7 +209,7 @@ function negationPreserved(requirement: string, description: string): boolean {
   const targetTokens = tokenize(requirement).filter(
     token => !['not', 'never', 'must', 'should', 'without', 'avoid'].includes(token)
   );
-  const sentences = description.split(/(?<=[.!?\n])\s+/);
+  const sentences = splitSentences(description);
   for (const sentence of sentences) {
     if (!NEGATION_PATTERN.test(sentence)) continue;
     const sentenceTokens = new Set(tokenize(sentence));
@@ -211,7 +224,7 @@ function detectScopeDrift(
   description: string
 ): readonly string[] {
   const drift: string[] = [];
-  const sentences = description.split(/(?<=[.!?\n])\s+/).filter(item => item.trim() !== '');
+  const sentences = splitSentences(description);
 
   for (const exclusion of exclusions) {
     const targetTokens = [...new Set(tokenize(exclusion))];

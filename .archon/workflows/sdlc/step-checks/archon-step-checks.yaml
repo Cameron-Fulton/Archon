@@ -37,6 +37,7 @@ inputs:
 
 nodes:
   - id: check-description
+    when: "$INPUTS.request != ''"
     script: check-description
     runtime: bun
     mutates_checkout: false
@@ -66,6 +67,7 @@ nodes:
           items: { type: string }
 
   - id: check-plan
+    when: "$INPUTS.work_order != ''"
     script: check-plan
     runtime: bun
     mutates_checkout: false
@@ -89,6 +91,7 @@ nodes:
           items: { type: string }
 
   - id: check-red-before-green
+    when: "$INPUTS.test_cmd != ''"
     script: check-red-before-green
     runtime: bun
     mutates_checkout: false
