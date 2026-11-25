@@ -1,0 +1,149 @@
+name: archon-checker-eval
+description: |
+  Compute weekly accuracy metrics for the five allowlisted factory checkers from
+  a task-outcome ledger and emit a deterministic, free-text-free checker-scores
+  report. When a checker meets the minimum sample count and falls below the
+  accuracy or recall threshold, emits a structured maintainer task entry without
+  ever dropping or disabling any checker.
+
+  Use when: computing weekly checker accuracy scores for the factory dashboard.
+  NOT for: mutating checker configuration or disabling required checks.
+
+worktree:
+  enabled: false
+mutates_checkout: false
+
+inputs:
+  ledger_path:
+    default: ""
+    description: Path to a JSON or JSONL task-outcome ledger file.
+  ledger_json:
+    default: ""
+    description: Inline JSON array of task-outcome records.
+  output_path:
+    default: ""
+    description: Optional destination path to write checker-scores.json.
+  window_days:
+    default: "7"
+    description: Trailing window length in days.
+  min_samples:
+    default: "10"
+    description: Minimum non-skip samples required before evaluating accuracy.
+  min_accuracy:
+    default: "0.8"
+    description: Minimum healthy accuracy ratio in [0, 1].
+  min_recall:
+    default: "0.85"
+    description: Minimum healthy recall ratio in [0, 1].
+  now:
+    default: ""
+    description: Optional ISO-8601 UTC reference timestamp for deterministic scoring.
+
+nodes:
+  - id: score
+    script: score
+    runtime: bun
+    mutates_checkout: false
+    with:
+      ledger_path: "$INPUTS.ledger_path"
+      ledger_json: "$INPUTS.ledger_json"
+      output_path: "$INPUTS.output_path"
+      window_days: "$INPUTS.window_days"
+      min_samples: "$INPUTS.min_samples"
+      min_accuracy: "$INPUTS.min_accuracy"
+      min_recall: "$INPUTS.min_recall"
+      now: "$INPUTS.now"
+    output_format:
+      type: object
+      additionalProperties: false
+      required:
+        - version
+        - generated_at
+        - window_days
+        - min_samples
+        - thresholds
+        - auto_drop_allowed
+        - total_tasks
+        - checkers
+        - maintainer_tasks
+      properties:
+        version: { type: integer }
+        generated_at: { type: string }
+        window_days: { type: integer }
+        min_samples: { type: integer }
+        thresholds:
+          type: object
+          additionalProperties: false
+          required: [min_accuracy, min_recall]
+          properties:
+            min_accuracy: { type: number }
+            min_recall: { type: number }
+        auto_drop_allowed: { type: boolean }
+        total_tasks: { type: integer }
+        checkers:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required:
+              - checker_id
+              - samples
+              - skipped
+              - total_tasks
+              - true_positives
+              - true_negatives
+              - false_positives
+              - false_negatives
+              - accuracy
+              - precision
+              - recall
+              - coverage
+              - status
+              - auto_drop_allowed
+            properties:
+              checker_id: { type: string }
+              samples: { type: integer }
+              skipped: { type: integer }
+              total_tasks: { type: integer }
+              true_positives: { type: integer }
+              true_negatives: { type: integer }
+              false_positives: { type: integer }
+              false_negatives: { type: integer }
+              accuracy: { type: ["number", "null"] }
+              precision: { type: ["number", "null"] }
+              recall: { type: ["number", "null"] }
+              coverage: { type: ["number", "null"] }
+              status: { type: string, enum: [healthy, low_accuracy, insufficient_data] }
+              auto_drop_allowed: { type: boolean }
+        maintainer_tasks:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required:
+              - checker_id
+              - action
+              - reason_code
+              - samples
+              - accuracy
+              - recall
+              - min_accuracy
+              - min_recall
+              - auto_drop_allowed
+              - target_owner
+            properties:
+              checker_id: { type: string }
+              action: { type: string, enum: [review_checker_weight_and_prompt] }
+              reason_code:
+                type: string
+                enum:
+                  - accuracy_below_threshold
+                  - recall_below_threshold
+                  - accuracy_and_recall_below_threshold
+              samples: { type: integer }
+              accuracy: { type: ["number", "null"] }
+              recall: { type: ["number", "null"] }
+              min_accuracy: { type: number }
+              min_recall: { type: number }
+              auto_drop_allowed: { type: boolean }
+              target_owner: { type: string, enum: [maintainer_session] }

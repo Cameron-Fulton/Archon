@@ -18,11 +18,15 @@ const LEAKS: readonly { readonly pattern: RegExp; readonly what: string }[] = [
 ];
 
 /**
- * The one exception: the maintained GitHub forge plugin's install id names the
- * repository that publishes it, which is the same for every project.
+ * Narrow exceptions:
+ * - The maintained GitHub forge plugin's install id names the repository that
+ *   publishes it, which is the same for every project.
+ * - The checker-eval scorer's fixed `CHECKER_IDS` allowlist names the five
+ *   factory checkers whose weekly accuracy is measured.
  */
 const ALLOWED: readonly { readonly file: string; readonly line: RegExp }[] = [
   { file: `${PACK_ROOT}/.shared/forge.ts`, line: /^export const GITHUB_FORGE_PLUGIN = / },
+  { file: `${PACK_ROOT}/checker-eval/scripts/score.ts`, line: /^export const CHECKER_IDS = \[/ },
 ];
 
 export interface Leak {

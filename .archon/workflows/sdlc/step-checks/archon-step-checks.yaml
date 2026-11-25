@@ -1,0 +1,115 @@
+name: archon-step-checks
+description: |
+  Deterministic step-by-step verification checks for factory tasks:
+  1) task description matches the original request,
+  2) plan covers every acceptance check with a verification method, and
+  3) newly added or modified tests fail on base before passing on head.
+
+  Use when: validating task artifacts before or after implementation.
+  NOT for: running full project test suites or code review lenses.
+
+worktree:
+  enabled: false
+mutates_checkout: false
+
+inputs:
+  request:
+    default: ""
+    description: Original user request or approved work order text.
+  task_description:
+    default: ""
+    description: Derived task description to verify against the request.
+  work_order:
+    default: ""
+    description: Approved work order containing acceptance checks.
+  plan:
+    default: ""
+    description: Markdown plan to verify against acceptance checks.
+  base_ref:
+    default: "HEAD~1"
+    description: Base git ref without the implementation change.
+  head_ref:
+    default: "HEAD"
+    description: Head git ref containing the implementation and tests.
+  test_cmd:
+    default: ""
+    description: Test command to execute against base (test diff only) and head.
+
+nodes:
+  - id: check-description
+    script: check-description
+    runtime: bun
+    mutates_checkout: false
+    with:
+      request: "$INPUTS.request"
+      task_description: "$INPUTS.task_description"
+    output_format:
+      type: object
+      additionalProperties: false
+      required:
+        - passed
+        - missing
+        - coverage
+        - total_requirements
+        - matched_requirements
+        - scope_drift
+      properties:
+        passed: { type: boolean }
+        missing:
+          type: array
+          items: { type: string }
+        coverage: { type: number }
+        total_requirements: { type: integer }
+        matched_requirements: { type: integer }
+        scope_drift:
+          type: array
+          items: { type: string }
+
+  - id: check-plan
+    script: check-plan
+    runtime: bun
+    mutates_checkout: false
+    with:
+      work_order: "$INPUTS.work_order"
+      plan: "$INPUTS.plan"
+    output_format:
+      type: object
+      additionalProperties: false
+      required:
+        - passed
+        - total_checks
+        - covered
+        - uncovered
+      properties:
+        passed: { type: boolean }
+        total_checks: { type: integer }
+        covered: { type: integer }
+        uncovered:
+          type: array
+          items: { type: string }
+
+  - id: check-red-before-green
+    script: check-red-before-green
+    runtime: bun
+    mutates_checkout: false
+    with:
+      base_ref: "$INPUTS.base_ref"
+      head_ref: "$INPUTS.head_ref"
+      test_cmd: "$INPUTS.test_cmd"
+    output_format:
+      type: object
+      additionalProperties: false
+      required:
+        - passed
+        - red_on_base
+        - green_on_head
+        - test_files
+        - reason
+      properties:
+        passed: { type: boolean }
+        red_on_base: { type: boolean }
+        green_on_head: { type: boolean }
+        test_files:
+          type: array
+          items: { type: string }
+        reason: { type: string }
