@@ -1,0 +1,26 @@
+name: archon-build-eval
+description: |
+  One build past-task eval sample: runs the shipped implement workflow in strict
+  work-order mode against a sealed, history-less replay sandbox. `scripts/bench.ts`
+  launches it once per sample and grades the resulting tree strictly by code; it is
+  not meant to be run by hand.
+
+  Needs a sealed git snapshot of the task's parent commit with no remotes and no
+  later history. Always enforces work_order_mode=true so builders read only the
+  pinned work order.
+
+  Use when: the build past-task bench runs a sample.
+  NOT for: ordinary feature delivery (deliver), reviewing a change (review).
+
+inputs:
+  work_order:
+    default: ""
+    description: >-
+      The pinned, approved task description for this replay sample.
+
+nodes:
+  - id: implement
+    include: archon-implement
+    with:
+      work: "$INPUTS.work_order"
+      work_order_mode: "true"
