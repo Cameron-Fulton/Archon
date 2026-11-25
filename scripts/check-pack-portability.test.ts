@@ -24,4 +24,11 @@ describe('pack portability check', () => {
     expect(findLeaks('.archon/workflows/sdlc/.shared/forge.ts', line)).toEqual([]);
     expect(findLeaks('.archon/workflows/sdlc/.shared/other.ts', line)).toHaveLength(1);
   });
+
+  test('allows only the checker-eval CHECKER_IDS allowlist line, in score.ts', () => {
+    const line =
+      "export const CHECKER_IDS = ['tests', 'coderabbit', 'chatgpt', 'claude', 'release-watch'] as const;";
+    expect(findLeaks('.archon/workflows/sdlc/checker-eval/scripts/score.ts', line)).toEqual([]);
+    expect(findLeaks('.archon/workflows/sdlc/checker-eval/scripts/other.ts', line)).toHaveLength(1);
+  });
 });
