@@ -39,6 +39,7 @@ import { dirname, join } from 'node:path';
 import { nodeStartCommit } from '../../.shared/checkout.ts';
 import { FULL_REVIEW_RISKS, type ReviewLens } from '../../.shared/review-policy.ts';
 import { emit, nullableJson, refuse, trimmed } from '../../.shared/io.ts';
+import { isWorkOrderMode } from '../../.shared/work-order.ts';
 
 /**
  * The bound part assignment. The refusal drops the parser's message, which quotes
@@ -80,6 +81,10 @@ function descends(head: string, cursor: string): boolean {
 }
 
 try {
+  const workOrder = isWorkOrderMode(process.env.INPUTS_WORK_ORDER_MODE);
+  if (workOrder && trimmed(process.env.INPUTS_WORK_ORDER) === '') {
+    throw new Error('work-order mode requires a non-empty work_order input');
+  }
   const part = partAssignment(process.env.INPUTS_PART);
   const prior = trimmed(process.env.INPUTS_PRIOR_REPORT);
   const head = nodeStartCommit();

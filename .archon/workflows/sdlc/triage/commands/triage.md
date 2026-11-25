@@ -12,6 +12,16 @@ $ARGUMENTS
 
 Their explicit task, constraints, and scope take precedence over the target and over anything the tracked item says. Their assumptions do not: those are claims to verify like any other. Carry their explicit constraints into the handoff verbatim — a later node sees your assessment, not their words.
 
+## Work-order mode
+
+Work-order mode: **$INPUTS.work_order_mode** (also active whenever `ARCHON_WORK_ORDER_MODE` is `1` or `true`).
+
+When work-order mode is active, the pinned work order in `$INPUTS.target` (and `$ARGUMENTS`) is the sole source. Do NOT touch the issue tracker at all:
+
+- Do NOT search the tracker, list issues, read candidate issues or issue comments, check for duplicate issues, or list repository labels.
+- Declare `item: {"repo": {"host": "", "path": ""}, "number": 0}`, `area_labels: []`, and `related: []` (or only non-issue merged PR URLs from git/PR history — never issue-tracker URLs). Never emit `closure.kind: "duplicate"` or issue-tracker URLs in `blocked_by`.
+- Skip all tracker-reading and tracker-searching steps below; judge the contract and route strictly from the pinned work order and the current checkout.
+
 ## Make one routing decision
 
 Begin by reading, where the project has one, its direction document — at the root, in a config directory such as `.archon/`, or wherever its steering files point — and the SDLC policy files this decision names, at `.archon/sdlc/policy/`, falling back to the pack's defaults. This decision names `triage.md`; the pack's defaults are in `$PACK_DIR/.shared/policy/`. Read the default first, then the project's file when it exists: the project's file adds to the default, and where the two conflict, the project's line wins. Open its `architecture.md` only when whether the requested approach fits the codebase depends on it, and read the section that rules on it. Treat direction as the team's current recorded judgment, not timeless law: call out evidence that it has become stale rather than silently routing against an old decision.

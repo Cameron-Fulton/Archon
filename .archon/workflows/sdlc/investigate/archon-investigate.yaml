@@ -18,6 +18,12 @@ inputs:
     description: >-
       What to investigate — an issue reference, a symptom, a failing command, or
       a question. When empty, the run's trigger message is the target.
+  work_order_mode:
+    default: "false"
+    description: >-
+      When true, investigate strictly from the pinned work order and code and
+      never read the issue tracker, issue comments, or review threads. Also
+      enabled by ARCHON_WORK_ORDER_MODE=1.
 
 # Only `rooted` owes delivery. `refuted` and `inconclusive` are valid completions
 # with an authored outcome of false — lifecycle status and work outcome are separate

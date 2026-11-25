@@ -25,6 +25,12 @@ inputs:
     description: >-
       Write the derived labels to the tracker item — true or false. Off by
       default; the run then records the labels it would apply.
+  work_order_mode:
+    default: "false"
+    description: >-
+      "true" runs in work-order mode: assess only the pinned work order and
+      never search or read the issue tracker, issue comments, or write tracker
+      labels. Also enabled by ARCHON_WORK_ORDER_MODE=1 or true.
 
 # The verdict node is what a composing caller resolves to: the same fields the
 # prompt declared, after the boundary has verified the tuple is legal.
@@ -232,6 +238,7 @@ nodes:
       summary: "$triage.output.summary"
       report: { from: "$triage.output.report" }
       publish: "$INPUTS.publish"
+      work_order_mode: "$INPUTS.work_order_mode"
     output_format:
       type: object
       properties:

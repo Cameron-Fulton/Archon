@@ -44,6 +44,7 @@ import {
 } from '../../.shared/forge.ts';
 import { artifactsDir, emit, note, nullableJson, refuse, text, trimmed } from '../../.shared/io.ts';
 import { pushHead } from '../../.shared/push.ts';
+import { assertNoIssueReferences, isWorkOrderMode } from '../../.shared/work-order.ts';
 
 type Repo = QualifiedPr['repo'];
 
@@ -115,9 +116,12 @@ async function withDescriptionSection(live: string, section: string): Promise<st
 }
 
 /** The prepared section's content, or undefined when prepare declared none. */
-async function preparedSection(artifacts: string): Promise<string | undefined> {
+async function preparedSection(artifacts: string, workOrder: boolean): Promise<string | undefined> {
   const pointer = record(nullableJson(process.env.INPUTS_DESCRIPTION));
   if (pointer === undefined) return undefined;
+  if (workOrder) {
+    throw new Error('work-order mode forbids editing the pull request description; PR text belongs to the loop');
+  }
   if (trimmed(process.env.INPUTS_PUBLISH_DESCRIPTION) !== 'true') {
     throw new Error('prepare declared a description section, but the caller did not allow publishing one');
   }
@@ -180,12 +184,18 @@ function recordPublishedPr(claimPath: string, pr: PrRecord, required: boolean): 
   }
 }
 
-function publish(hasDescription: boolean): PrRecord {
+function checkPrText(workOrder: boolean, surface: string, content: string): void {
+  if (workOrder) assertNoIssueReferences(surface, content);
+}
+
+function publish(hasDescription: boolean, workOrder: boolean): PrRecord {
   const source = forgeSource();
   const repo = JSON.parse(text(process.env.INPUTS_REPO)) as Repo;
   const headRepo = JSON.parse(text(process.env.INPUTS_HEAD_REPO)) as Repo;
   const existing = nullableJson(process.env.INPUTS_EXISTING) as number | null;
   const artifacts = artifactsDir();
+  const title = text(process.env.INPUTS_TITLE);
+  checkPrText(workOrder, 'pull request title', title);
 
   const named = nullableJson(process.env.INPUTS_PULL_REQUEST) as number | null;
   if (named !== null && existing !== named) {
@@ -241,7 +251,8 @@ function publish(hasDescription: boolean): PrRecord {
   }
   const bodyPath = join(artifacts, body.path);
   // A local read failure sent no create; it must not leave a claim blocking retry.
-  readFileSync(bodyPath, 'utf8');
+  const bodyText = readFileSync(bodyPath, 'utf8');
+  checkPrText(workOrder, 'pull request body', bodyText);
 
   // Killing the script cannot cancel a submitted forge write. Keep this claim even
   // after success: a retry may only reconcile it.
@@ -264,7 +275,7 @@ function publish(hasDescription: boolean): PrRecord {
         head,
         headRevision,
         base: text(process.env.INPUTS_BASE),
-        title: text(process.env.INPUTS_TITLE),
+        title,
         bodyPath,
         draft: trimmed(process.env.INPUTS_DRAFT) === 'true',
       },
@@ -284,8 +295,9 @@ function publish(hasDescription: boolean): PrRecord {
 
 // Validate the artifact before pushing; check composition against the live body before editing.
 async function publishWithDescription(): Promise<PrRecord> {
-  const section = await preparedSection(artifactsDir());
-  const pr = publish(section !== undefined);
+  const workOrder = isWorkOrderMode(process.env.INPUTS_WORK_ORDER_MODE);
+  const section = await preparedSection(artifactsDir(), workOrder);
+  const pr = publish(section !== undefined, workOrder);
   // The edit does not move the head, so the head-verified record stays the output.
   if (section !== undefined) await applyDescription(pr, section, forgeSource());
   return pr;

@@ -51,6 +51,7 @@ import { askFields, attentionWait, withOther } from '../../.shared/queue.ts';
 import { idleSummary, stuckItems } from '../../.shared/stuck.ts';
 import { readMaintainers } from '../../.shared/maintainers.ts';
 import { updateClaimed, type WorkItem } from '../../.shared/workitem.ts';
+import { isWorkOrderMode } from '../../.shared/work-order.ts';
 
 /**
  * The asked item with the queue's `other`, whose effect is what the item can take: a
@@ -212,10 +213,15 @@ function settle(decision: Decision, after: PrFacts): Outcome {
  * Read one pull request back. One that cannot be read waits for the next sweep, whose
  * facts settle it, a merge the gate made included: only the forge says it merged.
  */
-function readBack(decision: Decision, item: Item, maintainers: ReadonlySet<string>): Outcome {
+function readBack(
+  decision: Decision,
+  item: Item,
+  maintainers: ReadonlySet<string>,
+  workOrder: boolean
+): Outcome {
   let after: PrFacts;
   try {
-    after = readPr(item.pr, maintainers);
+    after = readPr(item.pr, maintainers, { workOrder });
   } catch (error) {
     return { status: 'waiting', reason: `${item.url} could not be read back: ${message(error)}`, head: decision.head, contradiction: null };
   }
@@ -288,6 +294,7 @@ function recordBaseFailure(writes: Writes, settled: readonly MergeSettled[], bas
 }
 
 function main(): void {
+  const workOrder = isWorkOrderMode(process.env.INPUTS_WORK_ORDER_MODE);
   const path = MERGE_PATHS.find(candidate => candidate === trimmed(process.env.INPUTS_PATH));
   if (path === undefined) throw new Error(`path must be one of ${MERGE_PATHS.join(', ')}`);
   const items = (nullableJson(process.env.INPUTS_ITEMS) ?? []) as Item[];
@@ -341,7 +348,10 @@ function main(): void {
   recordSettled(writes, settled);
   const maintainers = items.length > 0 ? readMaintainers(items[0]?.pr.repo as QualifiedPr['repo']) : new Set<string>();
 
-  const outcomes = decisions.map(decision => ({ decision, ...readBack(decision, itemOf(decision.number), maintainers) }));
+  const outcomes = decisions.map(decision => ({
+    decision,
+    ...readBack(decision, itemOf(decision.number), maintainers, workOrder),
+  }));
   const contradictions = [...refused, ...outcomes.flatMap(outcome => (outcome.contradiction === null ? [] : [outcome.contradiction]))];
   const silentRed = unraisedRedBase(sweep, base);
   if (silentRed !== null) contradictions.push(silentRed);

@@ -22,6 +22,7 @@ import { viewIssue } from '../../.shared/issue.ts';
 import { launchDetached } from '../../.shared/launch.ts';
 import { writeLabels } from '../../.shared/labels.ts';
 import type { MergeSettled } from '../../.shared/merge.ts';
+import { isWorkOrderMode } from '../../.shared/work-order.ts';
 
 interface Item {
   readonly item: QualifiedPr | null;
@@ -43,6 +44,13 @@ function retriage(issue: QualifiedPr, actor: string): string | null {
 }
 
 function main(): void {
+  if (isWorkOrderMode(process.env.INPUTS_WORK_ORDER_MODE)) {
+    emit({
+      retriaged: [],
+      summary: 'work-order mode: merge-queue resolves no issue and triggers no issue re-triage.',
+    });
+    return;
+  }
   const actor = trimmed(process.env.INPUTS_RETRIAGE_AS);
   if (actor === '') {
     emit({ retriaged: [], summary: 'retriage_as is empty; no merged issue is re-triaged.' });

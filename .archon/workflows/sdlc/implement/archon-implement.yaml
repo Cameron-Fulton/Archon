@@ -18,6 +18,12 @@ inputs:
       What to implement — a plan path, review findings, a CI failure, a plain
       description, or the repair of an existing pull request when this run was
       launched on its branch. When empty, the run's trigger message is the work.
+  work_order_mode:
+    default: "false"
+    description: >-
+      When true, implement strictly from the pinned work order and never read
+      the issue tracker, issue comments, or review threads. Also enabled by
+      ARCHON_WORK_ORDER_MODE=1.
 
 returns: implement
 outcome_field: green

@@ -255,26 +255,37 @@ function graphql(host: string, query: string, fields: Record<string, string | nu
   return repository;
 }
 
-/** The forge operations the merge queue reads and merges through on the `forge` source. */
-export const MERGE_QUEUE_FORGE_OPERATIONS = [
+/** The forge operations the merge queue reads and merges through in work-order mode (no thread reads). */
+export const MERGE_QUEUE_WORK_ORDER_FORGE_OPERATIONS = [
   'pr.view',
   'pr.merge',
-  'pr.threads',
   'checks.state',
   'checks.commit',
   'pr.merge-state',
   'workitem.comments',
 ] as const;
 
+/** The forge operations the merge queue reads and merges through on the `forge` source. */
+export const MERGE_QUEUE_FORGE_OPERATIONS = [
+  ...MERGE_QUEUE_WORK_ORDER_FORGE_OPERATIONS,
+  'pr.threads',
+] as const;
+
 /**
  * On `forge`, refuse a plugin that lacks a merge-queue operation before anything is
  * claimed: every pull request it could not read would otherwise wait, then park.
  */
-export function requireMergeSource(repo: QualifiedPr['repo']): void {
+export function requireMergeSource(
+  repo: QualifiedPr['repo'],
+  options: { readonly workOrder?: boolean } = {}
+): void {
   if (forgeSource() !== 'forge') return;
   const capabilities = invokeForge('metadata', { host: repo.host })?.capabilities;
   if (!Array.isArray(capabilities)) throw new Error('forge metadata returned no operation capabilities');
-  const missing = MERGE_QUEUE_FORGE_OPERATIONS.filter(op => !capabilities.includes(op));
+  const required = options.workOrder
+    ? MERGE_QUEUE_WORK_ORDER_FORGE_OPERATIONS
+    : MERGE_QUEUE_FORGE_OPERATIONS;
+  const missing = required.filter(op => !capabilities.includes(op));
   if (missing.length > 0) {
     throw new Error(`the forge plugin for ${repo.host} lacks the merge queue's ${missing.join(', ')}. ${REMEDY.unsupported_op}`);
   }
@@ -383,6 +394,15 @@ const PR_QUERY = `query($owner: String!, $name: String!, $number: Int!) { reposi
   }
 } }`;
 
+const PR_QUERY_WORK_ORDER = `query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) {
+  defaultBranchRef { name }
+  pullRequest(number: $number) {
+    url title state isDraft baseRefName headRefName headRefOid mergeable
+    mergeCommit { oid }
+    commits(last: 1) { nodes { commit { oid ${ROLLUP} } } }
+  }
+} }`;
+
 const BEHIND_QUERY = `query($owner: String!, $name: String!, $head: String!) { repository(owner: $owner, name: $name) {
   defaultBranchRef { target { oid } compare(headRef: $head) { behindBy } }
 } }`;
@@ -403,13 +423,34 @@ function readBehind(repo: QualifiedPr['repo'], head: string): { default_head: st
 }
 
 /** One snapshot of everything the gate and the sweep read about a pull request. */
-export function readPr(pr: QualifiedPr, maintainers: ReadonlySet<string>): PrFacts {
-  return forgeSource() === 'forge' ? readForgePr(pr, maintainers) : readGhPr(pr, maintainers);
+export function readPr(
+  pr: QualifiedPr,
+  maintainers: ReadonlySet<string>,
+  options: { readonly workOrder?: boolean } = {}
+): PrFacts {
+  const workOrder = options.workOrder === true;
+  return forgeSource() === 'forge'
+    ? readForgePr(pr, maintainers, workOrder)
+    : readGhPr(pr, maintainers, workOrder);
 }
 
-function readGhPr(pr: QualifiedPr, maintainers: ReadonlySet<string>): PrFacts {
+function readGhThreads(row: Record<string, unknown>, workOrder: boolean): PrFacts['threads'] {
+  if (workOrder) return { unresolved: 0, urls: [] };
+  const threads = record(row.reviewThreads);
+  const threadNodes = Array.isArray(threads?.nodes) ? threads.nodes.map(node => record(node)) : [];
+  if (typeof threads?.totalCount === 'number' && threads.totalCount > threadNodes.length) {
+    throw new Error(`${String(row.url)} has ${String(threads.totalCount)} review threads; the gate reads at most 100`);
+  }
+  const unresolved = threadNodes.filter(thread => thread?.isResolved !== true);
+  return {
+    unresolved: unresolved.length,
+    urls: unresolved.map(thread => String(record((record(thread?.comments)?.nodes as unknown[] | undefined)?.[0])?.url ?? '')),
+  };
+}
+
+function readGhPr(pr: QualifiedPr, maintainers: ReadonlySet<string>, workOrder: boolean): PrFacts {
   const [owner, name] = pr.repo.path.split('/');
-  const repository = graphql(pr.repo.host, PR_QUERY, { owner: owner ?? '', name: name ?? '', number: pr.number });
+  const repository = graphql(pr.repo.host, workOrder ? PR_QUERY_WORK_ORDER : PR_QUERY, { owner: owner ?? '', name: name ?? '', number: pr.number });
   const row = record(repository.pullRequest);
   const defaultBranch = record(repository.defaultBranchRef)?.name;
   if (row === undefined || typeof row.headRefOid !== 'string' || typeof defaultBranch !== 'string') {
@@ -417,12 +458,6 @@ function readGhPr(pr: QualifiedPr, maintainers: ReadonlySet<string>): PrFacts {
   }
   const commit = record(record((record(row.commits)?.nodes as unknown[] | undefined)?.[0])?.commit);
   if (commit?.oid !== row.headRefOid) throw new Error(`the checks read for ${String(row.url)} are not on its head`);
-  const threads = record(row.reviewThreads);
-  const threadNodes = Array.isArray(threads?.nodes) ? threads.nodes.map(node => record(node)) : [];
-  if (typeof threads?.totalCount === 'number' && threads.totalCount > threadNodes.length) {
-    throw new Error(`${String(row.url)} has ${String(threads.totalCount)} review threads; the gate reads at most 100`);
-  }
-  const unresolved = threadNodes.filter(thread => thread?.isResolved !== true);
   const verdict = trustedReview(ghIssueComments(pr), maintainers);
   const { default_head, behind } = readBehind(pr.repo, row.headRefOid);
   const state = String(row.state).toLowerCase();
@@ -441,10 +476,7 @@ function readGhPr(pr: QualifiedPr, maintainers: ReadonlySet<string>): PrFacts {
     merge_commit: typeof record(row.mergeCommit)?.oid === 'string' ? String(record(row.mergeCommit)?.oid) : null,
     mergeable: row.mergeable === 'MERGEABLE' ? 'clean' : row.mergeable === 'CONFLICTING' ? 'conflict' : 'unknown',
     checks: checksOf(commit.statusCheckRollup),
-    threads: {
-      unresolved: unresolved.length,
-      urls: unresolved.map(thread => String(record((record(thread?.comments)?.nodes as unknown[] | undefined)?.[0])?.url ?? '')),
-    },
+    threads: readGhThreads(row, workOrder),
     verdict,
   };
 }
@@ -530,7 +562,7 @@ function readForgeComments(ref: QualifiedPr): Comment[] {
 }
 
 /** The same snapshot through the forge contract: each read that names a commit must name the head. */
-function readForgePr(pr: QualifiedPr, maintainers: ReadonlySet<string>): PrFacts {
+function readForgePr(pr: QualifiedPr, maintainers: ReadonlySet<string>, workOrder: boolean): PrFacts {
   const ref = { repo: pr.repo, number: pr.number };
   const view = viewPr(ref, 'forge');
   const { url, head_revision: head } = view.pr;
@@ -549,7 +581,7 @@ function readForgePr(pr: QualifiedPr, maintainers: ReadonlySet<string>): PrFacts
     head_revision: head,
     ...mergeState,
     checks: checksOfUnits(checks.units),
-    threads: readForgeThreads(ref),
+    threads: workOrder ? { unresolved: 0, urls: [] } : readForgeThreads(ref),
     verdict: trustedReview(readForgeComments(ref), maintainers),
   };
 }

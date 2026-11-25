@@ -51,6 +51,12 @@ inputs:
       forwarded unchanged to delivery. When an open pull request already has that
       head, the push updates it instead of opening another. Empty opens it from the
       checkout's branch.
+  work_order_mode:
+    default: "false"
+    description: >-
+      When true, the pipeline runs strictly from the pinned work order and never
+      reads or writes the issue tracker, review threads, or loop-owned PR
+      descriptions. Also enabled by ARCHON_WORK_ORDER_MODE=1.
 
 returns: result
 outcome_field: delivered
@@ -77,6 +83,7 @@ nodes:
             publish: "$INPUTS.publish"
             pull_request: "$INPUTS.pull_request"
             branch: "$INPUTS.branch"
+            work_order_mode: "$INPUTS.work_order_mode"
             target: |-
               $INPUTS.target
               $LOOP_PREV.attend__settle.output.brief

@@ -28,6 +28,7 @@ import {
   readPr,
 } from '../../.shared/merge.ts';
 import { readMaintainers } from '../../.shared/maintainers.ts';
+import { isWorkOrderMode } from '../../.shared/work-order.ts';
 
 function flag(args: readonly string[], name: string): string {
   const index = args.indexOf(name);
@@ -43,9 +44,10 @@ function main(): void {
   const url = flag(args, '--pr');
   const head = flag(args, '--head');
   const merge = args.includes('--merge');
+  const workOrder = isWorkOrderMode(args.includes('--work-order-mode') ? 'true' : undefined);
   const pr = prFromUrl(url);
   const maintainers = readMaintainers(pr.repo);
-  const refusals = gateRefusals(readPr(pr, maintainers), head, readBase(pr.repo));
+  const refusals = gateRefusals(readPr(pr, maintainers, { workOrder }), head, readBase(pr.repo));
   if (!merge || refusals.length > 0) {
     emit({ pr: url, head, refusals, merge_commit: null });
     if (merge) process.exitCode = 1;
@@ -54,7 +56,7 @@ function main(): void {
   mergeAtHead(pr, head, method);
   let after: PrFacts;
   try {
-    after = readPr(pr, maintainers);
+    after = readPr(pr, maintainers, { workOrder });
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     throw new Error(`merged ${url} at ${head}, so declare it merged, but the read-back failed: ${reason}`);

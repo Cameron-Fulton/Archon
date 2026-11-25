@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { discoverPlugins } from './discovery';
 import { dispatchForge } from './dispatch';
 import { repoRefSchema, type RepoRef } from './identity';
+import type { ForgeRequest } from './operations';
 
 const fixture = join(import.meta.dir, 'fixtures', 'test-plugin.ts');
 
@@ -303,3 +304,109 @@ test.each([
     });
   }
 );
+
+describe('ARCHON_WORK_ORDER_MODE dispatch guard', () => {
+  const repo = { host: 'github.com', path: 'owner/repo' };
+  const ref = { repo, number: 7 };
+  const failingPluginConfig = {
+    plugins: [{ plugin: 'never-spawned', command: '/definitely/missing' }],
+    scanPath: false,
+  };
+
+  const blockedRequests: [string, ForgeRequest][] = [
+    ['workitem.view', { operationId: 'wo-1', op: 'workitem.view', ref }],
+    ['workitem.list', { operationId: 'wo-2', op: 'workitem.list', repo, label: 'archon-triage' }],
+    [
+      'workitem.create',
+      {
+        operationId: 'wo-3',
+        op: 'workitem.create',
+        repo,
+        title: 'T',
+        body: '<!-- m -->\nB',
+        marker: '<!-- m -->',
+      },
+    ],
+    ['workitem.close', { operationId: 'wo-4', op: 'workitem.close', ref, reason: 'completed' }],
+    ['workitem.edit-body', { operationId: 'wo-5', op: 'workitem.edit-body', ref, body: 'B' }],
+    ['workitem.labels.set', { operationId: 'wo-6', op: 'workitem.labels.set', ref, labels: [] }],
+    [
+      'workitem.comments (issue)',
+      { operationId: 'wo-7', op: 'workitem.comments', subject: { kind: 'issue', ref } },
+    ],
+    [
+      'workitem.comment.upsert (issue)',
+      {
+        operationId: 'wo-8',
+        op: 'workitem.comment.upsert',
+        subject: { kind: 'issue', ref },
+        marker: '<!-- m -->',
+        body: '<!-- m -->\nhi',
+      },
+    ],
+    [
+      'workitem.label.add (issue)',
+      { operationId: 'wo-9', op: 'workitem.label.add', subject: { kind: 'issue', ref }, name: 'x' },
+    ],
+    [
+      'workitem.label.remove (issue)',
+      {
+        operationId: 'wo-10',
+        op: 'workitem.label.remove',
+        subject: { kind: 'issue', ref },
+        name: 'x',
+      },
+    ],
+  ];
+
+  test.each(blockedRequests)(
+    'refuses %s before spawning any plugin when ARCHON_WORK_ORDER_MODE=1',
+    async (_label, request) => {
+      const result = await dispatchForge(request, {
+        config: failingPluginConfig,
+        env: { ARCHON_WORK_ORDER_MODE: '1' },
+      });
+      expect(result.plugin).toBeNull();
+      expect(result.response).toMatchObject({
+        operationId: request.operationId,
+        ok: false,
+        error: { kind: 'authorization' },
+      });
+      if (!result.response.ok) {
+        expect(result.response.error.message).toContain(
+          'work-order mode forbids issue tracker operation'
+        );
+      }
+    }
+  );
+
+  test('still dispatches pull request operations when ARCHON_WORK_ORDER_MODE=1', async () => {
+    const discovery = await discoverPlugins({
+      config: {
+        plugins: [
+          {
+            plugin: 'mutator',
+            command: process.execPath,
+            args: [join(import.meta.dir, 'fixtures', 'mutation-plugin.ts')],
+          },
+        ],
+        hosts: { 'forge.example': { plugin: 'mutator', token_env: 'BARE_TOKEN' } },
+        scanPath: false,
+      },
+      env: {},
+    });
+    const prRepo = { host: 'forge.example', path: 'team/repo' };
+    const result = await dispatchForge(
+      {
+        operationId: 'wo-pr-comments',
+        op: 'workitem.comments',
+        subject: { kind: 'pr', ref: { repo: prRepo, number: 1 } },
+      },
+      { discovery, env: { ARCHON_WORK_ORDER_MODE: '1', BARE_TOKEN: 'fixture' } }
+    );
+    // Must pass the work-order guard and reach plugin dispatch rather than failing with authorization.
+    if (!result.response.ok) {
+      expect(result.response.error.kind).not.toBe('authorization');
+    }
+  });
+});

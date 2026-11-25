@@ -16,6 +16,8 @@ Prose is a claim; the code is the fact. An issue body, a comment, a linked discu
 
 ## Ground the target
 
+Work-order mode: **$INPUTS.work_order_mode** (also active whenever `ARCHON_WORK_ORDER_MODE` is `1` or `true`). When work-order mode is active, work ONLY from the pinned work order in `$INPUTS.target` (and `$ARGUMENTS`), this run's artifacts, and the repository checkout: do NOT read the issue tracker, issue comments, or pull request review threads.
+
 Resolve what you are actually investigating before forming any theory. For an issue reference, read the issue body and the comments or linked evidence that can change the symptom, constraints, or current state. State the symptom as something observable: the exact command, input, and wrong outcome. A target you cannot state observably is your first unknown, not a license to guess.
 
 ## Prior analysis is claims, not facts

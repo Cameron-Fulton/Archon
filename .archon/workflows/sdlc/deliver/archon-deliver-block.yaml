@@ -51,6 +51,12 @@ inputs:
   errors:
     default: "auto"
     description: Silent-failure lens — auto, true, or false.
+  work_order_mode:
+    default: "false"
+    description: >-
+      When true, delivery runs strictly from the pinned work order and never
+      reads or writes the issue tracker, review threads, or loop-owned PR
+      descriptions. Also enabled by ARCHON_WORK_ORDER_MODE=1.
 
 # A composed caller reads the report: ready with the pull request's URL, or not
 # ready with the reason the rounds ended. Not ready is a valid completion, like
@@ -66,6 +72,8 @@ nodes:
   - id: forge
     script: forge-check
     runtime: bun
+    with:
+      work_order_mode: "$INPUTS.work_order_mode"
     output_format:
       type: object
       properties:
@@ -93,6 +101,7 @@ nodes:
         - id: implement
           include: archon-implement
           with:
+            work_order_mode: "$INPUTS.work_order_mode"
             work: >-
               Deliver the accepted work order below. On the first round, build it.
 
@@ -155,6 +164,7 @@ nodes:
             pull_request: "$INPUTS.pull_request"
             branch: "$INPUTS.branch"
             publish_description: "true"
+            work_order_mode: "$INPUTS.work_order_mode"
 
         - id: review
           include: archon-review-block
@@ -174,6 +184,7 @@ nodes:
             work_order: "$INPUTS.work"
             part: "$INPUTS.part"
             errors: "$INPUTS.errors"
+            work_order_mode: "$INPUTS.work_order_mode"
 
         # After a review passes, before CI. Once per run: a later round finds the
         # earlier shape.md and declares no findings (see simplify.md).
@@ -183,12 +194,14 @@ nodes:
           when: "$review.output.ready == true"
           with:
             work_order: "$INPUTS.work"
+            work_order_mode: "$INPUTS.work_order_mode"
 
         - id: reshape
           include: archon-implement
           depends_on: [simplify]
           when: "$simplify.output.findings == true"
           with:
+            work_order_mode: "$INPUTS.work_order_mode"
             work: >-
               Judge the smaller shapes recorded in $ARTIFACTS_DIR/shape.md against
               the accepted work order below. Adopt every finding whose smaller
@@ -217,6 +230,7 @@ nodes:
             work_order: "$INPUTS.work"
             part: "$INPUTS.part"
             errors: "$INPUTS.errors"
+            work_order_mode: "$INPUTS.work_order_mode"
 
         # Review threads are work too, whoever opened them. This round's implementer
         # judged the threads the previous round read; this agent checks each
@@ -228,9 +242,10 @@ nodes:
           mutates_checkout: false
           depends_on: [pr, review, rereview]
           trigger_rule: none_failed_min_one_success
-          when: "$LOOP_PREV.threads.output.open > 0"
+          when: "$LOOP_PREV.threads.output.open > 0 && $LOOP_PREV.round.output.work_order_mode == false"
           with:
             pr: "$pr.output"
+            work_order_mode: "$INPUTS.work_order_mode"
           output_format:
             type: object
             properties:
@@ -281,6 +296,7 @@ nodes:
           with:
             pr: "$pr.output"
             answers: { from: "$settle-threads.output.answers", if_skipped: null }
+            work_order_mode: "$INPUTS.work_order_mode"
           output_format:
             type: object
             properties:
@@ -318,6 +334,7 @@ nodes:
             threads_summary: { from: "$threads.output.summary", if_skipped: null }
             settle_ask: { from: "$settle-threads.output.ask", if_skipped: null }
             settle_summary: { from: "$settle-threads.output.summary", if_skipped: null }
+            work_order_mode: "$INPUTS.work_order_mode"
           output_format:
             type: object
             properties:
@@ -333,8 +350,10 @@ nodes:
               light_review: { type: boolean }
               # The latest review's `contract_left`; null until a review judged coverage.
               contract_left: { type: [array, 'null'], items: { type: string } }
+              # True when work-order mode is active via input or ARCHON_WORK_ORDER_MODE.
+              work_order_mode: { type: boolean }
               summary: { type: string }
-            required: [round, done, ready, reason, pr_url, prior_report, light_review, contract_left, summary]
+            required: [round, done, ready, reason, pr_url, prior_report, light_review, contract_left, work_order_mode, summary]
 
   # Corrections and the base merge can falsify claims the description made when the
   # draft opened, and an implementer can pass red the description must disclose. One
@@ -347,11 +366,12 @@ nodes:
     command: update-pr-body
     model: medium
     depends_on: [rounds]
-    when: "$rounds.output.pr_url != ''"
+    when: "$rounds.output.pr_url != '' && $rounds.output.work_order_mode == false"
     with:
       pr: "$rounds.output.pr_url"
       contract_left: "$rounds.output.contract_left"
       source: "$forge.output.source"
+      work_order_mode: "$INPUTS.work_order_mode"
     output_format:
       type: object
       properties:

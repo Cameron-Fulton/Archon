@@ -1,0 +1,53 @@
+# Outcome: delivered in work-order mode. One round runs through review, simplify,
+# CI, threads, and round; because work_order_mode is true, both settle-threads
+# and update-pr-body stay skipped (omitting their stubs proves the workflow never
+# reaches them). round and outcome run for real.
+forge: { source: forge }
+implement__implement:
+  done: true
+  green: true
+  red_cause: ""
+  summary: "stub: implemented from pinned work order; focused checks pass"
+pr__forge: { source: forge }
+pr__prepare: { repo: { host: "github.com", path: "example/repo" }, head_repo: { host: "github.com", path: "example/repo" }, head: "fixture-branch", base: "dev", existing: null, title: "stub: title", body: { type: archon_artifact, run_id: "fixture-run", path: "pr-body.md" }, description: null, summary: "stub: target recorded" }
+pr__publish: { schemaVersion: 1, repo: { host: "github.com", path: "example/repo" }, number: 1, url: "https://github.com/example/repo/pull/1", head: "fixture-branch", base: "dev", is_draft: true, state: "open", head_repo: { host: "github.com", path: "example/repo" }, head_revision: "fixturehead", base_revision: "fixturebase", maintainer_can_modify: null }
+review__mode: '{"continuation":false,"light":false,"head":"fixturehead","cursor":"","risks":"fixture-owned-policy","seams":false,"code":false,"tests":false,"errors":false,"docs":false,"part":null}'
+review__route: { seams: true, code: true, tests: true, errors: false, docs: false, reason: "stub: pinned work order change" }
+review__scope:
+  head_matches: true
+  pr: { repo: { host: "github.com", path: "example/repo" }, number: 1 }
+  report: { type: archon_artifact, run_id: "fixture-run", path: "review/scope.md" }
+review__seams: "0 findings"
+review__code: "0 findings"
+review__tests: "0 findings"
+review__prune-scratch: "prune-scratch: removed 0 scratch worktree(s)"
+review__synthesize:
+  ready: true
+  action: none
+  findings_summary: "stub: none"
+  report: { type: archon_artifact, run_id: "fixture-run", path: "review/report.md" }
+  discoveries: []
+  contract_left: []
+review__publish:
+  ready: true
+  action: none
+  findings_summary: "stub: none"
+  report: { type: archon_artifact, run_id: "fixture-run", path: "review/report.md" }
+  discoveries: []
+  contract_left: []
+simplify__simplify: { findings: false }
+simplify__prune-scratch: "prune-scratch: removed 0 scratch worktree(s)"
+threads: { open: 0, summary: "stub: work-order mode skips review threads" }
+ci: { state: green, rerun: none, summary: "stub: every check passed; marked ready" }
+fixture:
+  inputs:
+    work_order_mode: "true"
+    work: "Pinned work order: add health endpoint."
+  expect: completed
+  reached: [pr__publish, review__synthesize, ci, threads, round, outcome]
+  resolved-text-contains:
+    implement__implement: "Work-order mode: **true**"
+    pr__prepare: "Work-order mode: **true**"
+    review__scope: "**Work-order mode**: **true**"
+    simplify__simplify: "Work-order mode: **true**"
+exec-code: true

@@ -46,6 +46,12 @@ inputs:
       forwarded unchanged to delivery. When an open pull request already has that
       head, the push updates it instead of opening another. Empty opens it from the
       checkout's branch.
+  work_order_mode:
+    default: "false"
+    description: >-
+      When true, the pipeline runs strictly from the pinned work order and never
+      reads or writes the issue tracker, review threads, or loop-owned PR
+      descriptions. Also enabled by ARCHON_WORK_ORDER_MODE=1.
 
 # `delivered:false` is a valid completion: an honest "no work is owed" is a
 # successful run that shipped nothing, and lifecycle status and work outcome are
@@ -59,6 +65,8 @@ nodes:
   - id: forge
     script: forge-check
     runtime: bun
+    with:
+      work_order_mode: "$INPUTS.work_order_mode"
     output_format:
       type: object
       properties:
@@ -73,10 +81,12 @@ nodes:
     with:
       target: "$INPUTS.target"
       publish: "$INPUTS.publish"
+      work_order_mode: "$INPUTS.work_order_mode"
 
   - id: inv
     include: archon-investigate
     with:
+      work_order_mode: "$INPUTS.work_order_mode"
       target: >-
         Investigate the unresolved causal question recorded in
         $ARTIFACTS_DIR/triage.md. Read that assessment first; its confirmed facts
@@ -107,6 +117,7 @@ nodes:
         $ARTIFACTS_DIR/intel.md too: what usage data says about this work, or
         why there is none.
       related: "$triage.output.related"
+      work_order_mode: "$INPUTS.work_order_mode"
     depends_on: [triage, intel]
     when: "$triage.output.route == 'plan'"
 
@@ -141,6 +152,7 @@ nodes:
         request.
       pull_request: "$continues.output.pull_request"
       branch: "$INPUTS.branch"
+      work_order_mode: "$INPUTS.work_order_mode"
     # One join into delivery: the direct or continue route, a rooted investigation,
     # or a ready plan. A negative judgment skips delivery; a failed producer fails
     # the run.

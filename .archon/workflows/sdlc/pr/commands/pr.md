@@ -6,6 +6,11 @@ Draft mode: **$INPUTS.draft** — `true` opens as a draft; anything else, ready 
 
 Description section: **$INPUTS.publish_description** — `true` lets this run publish content it prepared for the pull request's description; anything else, it prepares none.
 
+Work-order mode: **$INPUTS.work_order_mode** (also active whenever `ARCHON_WORK_ORDER_MODE` is `1` or `true`). When active:
+- Never read the issue tracker, issue comments, or review threads.
+- Link NO issue anywhere in the PR title or body: omit `Closes #N`, `Fixes #N`, `Resolves #N`, `Refs #N`, bare `#N` references, `GH-N`, and issue URLs — even when a PR template includes a `Closes #` placeholder (delete that placeholder). The publishing script refuses any title or body containing an issue reference.
+- Do NOT write `$ARTIFACTS_DIR/pr-description.md` and always declare `description: null`; PR description edits belong exclusively to the calling loop.
+
 Context from the run that may narrow this (often empty):
 
 $ARGUMENTS

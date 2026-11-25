@@ -18,6 +18,8 @@ through the source this run selected, `$INPUTS.source`:
   operation is the answer: report it, and never repeat it through `gh`.
 - **`gh`:** the GitHub CLI, every command naming `--repo <host>/<owner>/<repo>`.
 
+Work-order mode: **$INPUTS.work_order_mode** (also active whenever `ARCHON_WORK_ORDER_MODE` is `1` or `true`). When work-order mode is active, PR text belongs exclusively to the calling loop and no issue is linked: do NOT read any issue or edit the pull request body. Immediately declare `changed: false` and a one-sentence summary stating that work-order mode skipped updating the PR description.
+
 1. Read the live description and base (`pr.view`, or
    `gh pr view <number> --repo <host>/<owner>/<repo> --json body,baseRefName`):
    a person may have edited it since, and their edits stay. Then read the full

@@ -25,6 +25,12 @@ inputs:
     description: >-
       Write the derived labels to the tracker item — true or false. Off by
       default; the run then records the labels it would apply.
+  work_order_mode:
+    default: "false"
+    description: >-
+      "true" runs in work-order mode: assess only the pinned work order and
+      never search or read the issue tracker, issue comments, or write tracker
+      labels. Also enabled by ARCHON_WORK_ORDER_MODE=1 or true.
 
 returns: result
 outcome_field: ready
@@ -52,6 +58,7 @@ nodes:
           depends_on: [go]
           with:
             publish: "$INPUTS.publish"
+            work_order_mode: "$INPUTS.work_order_mode"
             target: |-
               $INPUTS.target
               $LOOP_PREV.attend__settle.output.brief

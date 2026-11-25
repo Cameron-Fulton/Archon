@@ -15,6 +15,7 @@ import {
   type QualifiedPr,
 } from './forge.ts';
 import { remoteRepos } from './remote.ts';
+import { isWorkOrderMode } from './work-order.ts';
 
 export function forgeAccessRead(repo: QualifiedPr['repo']) {
   return {
@@ -23,7 +24,8 @@ export function forgeAccessRead(repo: QualifiedPr['repo']) {
   } as const;
 }
 
-export const REQUIRED_FORGE_OPERATIONS = [
+/** Operations required in work-order mode: pull requests, review comments and checks only (no issues or threads). */
+export const WORK_ORDER_FORGE_OPERATIONS = [
   'pr.view',
   'pr.create',
   'pr.edit-body',
@@ -32,6 +34,10 @@ export const REQUIRED_FORGE_OPERATIONS = [
   'comment.upsert',
   'checks.state',
   'checks.rerun',
+] as const;
+
+export const REQUIRED_FORGE_OPERATIONS = [
+  ...WORK_ORDER_FORGE_OPERATIONS,
   'workitem.view',
   'repo.labels.list',
   'repo.label.ensure',
@@ -77,20 +83,23 @@ const probeForge: ForgeProbe = async (op, data) => {
 
 export async function checkForgeAccess(
   env: NodeJS.ProcessEnv = process.env,
-  probe: ForgeProbe = probeForge
+  probe: ForgeProbe = probeForge,
+  workOrderInput?: string
 ): Promise<{ readonly source: ForgeSource; readonly detail: string }> {
+  const workOrder = isWorkOrderMode(workOrderInput, env);
   const source = forgeSource(env);
-  const detail = source === 'gh' ? await checkGh(env) : await checkForge(probe);
+  const detail = source === 'gh' ? await checkGh(env) : await checkForge(probe, workOrder);
   return { source, detail };
 }
 
 const GH_REMEDY = 'run `gh auth login --hostname <host>`, or set GH_TOKEN or GITHUB_TOKEN';
 
-function requirePackOperations(metadata: Record<string, unknown> | null): void {
+function requirePackOperations(metadata: Record<string, unknown> | null, workOrder: boolean): void {
   const capabilities = metadata?.capabilities;
   if (!Array.isArray(capabilities) || !capabilities.every(op => typeof op === 'string'))
     throw new Error('forge metadata returned no operation capabilities');
-  const missing = REQUIRED_FORGE_OPERATIONS.filter(op => !capabilities.includes(op));
+  const required = workOrder ? WORK_ORDER_FORGE_OPERATIONS : REQUIRED_FORGE_OPERATIONS;
+  const missing = required.filter(op => !capabilities.includes(op));
   if (missing.length)
     throw new Error(
       `ARCHON_SDLC_FORGE=forge needs a plugin with every delivery operation; missing: ${missing.join(', ')}. ` +
@@ -179,7 +188,7 @@ async function checkGh(env: NodeJS.ProcessEnv): Promise<string> {
  * plugin, the token and read access. No forge operation reports what the token may
  * write, so write access is first proven by the run's first write.
  */
-async function checkForge(probe: ForgeProbe): Promise<string> {
+async function checkForge(probe: ForgeProbe, workOrder: boolean): Promise<string> {
   const repos = remoteRepos();
   if (repos.length === 0) {
     throw new Error('this checkout has no git remote that names a forge repository');
@@ -189,7 +198,7 @@ async function checkForge(probe: ForgeProbe): Promise<string> {
   for (const repo of repos) {
     const name = `${repo.host}/${repo.path}`;
     try {
-      requirePackOperations((await probe('metadata', { host: repo.host })).value);
+      requirePackOperations((await probe('metadata', { host: repo.host })).value, workOrder);
       const read = forgeAccessRead(repo);
       const { credentialSource } = await probe(read.op, read.data);
       answered.push(name + (credentialSource ? ` (source: ${credentialSource})` : ''));

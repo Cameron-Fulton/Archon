@@ -36,6 +36,7 @@ import {
 import { readMaintainerList } from '../../.shared/maintainers.ts';
 import { enrollOwnPrs, isOwnPr } from '../../.shared/own-prs.ts';
 import { claimNext, updateClaimed, type Pickup, type WorkItem } from '../../.shared/workitem.ts';
+import { isWorkOrderMode } from '../../.shared/work-order.ts';
 
 interface Item {
   /** The issue whose work item the queue claimed. */
@@ -78,14 +79,17 @@ function claimAll(limit: number, runId: string, pickup: Pickup): WorkItem[] {
 
 type Snapshot = { readonly ok: true; readonly facts: PrFacts } | { readonly ok: false; readonly error: unknown };
 
-function snapshotReader(maintainers: ReadonlySet<string>): (pr: QualifiedPr) => PrFacts {
+function snapshotReader(
+  maintainers: ReadonlySet<string>,
+  workOrder: boolean
+): (pr: QualifiedPr) => PrFacts {
   const snapshots = new Map<string, Snapshot>();
   return pr => {
     const key = JSON.stringify([pr.repo.host, pr.repo.path, pr.number]);
     let result = snapshots.get(key);
     if (result === undefined) {
       try {
-        result = { ok: true, facts: readPr(pr, maintainers) };
+        result = { ok: true, facts: readPr(pr, maintainers, { workOrder }) };
       } catch (error) {
         result = { ok: false, error };
       }
@@ -178,6 +182,7 @@ function emitFacts(repo: QualifiedPr['repo'], items: readonly Item[], settled: r
 }
 
 function main(): void {
+  const workOrder = isWorkOrderMode(process.env.INPUTS_WORK_ORDER_MODE);
   const limit = positive('limit', trimmed(process.env.INPUTS_LIMIT));
   const method = parseMethod(trimmed(process.env.INPUTS_MERGE_METHOD));
   const repo = { host: trimmed(process.env.INPUTS_REPO_HOST), path: trimmed(process.env.INPUTS_REPO_PATH) };
@@ -185,11 +190,11 @@ function main(): void {
   const runId = text(process.env.WORKFLOW_ID);
   if (runId === '') throw new Error('WORKFLOW_ID is not set; the engine supplies it to every exec node');
 
-  requireMergeSource(repo);
+  requireMergeSource(repo, { workOrder });
   const list = readMaintainerList(repo);
   const maintainers = list.logins;
   enrollOrNote(repo, list.ownPrs);
-  const snapshot = snapshotReader(maintainers);
+  const snapshot = snapshotReader(maintainers, workOrder);
   const pickup = recoveryPickup(snapshot);
   const items: Item[] = [];
   const settled: MergeSettled[] = [];
@@ -227,6 +232,7 @@ function main(): void {
     join(import.meta.dir, 'gate.ts'),
     '--method',
     method,
+    ...(workOrder ? ['--work-order-mode'] : []),
   ]
     .map(quoted)
     .join(' ');

@@ -178,7 +178,59 @@ export async function dispatchForge(
   };
 }
 
+const WORK_ORDER_TRUTHY = new Set(['1', 'true']);
+const WORK_ORDER_FALSY = new Set(['', '0', 'false']);
+
+function workOrderModeFlag(env: NodeJS.ProcessEnv | undefined): boolean {
+  const raw = (env?.ARCHON_WORK_ORDER_MODE ?? '').trim().toLowerCase();
+  if (WORK_ORDER_FALSY.has(raw)) return false;
+  if (WORK_ORDER_TRUTHY.has(raw)) return true;
+  throw new Error(
+    `ARCHON_WORK_ORDER_MODE must be "true", "false", "1", or "0", not "${(env?.ARCHON_WORK_ORDER_MODE ?? '').trim()}"`
+  );
+}
+
+/** Issue-tracker operations forbidden in work-order mode (PR-targeted subjects remain allowed). */
+export function isIssueTrackerOperation(request: ForgeRequest): boolean {
+  switch (request.op) {
+    case 'workitem.view':
+    case 'workitem.list':
+    case 'workitem.create':
+    case 'workitem.close':
+    case 'workitem.edit-body':
+    case 'workitem.labels.set':
+      return true;
+    case 'workitem.comments':
+    case 'workitem.comment.upsert':
+    case 'workitem.label.add':
+    case 'workitem.label.remove':
+      return request.subject.kind === 'issue';
+    default:
+      return false;
+  }
+}
+
+function workOrderRefusal(request: ForgeRequest, options: DispatchOptions): ForgeError | undefined {
+  let active: boolean;
+  try {
+    active =
+      workOrderModeFlag(options.env ?? process.env) || workOrderModeFlag(options.credentialEnv);
+  } catch (error) {
+    return {
+      kind: 'invalid_request',
+      message: error instanceof Error ? error.message : String(error),
+    };
+  }
+  if (!active || !isIssueTrackerOperation(request)) return undefined;
+  return {
+    kind: 'authorization',
+    message: `work-order mode forbids issue tracker operation ${request.op}`,
+  };
+}
+
 async function dispatch(request: ForgeRequest, options: DispatchOptions): Promise<Dispatched> {
+  const workOrderError = workOrderRefusal(request, options);
+  if (workOrderError) return { response: errorResponse(request, workOrderError), plugin: null };
   const host =
     request.op === 'resolve'
       ? remoteHost(request.remote)

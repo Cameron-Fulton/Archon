@@ -44,6 +44,7 @@ import {
 } from '../../.shared/forge.ts';
 import { emit, note, refuse, text } from '../../.shared/io.ts';
 import { REVIEW_MARKER, reviewCommentBody } from '../../.shared/review-comment.ts';
+import { isWorkOrderMode } from '../../.shared/work-order.ts';
 
 /** The pull request delivery recorded, when the scope is that JSON record. */
 function recordedPr(scope: string): QualifiedPr | undefined {
@@ -72,6 +73,7 @@ function label(pr: QualifiedPr | undefined): string {
 }
 
 try {
+  isWorkOrderMode(process.env.INPUTS_WORK_ORDER_MODE);
   const source = forgeSource();
   const verdict = {
     ready: JSON.parse(text(process.env.INPUTS_READY)) as boolean,

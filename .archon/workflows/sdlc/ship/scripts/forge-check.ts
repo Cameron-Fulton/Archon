@@ -4,7 +4,11 @@ import { checkForgeAccess } from '../../.shared/forge-check.ts';
 import { emit, note, refuse } from '../../.shared/io.ts';
 
 try {
-  const { source, detail } = await checkForgeAccess();
+  const { source, detail } = await checkForgeAccess(
+    process.env,
+    undefined,
+    process.env.INPUTS_WORK_ORDER_MODE
+  );
   note(detail);
   emit({ source });
 } catch (error) {

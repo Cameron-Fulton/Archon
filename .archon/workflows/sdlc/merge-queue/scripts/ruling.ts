@@ -29,6 +29,7 @@ import { appendSection } from '../../.shared/issue.ts';
 import { answeredMergeDecision, type MergeAsked, type MergeAttention, type MergeDecisionEntry, type MergeStatus, withMerge } from '../../.shared/merge.ts';
 import { type Choice, PRE_VALUE_ANSWER, rulingHeading } from '../../.shared/queue.ts';
 import { updateClaimed } from '../../.shared/workitem.ts';
+import { isWorkOrderMode } from '../../.shared/work-order.ts';
 
 const STATUS = { merge: 'waiting', return: 'returned', park: 'parked' } as const satisfies Record<
   MergeAttention['choices'][number]['effect'],
@@ -36,13 +37,23 @@ const STATUS = { merge: 'waiting', return: 'returned', park: 'parked' } as const
 >;
 
 /** Act on the answer now; on failure the released item waits for the next queue run. */
-function continueNow(effect: string, item: QualifiedPr, runId: string, selections: MergeQueueSelections): string {
+function continueNow(
+  effect: string,
+  item: QualifiedPr,
+  runId: string,
+  selections: MergeQueueSelections,
+  workOrder: boolean
+): string {
   if (effect !== 'merge' && effect !== 'return') return '';
   const repo = { repo_host: item.repo.host, repo_path: item.repo.path };
   try {
     const next =
       effect === 'merge'
-        ? launchDetached('archon-merge-queue', { ...selections, ...repo }, { configFromRun: runId })
+        ? launchDetached(
+            'archon-merge-queue',
+            { ...selections, ...repo, ...(workOrder ? { work_order_mode: 'true' } : {}) },
+            { configFromRun: runId }
+          )
         : // The build queue declares none of the merge queue's selections, so a returned
           // round runs on the build queue's defaults.
           launchDetached('archon-build-queue', { ...repo, number: String(item.number) }, { configFromRun: runId });
@@ -58,16 +69,22 @@ function continueNow(effect: string, item: QualifiedPr, runId: string, selection
  * An enrolled own pull request is its own work item and has no issue body to write, so
  * its ruling stays on the work item's decision entry, which keeps the answer's text.
  */
-function writeRuling(asked: Extract<MergeAsked, { by: 'pr' }>, ruling: string, at: string): string {
+function writeRuling(
+  asked: Extract<MergeAsked, { by: 'pr' }>,
+  ruling: string,
+  at: string,
+  workOrder: boolean
+): string {
   // Issues and pull requests share one numbering, so an item numbered as its pull request is that pull request.
   const ownPr = asked.item.number === asked.pr.number && asked.item.repo.path === asked.pr.repo.path && asked.item.repo.host === asked.pr.repo.host;
-  if (ruling === '' || ownPr) return '';
+  if (ruling === '' || ownPr || workOrder) return '';
   const heading = rulingHeading(at, `the merge queue's question on PR ${String(asked.pr.number)}`);
   appendSection(asked.item, heading, ruling);
   return heading;
 }
 
 function main(): void {
+  const workOrder = isWorkOrderMode(process.env.INPUTS_WORK_ORDER_MODE);
   const asked = nullableJson(process.env.INPUTS_ASKED) as MergeAsked | null;
   if (asked === null) throw new Error('the answer arrived with nothing asked');
   const answered = nullableJson(process.env.INPUTS_CHOICE) as Choice<string> | null;
@@ -94,7 +111,7 @@ function main(): void {
   const ruling = [choice.ruling.trim(), words === '' ? '' : `The maintainer's words: ${words}`]
     .filter(part => part !== '')
     .join('\n\n');
-  const heading = writeRuling(asked, ruling, at);
+  const heading = writeRuling(asked, ruling, at, workOrder);
 
   const entry: MergeDecisionEntry = {
     at,
@@ -123,7 +140,7 @@ function main(): void {
   emit({
     decision: choice.effect,
     section: heading,
-    summary: `PR ${String(asked.pr.number)}: the maintainer chose ${choice.id} (${choice.effect})${continueNow(choice.effect, asked.item, runId, selections)}.`,
+    summary: `PR ${String(asked.pr.number)}: the maintainer chose ${choice.id} (${choice.effect})${continueNow(choice.effect, asked.item, runId, selections, workOrder)}.`,
   });
 }
 

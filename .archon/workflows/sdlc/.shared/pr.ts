@@ -29,6 +29,7 @@ import {
   type PrRecord,
   type QualifiedPr,
 } from './forge.ts';
+import { assertIssueTrackerAllowed } from './work-order.ts';
 
 export const PR_CREATE_UNRESOLVED = 'pr_create_unresolved';
 /** The reason a tail's report gives when a node failure ended the run. */
@@ -458,6 +459,7 @@ export function upsertComment(
   body: string,
   source: ForgeSource
 ): { readonly url: string } {
+  if (subject.kind === 'issue') assertIssueTrackerAllowed('issue comment write');
   const ref = { repo: subject.ref.repo, number: subject.ref.number };
   if (source === 'forge') {
     // A pull request keeps the original operation, so a plugin that predates

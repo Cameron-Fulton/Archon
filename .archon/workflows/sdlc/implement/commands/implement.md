@@ -24,6 +24,8 @@ Whichever carries it, the work may be:
 
 ## Reading the sources
 
+Work-order mode: **$INPUTS.work_order_mode** (also active whenever `ARCHON_WORK_ORDER_MODE` is `1` or `true`). When work-order mode is active, work ONLY from the pinned work order in `$INPUTS.work` (and `$ARGUMENTS`), this run's artifacts, and the repository checkout. Do NOT read the issue tracker, issue comments, or pull request review threads, and do NOT write issue references or PR description sections.
+
 Prose is a claim; the code is the fact. An issue body, a comment, a linked discussion, a prior report — each is somebody's belief at some past moment. Often correct, sometimes stale, never authoritative about what the code does today. Read them for intent and history, then verify anything load-bearing against the current source before acting on it. When they disagree, the code decides and you record the conflict.
 
 Weigh by source and recency. The operator's request in this run is the most current statement of intent. A tracked item's body and its comments are older, may predate the code in front of you, and vary in how much their author verified before writing. Read them; do not inherit them. A confident claim is still a claim.

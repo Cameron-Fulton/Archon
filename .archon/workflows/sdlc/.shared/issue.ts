@@ -19,6 +19,7 @@ import {
   samePr,
   type QualifiedPr,
 } from './forge.ts';
+import { assertIssueTrackerAllowed } from './work-order.ts';
 
 export interface IssueView {
   readonly title: string;
@@ -42,6 +43,7 @@ export class NotAnIssueError extends Error {
 }
 
 export function viewIssue(item: QualifiedPr): IssueView {
+  assertIssueTrackerAllowed('issue read');
   return forgeSource() === 'forge' ? forgeView(item) : ghView(item);
 }
 
@@ -155,6 +157,7 @@ export function createIssue(
   body: string,
   marker: string
 ): CreatedIssue {
+  assertIssueTrackerAllowed('issue create');
   if (firstLine(body) !== marker) throw new Error('the issue body must begin with its marker');
   if (forgeSource() === 'forge') {
     const value = invokeForge('workitem.create', { repo, title, body, marker });
@@ -254,6 +257,7 @@ export type CloseReason = (typeof CLOSE_REASONS)[number];
  * forge contract does.
  */
 export function closeIssue(item: QualifiedPr, reason: CloseReason): void {
+  assertIssueTrackerAllowed('issue close');
   if (forgeSource() === 'forge') {
     const value = invokeForge('workitem.close', { ref: item, reason });
     if (record(value?.workitem)?.state !== 'closed' || value?.reason !== reason)
@@ -299,6 +303,7 @@ export function closeIssue(item: QualifiedPr, reason: CloseReason): void {
  * here and the write is lost, and the read-back cannot tell.
  */
 export function appendSection(item: QualifiedPr, heading: string, text: string): void {
+  assertIssueTrackerAllowed('issue body edit');
   const section = `## ${heading}\n\n${text.trim()}\n`;
   if (forgeSource() === 'forge') {
     const body = forgeView(item).body;

@@ -34,6 +34,12 @@ inputs:
       description, as a marked section of it, on any pull request it opens or
       continues; anything else leaves a continued pull request's description as its
       author left it.
+  work_order_mode:
+    default: "false"
+    description: >-
+      "true" runs in work-order mode: link no issue in the pull request title
+      or body, and never edit the pull request description. Also enabled by
+      ARCHON_WORK_ORDER_MODE=1 or true.
 
 returns: publish
 
@@ -43,6 +49,8 @@ nodes:
   - id: forge
     script: forge-check
     runtime: bun
+    with:
+      work_order_mode: "$INPUTS.work_order_mode"
     output_format:
       type: object
       properties:
@@ -114,6 +122,7 @@ nodes:
       draft: "$INPUTS.draft"
       pull_request: "$INPUTS.pull_request"
       branch: "$INPUTS.branch"
+      work_order_mode: "$INPUTS.work_order_mode"
     output_type: pull-request
     output_format:
       type: object
