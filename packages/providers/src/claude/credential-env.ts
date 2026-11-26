@@ -76,7 +76,6 @@ export function buildClaudeSubprocessEnv(options: SendQueryOptions | undefined):
         delete env[key];
     }
     bindCredential(env, OAUTH_TOKEN, grantToken);
-    env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB = '1';
   } else if (delivered) {
     bindCredential(env, delivered, options?.env?.[delivered]);
   } else if (env.CLAUDE_API_KEY && !env.ANTHROPIC_API_KEY && !env[OAUTH_TOKEN]) {
