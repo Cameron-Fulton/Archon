@@ -4,7 +4,7 @@ import { expect, mock, test } from 'bun:test';
 import { PassThrough } from 'node:stream';
 import * as childProcess from 'node:child_process';
 import type { AccountInfo, Options } from '@anthropic-ai/claude-agent-sdk';
-import { ClaudeProvider } from './claude/provider';
+import { buildRequestSubprocessEnv, ClaudeProvider } from './claude/provider';
 import { CopilotProvider } from './community/copilot/provider';
 import { OpencodeProvider } from './community/opencode/provider';
 
@@ -70,6 +70,66 @@ test('Claude runtime failure is inconclusive, never usable', async () => {
     evidence: 'runtime unavailable: [REDACTED]',
   });
 });
+
+test('the Factory grant binds Claude preflight and execution to one subscription', async () => {
+  const overrides = {
+    ARCHON_WORK_ORDER_MODE: '1',
+    ARCHON_CLAUDE_ACCOUNTS: 'granted',
+    ARCHON_CLAUDE_ACCOUNT_GRANTED_TOKEN: 'fixture-granted-token',
+    ARCHON_CLAUDE_ACCOUNT_OTHER_TOKEN: 'fixture-other-token',
+    ANTHROPIC_BASE_URL: '',
+  };
+  const previous = Object.entries(overrides).map(([key]) => [key, process.env[key]] as const);
+  Object.assign(process.env, overrides);
+  try {
+    const credentialRequest = {
+      ...request(),
+      env: {
+        ANTHROPIC_API_KEY: 'fixture-paid-key',
+        CLAUDE_CODE_OAUTH_TOKEN: 'fixture-ungranted-token',
+        CLAUDE_CODE_USE_BEDROCK: '1',
+      },
+    };
+    account = { tokenSource: 'CLAUDE_CODE_OAUTH_TOKEN', apiProvider: 'firstParty' };
+    expect(await new ClaudeProvider().checkCredential(credentialRequest)).toEqual({
+      state: 'usable',
+      source: 'native',
+    });
+    const preflight = query.mock.calls.at(-1)?.[0].options;
+    const execution = buildRequestSubprocessEnv(credentialRequest);
+    expect(preflight?.settings).toEqual({ apiKeyHelper: '' });
+    for (const env of [preflight?.env, execution]) {
+      expect(env?.CLAUDE_CODE_OAUTH_TOKEN === 'fixture-granted-token').toBe(true);
+      expect(env?.ANTHROPIC_API_KEY === undefined).toBe(true);
+      expect(env?.CLAUDE_CODE_USE_BEDROCK).toBe('0');
+      expect(Object.keys(env ?? {}).some(key => key.startsWith('ARCHON_CLAUDE_ACCOUNT'))).toBe(
+        false
+      );
+    }
+
+    expect(() =>
+      buildRequestSubprocessEnv({ env: { ANTHROPIC_BASE_URL: 'https://example.invalid' } })
+    ).toThrow('Conflicting Claude grant credential or endpoint');
+    process.env.ARCHON_CLAUDE_ACCOUNTS = 'granted,other';
+    expect(() => buildRequestSubprocessEnv(credentialRequest)).toThrow(
+      'Expected one host Claude grant account'
+    );
+    process.env.ARCHON_CLAUDE_ACCOUNTS = 'missing';
+    expect(() => buildRequestSubprocessEnv(credentialRequest)).toThrow(
+      'Claude grant account credential is missing'
+    );
+    delete process.env.ARCHON_WORK_ORDER_MODE;
+    expect(buildRequestSubprocessEnv(credentialRequest).CLAUDE_CODE_OAUTH_TOKEN).toBe(
+      'fixture-ungranted-token'
+    );
+  } finally {
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
 for (const Provider of [CopilotProvider, OpencodeProvider]) {
   test(`${Provider.name} native login is not checked without starting a runtime`, async () => {
     expect(await new Provider().checkCredential()).toEqual({

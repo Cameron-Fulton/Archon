@@ -103,6 +103,9 @@ export async function checkClaudeNativeAuth(
       })(),
       options: {
         env: requestEnv,
+        ...(requestEnv.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST === '1'
+          ? { settings: { apiKeyHelper: '' } }
+          : {}),
         pathToClaudeCodeExecutable:
           request.execContext?.kind === 'container'
             ? 'claude'

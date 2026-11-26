@@ -11,9 +11,8 @@
  * - Credentials reach the subprocess via process.env (already cleaned by
  *   stripCwdEnv) PLUS any per-request `requestOptions.env` (per-user delivered
  *   keys/subscriptions), merged LAST so it wins. `buildProviderSubprocessEnv` does NOT
- *   filter tokens — the Claude wrapper logs which posture process.env shows (explicit
- *   token present vs not); the historical env-token allowlist was removed in
- *   #1067, so the log can read "global" while a per-request token authenticates.
+ *   filter tokens. Explicit per-request credentials and Factory work-order grants
+ *   own the Claude subprocess credential.
  * - CLAUDE_USE_GLOBAL_AUTH is an Archon-only boot sentinel (set for solo
  *   installs with no creds — see server/src/boot/claude-auth-posture.ts). The
  *   Claude CLI itself ignores it; it neither gates nor filters env here.
@@ -81,16 +80,48 @@ function deliveredClaudeCredential(options: SendQueryOptions | undefined): strin
 export function buildRequestSubprocessEnv(
   requestOptions: SendQueryOptions | undefined
 ): NodeJS.ProcessEnv {
+  const env = buildProviderSubprocessEnv(requestOptions);
+  let delivered = deliveredClaudeCredential(requestOptions);
+  let credential = delivered && requestOptions?.env?.[delivered];
+  const grantedAccounts =
+    process.env.ARCHON_WORK_ORDER_MODE === '1' ? process.env.ARCHON_CLAUDE_ACCOUNTS : undefined;
+  if (grantedAccounts !== undefined) {
+    // The Factory launcher has already narrowed the pool to the one Squeeze lease.
+    // Resolve it from the host environment so both SDK calls use that same login.
+    const account = grantedAccounts.trim();
+    if (!/^[a-z0-9_]+$/i.test(account) || requestOptions?.execContext?.kind === 'container') {
+      throw new ClassifiedProviderError('misconfigured', 'Expected one host Claude grant account');
+    }
+    if (delivered || env.ANTHROPIC_BASE_URL?.trim()) {
+      throw new ClassifiedProviderError(
+        'misconfigured',
+        'Conflicting Claude grant credential or endpoint'
+      );
+    }
+    credential = process.env[`ARCHON_CLAUDE_ACCOUNT_${account.toUpperCase()}_TOKEN`]?.trim();
+    if (!credential) {
+      throw new ClassifiedProviderError(
+        'misconfigured',
+        'Claude grant account credential is missing'
+      );
+    }
+    for (const key of Object.keys(env)) {
+      if (key === 'ARCHON_CLAUDE_ACCOUNTS' || key.startsWith('ARCHON_CLAUDE_ACCOUNT_')) {
+        delete env[key];
+      }
+    }
+    delivered = 'CLAUDE_CODE_OAUTH_TOKEN';
+  }
   if (requestOptions?.execContext?.kind !== 'container') {
     const authMode =
-      process.env.CLAUDE_CODE_OAUTH_TOKEN || process.env.CLAUDE_API_KEY ? 'explicit' : 'global';
+      delivered || process.env.CLAUDE_CODE_OAUTH_TOKEN || process.env.CLAUDE_API_KEY
+        ? 'explicit'
+        : 'global';
     getLog().info(
       { authMode },
       authMode === 'global' ? 'using_global_auth' : 'using_explicit_tokens'
     );
   }
-  const env = buildProviderSubprocessEnv(requestOptions);
-  const delivered = deliveredClaudeCredential(requestOptions);
   if (delivered) {
     for (const key of [
       'ANTHROPIC_API_KEY',
@@ -102,8 +133,7 @@ export function buildRequestSubprocessEnv(
       'CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR',
     ])
       delete env[key];
-    env[delivered === 'CLAUDE_API_KEY' ? 'ANTHROPIC_API_KEY' : delivered] =
-      requestOptions?.env?.[delivered];
+    env[delivered === 'CLAUDE_API_KEY' ? 'ANTHROPIC_API_KEY' : delivered] = credential;
     for (const key of [
       'CLAUDE_CODE_USE_BEDROCK',
       'CLAUDE_CODE_USE_VERTEX',
@@ -506,7 +536,7 @@ async function* buildQueryOptions(
     }
   }
 
-  if (deliveredClaudeCredential(requestOptions)) {
+  if (env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST === '1') {
     options.settings = {
       ...(typeof options.settings === 'object' ? options.settings : {}),
       apiKeyHelper: '',
