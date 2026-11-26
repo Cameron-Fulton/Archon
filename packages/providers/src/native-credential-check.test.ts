@@ -106,6 +106,16 @@ test('the Factory grant binds Claude preflight and execution to one subscription
         false
       );
     }
+    process.env.ARCHON_WORK_ORDER_MODE = ' TRUE ';
+    expect(
+      buildRequestSubprocessEnv(credentialRequest).CLAUDE_CODE_OAUTH_TOKEN ===
+        'fixture-granted-token'
+    ).toBe(true);
+    process.env.ARCHON_WORK_ORDER_MODE = 'yes';
+    expect(() => buildRequestSubprocessEnv(credentialRequest)).toThrow(
+      'Invalid host work-order mode'
+    );
+    process.env.ARCHON_WORK_ORDER_MODE = 'true';
 
     expect(() =>
       buildRequestSubprocessEnv({ env: { ANTHROPIC_BASE_URL: 'https://example.invalid' } })
@@ -129,7 +139,7 @@ test('the Factory grant binds Claude preflight and execution to one subscription
     expect(() => buildRequestSubprocessEnv(credentialRequest)).toThrow(
       'Claude grant account credential is missing'
     );
-    delete process.env.ARCHON_WORK_ORDER_MODE;
+    process.env.ARCHON_WORK_ORDER_MODE = 'false';
     expect(buildRequestSubprocessEnv(credentialRequest).CLAUDE_CODE_OAUTH_TOKEN).toBe(
       'fixture-ungranted-token'
     );

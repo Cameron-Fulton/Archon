@@ -17,8 +17,13 @@ function factoryGrantToken(
   delivered: string | undefined
 ): string | undefined {
   // Squeeze and the Factory launcher have already narrowed the pool to one login.
+  const workOrderMode = (process.env.ARCHON_WORK_ORDER_MODE ?? '').trim().toLowerCase();
+  if (['', '0', 'false'].includes(workOrderMode)) return;
+  if (!['1', 'true'].includes(workOrderMode)) {
+    throw new ClassifiedProviderError('misconfigured', 'Invalid host work-order mode');
+  }
   const grantedAccounts = process.env.ARCHON_CLAUDE_ACCOUNTS;
-  if (process.env.ARCHON_WORK_ORDER_MODE !== '1' || grantedAccounts === undefined) return;
+  if (grantedAccounts === undefined) return;
   const account = grantedAccounts.trim();
   if (!/^[a-z0-9_]+$/i.test(account) || options?.execContext?.kind === 'container') {
     throw new ClassifiedProviderError('misconfigured', 'Expected one host Claude grant account');
