@@ -10,6 +10,7 @@ import type { IAgentProvider } from '../types';
 import { resolveClaudeBinaryPath } from './binary-resolver';
 import { parseClaudeConfig, resolveSettingSources } from './config';
 import { buildContainerSpawn, buildDockerExecPrefix } from './container-spawn';
+import { managedClaudeSettings } from './credential-env';
 
 const nativeHelperSettingsSchema = z.object({
   response: z.object({
@@ -103,9 +104,7 @@ export async function checkClaudeNativeAuth(
       })(),
       options: {
         env: requestEnv,
-        ...(requestEnv.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST === '1'
-          ? { settings: { apiKeyHelper: '' } }
-          : {}),
+        settings: managedClaudeSettings(requestEnv),
         pathToClaudeCodeExecutable:
           request.execContext?.kind === 'container'
             ? 'claude'

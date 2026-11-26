@@ -27,7 +27,6 @@
  *   the SDK switched to native binaries in the 0.2.x series. See
  *   `shouldPassNoEnvFile` for the implications on the `--no-env-file` flag.
  */
-import { buildProviderSubprocessEnv } from '@archon/provider-contract';
 import type { CredentialStatus, ProviderDiagnostics } from '@archon/provider-contract';
 import {
   query,
@@ -48,6 +47,7 @@ import { parseClaudeConfig, resolveSettingSources } from './config';
 import { CLAUDE_CAPABILITIES } from './capabilities';
 import { buildContainerSpawn } from './container-spawn';
 import { checkClaudeNativeAuth } from './native-auth';
+import { buildClaudeSubprocessEnv, managedClaudeSettings } from './credential-env';
 import { resolveClaudeBinaryPath, resolveClaudeBinaryWithSource } from './binary-resolver';
 import { ClassifiedProviderError } from '../shared/failure';
 import { buildArchonMcpServer, ARCHON_TOOL_SERVER } from './native-tools';
@@ -71,50 +71,15 @@ function getLog(): ReturnType<typeof createLogger> {
   return cachedLog;
 }
 
-function deliveredClaudeCredential(options: SendQueryOptions | undefined): string | undefined {
-  return ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'CLAUDE_API_KEY'].find(
-    key => options?.userCredentialEnvKeys?.includes(key) && options.env?.[key]
-  );
-}
-
 export function buildRequestSubprocessEnv(
   requestOptions: SendQueryOptions | undefined
 ): NodeJS.ProcessEnv {
-  const env = buildProviderSubprocessEnv(requestOptions);
-  let delivered = deliveredClaudeCredential(requestOptions);
-  let credential = delivered && requestOptions?.env?.[delivered];
-  const grantedAccounts =
-    process.env.ARCHON_WORK_ORDER_MODE === '1' ? process.env.ARCHON_CLAUDE_ACCOUNTS : undefined;
-  if (grantedAccounts !== undefined) {
-    // The Factory launcher has already narrowed the pool to the one Squeeze lease.
-    // Resolve it from the host environment so both SDK calls use that same login.
-    const account = grantedAccounts.trim();
-    if (!/^[a-z0-9_]+$/i.test(account) || requestOptions?.execContext?.kind === 'container') {
-      throw new ClassifiedProviderError('misconfigured', 'Expected one host Claude grant account');
-    }
-    if (delivered || env.ANTHROPIC_BASE_URL?.trim()) {
-      throw new ClassifiedProviderError(
-        'misconfigured',
-        'Conflicting Claude grant credential or endpoint'
-      );
-    }
-    credential = process.env[`ARCHON_CLAUDE_ACCOUNT_${account.toUpperCase()}_TOKEN`]?.trim();
-    if (!credential) {
-      throw new ClassifiedProviderError(
-        'misconfigured',
-        'Claude grant account credential is missing'
-      );
-    }
-    for (const key of Object.keys(env)) {
-      if (key === 'ARCHON_CLAUDE_ACCOUNTS' || key.startsWith('ARCHON_CLAUDE_ACCOUNT_')) {
-        delete env[key];
-      }
-    }
-    delivered = 'CLAUDE_CODE_OAUTH_TOKEN';
-  }
+  const env = buildClaudeSubprocessEnv(requestOptions);
   if (requestOptions?.execContext?.kind !== 'container') {
     const authMode =
-      delivered || process.env.CLAUDE_CODE_OAUTH_TOKEN || process.env.CLAUDE_API_KEY
+      managedClaudeSettings(env) ||
+      process.env.CLAUDE_CODE_OAUTH_TOKEN ||
+      process.env.CLAUDE_API_KEY
         ? 'explicit'
         : 'global';
     getLog().info(
@@ -122,38 +87,7 @@ export function buildRequestSubprocessEnv(
       authMode === 'global' ? 'using_global_auth' : 'using_explicit_tokens'
     );
   }
-  if (delivered) {
-    for (const key of [
-      'ANTHROPIC_API_KEY',
-      'CLAUDE_API_KEY',
-      'CLAUDE_CODE_OAUTH_TOKEN',
-      'ANTHROPIC_AUTH_TOKEN',
-      'ANTHROPIC_CUSTOM_HEADERS',
-      'CLAUDE_CODE_API_KEY_HELPER_FD',
-      'CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR',
-    ])
-      delete env[key];
-    env[delivered === 'CLAUDE_API_KEY' ? 'ANTHROPIC_API_KEY' : delivered] = credential;
-    for (const key of [
-      'CLAUDE_CODE_USE_BEDROCK',
-      'CLAUDE_CODE_USE_VERTEX',
-      'CLAUDE_CODE_USE_FOUNDRY',
-      'CLAUDE_CODE_USE_MANTLE',
-      'CLAUDE_CODE_USE_ANTHROPIC_AWS',
-      'CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD',
-    ]) {
-      env[key] = '0';
-    }
-    // Native settings env otherwise overwrites the delivered identity.
-    env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1';
-  } else if (env.CLAUDE_API_KEY && !env.ANTHROPIC_API_KEY && !env.CLAUDE_CODE_OAUTH_TOKEN) {
-    env.ANTHROPIC_API_KEY = env.CLAUDE_API_KEY;
-    getLog().debug('claude.api_key_mirrored');
-  }
-  // Without this, Claude Code reports some refusals to start (an invalid proxy URL, for
-  // one) only on stderr and exits 1, which reads as a crashed process and is retried.
-  // With it, every refusal with a known cause also ends in an error result carrying
-  // `startup_failure_reason`, which classifyClaudeErrorResult turns into a failure class.
+  // Ask Claude Code to report recognized startup refusals as structured results.
   env.CLAUDE_CODE_STARTUP_FAILURE_RESULTS = '1';
   return env;
 }
@@ -536,10 +470,11 @@ async function* buildQueryOptions(
     }
   }
 
-  if (env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST === '1') {
+  const managedSettings = managedClaudeSettings(env);
+  if (managedSettings) {
     options.settings = {
       ...(typeof options.settings === 'object' ? options.settings : {}),
-      apiKeyHelper: '',
+      ...managedSettings,
     };
   }
   options.systemPrompt = withPerRequestSystemPrompt(options.systemPrompt);

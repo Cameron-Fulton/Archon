@@ -102,6 +102,7 @@ test('the Factory grant binds Claude preflight and execution to one subscription
       expect(env?.CLAUDE_CODE_OAUTH_TOKEN === 'fixture-granted-token').toBe(true);
       expect(env?.ANTHROPIC_API_KEY === undefined).toBe(true);
       expect(env?.CLAUDE_CODE_USE_BEDROCK).toBe('0');
+      expect(env?.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB).toBe('1');
       expect(Object.keys(env ?? {}).some(key => key.startsWith('ARCHON_CLAUDE_ACCOUNT'))).toBe(
         false
       );
@@ -110,6 +111,17 @@ test('the Factory grant binds Claude preflight and execution to one subscription
     expect(() =>
       buildRequestSubprocessEnv({ env: { ANTHROPIC_BASE_URL: 'https://example.invalid' } })
     ).toThrow('Conflicting Claude grant credential or endpoint');
+    expect(() =>
+      buildRequestSubprocessEnv({
+        env: { ANTHROPIC_API_KEY: 'fixture-paid-key' },
+        userCredentialEnvKeys: ['ANTHROPIC_API_KEY'],
+      })
+    ).toThrow('Conflicting Claude grant credential or endpoint');
+    expect(() =>
+      buildRequestSubprocessEnv({
+        execContext: { kind: 'container', containerId: 'runner', execUser: 'worker' },
+      })
+    ).toThrow('Expected one host Claude grant account');
     process.env.ARCHON_CLAUDE_ACCOUNTS = 'granted,other';
     expect(() => buildRequestSubprocessEnv(credentialRequest)).toThrow(
       'Expected one host Claude grant account'
