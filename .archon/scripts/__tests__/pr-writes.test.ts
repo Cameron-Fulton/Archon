@@ -714,6 +714,9 @@ describe('publish-review keeps one canonical comment per pull request', () => {
       contract_left: ['acceptance: the console shows it'],
     });
     expect(first.gh.some(call => call.includes('--method POST'))).toBe(true);
+    expect(first.comments[0]?.body).toBe(
+      `${MARKER}\nReviewed commit: \`${REVIEWED}\`\nVerdict: ready\nContract: open\n\n${REPORT}`
+    );
 
     const second = publishReview({
       inputs: report,
@@ -744,6 +747,27 @@ describe('publish-review keeps one canonical comment per pull request', () => {
     expect(result.code).not.toBe(0);
     expect(result.stdout).toBe('');
     expect(result.stderr).toContain('does not read back as written');
+  });
+
+  it('publishes the literal NUL spelling without triggering the observed read-back rewrite', () => {
+    const stamp = `${MARKER}\nReviewed commit: \`${REVIEWED}\`\nVerdict: not ready\nContract: open\n\n`;
+    const evidence = String.raw`Observed \u0000, \u0000, and \u0000. Preserve \u0041.`;
+    const padding = `\n${'x'.repeat(9144 - stamp.length - evidence.length - 1)}`;
+    const original = stamp + evidence + padding;
+    expect(original).toHaveLength(9144);
+    expect(original.replaceAll(String.raw`\u0000`, String.raw`\^@`)).toHaveLength(9135);
+
+    const result = publishReview({
+      inputs: { ...report, INPUTS_READY: 'false' },
+      artifacts: { 'review-report.md': evidence + padding },
+      gh: { rewriteCommentNulNotation: true },
+    });
+    expect(result.code).toBe(0);
+    expect(result.stderr).toContain('canonical review comment at');
+    expect(JSON.parse(result.stdout)).toMatchObject({ ready: false });
+    expect(result.comments).toEqual([
+      { issue: 42, body: stamp + String.raw`Observed U+0000, U+0000, and U+0000. Preserve \u0041.` + padding },
+    ]);
   });
 
   it('publishes nothing for a working-diff review and still reports the verdict', () => {
