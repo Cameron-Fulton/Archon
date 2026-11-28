@@ -14,7 +14,9 @@ export const CONTRACT_COVERAGES = ['complete', 'open'] as const;
 export type ContractCoverage = (typeof CONTRACT_COVERAGES)[number];
 
 export function reviewCommentBody(head: string, ready: boolean, contract: ContractCoverage, report: string): string {
-  return `${REVIEW_MARKER}\nReviewed commit: \`${head}\`\nVerdict: ${ready ? 'ready' : 'not ready'}\nContract: ${contract}\n\n${report}`;
+  // The forge can rewrite this literal spelling, which breaks exact comment read-back.
+  const renderedReport = report.replaceAll(String.raw`\u0000`, 'U+0000');
+  return `${REVIEW_MARKER}\nReviewed commit: \`${head}\`\nVerdict: ${ready ? 'ready' : 'not ready'}\nContract: ${contract}\n\n${renderedReport}`;
 }
 
 export interface ReviewStamp {

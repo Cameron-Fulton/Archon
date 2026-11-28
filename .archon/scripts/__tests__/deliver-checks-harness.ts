@@ -71,6 +71,8 @@ export interface GhFake {
   readonly writeFail?: string;
   /** Drop the write instead of applying it, so the read-back disagrees. */
   readonly writeLost?: boolean;
+  /** Reproduce the observed rewrite of the literal NUL spelling in a stored comment. */
+  readonly rewriteCommentNulNotation?: boolean;
   /**
    * The HTTP failures the first comment writes answer with, one per write, before
    * writes succeed again. A `landed` failure applies the write and still fails, as a
@@ -388,8 +390,11 @@ Object.defineProperty(Bun, 'spawnSync', { value: (argv, settings) => {
     const id = method === 'PATCH' ? Number(endpoint.split('/').pop()) : nextId++;
     let row = comments.find(entry => entry.id === id);
     if (!fake.writeLost) {
-      if (row) row.body = body;
-      else { row = { id, body, ...(onIssue === undefined ? {} : { issue: onIssue }) }; comments.push(row); }
+      const storedBody = fake.rewriteCommentNulNotation
+        ? body.replaceAll(${JSON.stringify(String.raw`\u0000`)}, ${JSON.stringify(String.raw`\^@`)})
+        : body;
+      if (row) row.body = storedBody;
+      else { row = { id, body: storedBody, ...(onIssue === undefined ? {} : { issue: onIssue }) }; comments.push(row); }
     }
     appendFileSync(${JSON.stringify(ghLog)} + '.comments', JSON.stringify({ issue: row?.issue ?? onIssue ?? pr.number, body }) + '\\n');
     if (fault !== undefined) return failed();
